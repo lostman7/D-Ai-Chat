@@ -1,6 +1,21 @@
-const MB = 1024 * 1024;
+import { embedAndStore, vectorSearch } from './chunker.js'; // CODEx: Integrate shared embedding utilities for chunk storage and retrieval.
+import { EMBEDDING_PROVIDERS, detectEmbeddingService, requestEmbeddingVector } from './rag/local-embed.js'; // CODEx: Incorporate provider-aware embedding helpers.
+// CODEx: Maintain explicit separation between module imports and runtime constants.
+const MB = 1024 * 1024; // CODEx: Base multiplier for megabyte calculations across memory limits.
+const MAX_RAG_EMBEDDING_BYTES = 100 * MB; // CODEx: Cap chunk embedding footprint to 100 MB within the RAM disk budget.
+const EMBEDDING_CACHE_DIR = 'rag/cache'; // CODEx: Directory for persisted embedding cache entries.
+const EMBEDDING_CACHE_MANIFEST_PATH = `${EMBEDDING_CACHE_DIR}/manifest.json`; // CODEx: Manifest tracking persisted vectors.
+const EMBEDDING_CACHE_MAX_BYTES = MAX_RAG_EMBEDDING_BYTES; // CODEx: Align disk cache limit with RAM disk budget.
+const EMBEDDING_CACHE_TRIM_THRESHOLD = Math.floor(EMBEDDING_CACHE_MAX_BYTES * 0.8); // CODEx: Trigger LRU eviction at 80% usage.
+const MIN_MEMORY_LIMIT_MB = 50;
+const MAX_MEMORY_LIMIT_MB = 200;
+const MEMORY_LIMIT_STEP_MB = 10;
 
 const DEFAULT_DUAL_SEED = 'Debate whether persistent memories make AI more helpful.';
+// CODEx: Embedding defaults used for vector-based retrieval fallbacks.
+const EMBEDDING_DEFAULT_DIMENSIONS = 1536;
+const EMBEDDING_HASH_BUCKETS = 512;
+const EMBEDDING_MIN_QUERY_LENGTH = 12;
 
 const MODE_CHOOSER = 'chooser';
 const MODE_CHAT = 'chat';
@@ -16,18 +31,350 @@ const LOG_STORE_NAME = 'sam-logs';
 const LOG_STATUS_TIMEOUT = 4500;
 const LOG_EXPORT_PREFIX = 'sam-log';
 const RETRIEVAL_STORAGE_KEY = 'sam-retrieval-metrics';
+const REFLEX_HISTORY_STORE = 'reflex-history';
 const DEFAULT_CONTEXT_LIMIT = 131072;
 const MAX_CONTEXT_LIMIT = 262144;
 const RAG_ORIGIN_TOKENS = ['rag', 'archive', 'checkpoint', 'long-term'];
 
 const STATIC_RAG_MANIFESTS = [
-  { url: 'rag/manifest.json', basePath: 'rag/', defaultMode: MODE_CHAT, label: 'primary RAG files' },
-  { url: 'rag/archives/manifest.json', basePath: 'rag/archives/', defaultMode: MODE_ARENA, label: 'RAG archives' }
+  {
+    url: 'rag/manifest.json',
+    basePath: 'rag/',
+    defaultMode: MODE_CHAT,
+    label: 'primary RAG files',
+    ramKey: 'rag-manifest'
+  },
+  {
+    url: 'rag/archives/manifest.json',
+    basePath: 'rag/archives/',
+    defaultMode: MODE_ARENA,
+    label: 'RAG archives',
+    ramKey: 'rag-archives-manifest'
+  }
 ];
 const SUPPORTED_RAG_TEXT_FORMATS = new Set(['txt', 'text', 'md', 'markdown']);
 const SUPPORTED_RAG_JSON_FORMATS = new Set(['json', 'jsonl']);
 const SUPPORTED_RAG_BINARY_FORMATS = new Set(['pdf']);
+const SUPPORTED_CHUNK_EXTENSIONS = new Set([
+  ...SUPPORTED_RAG_TEXT_FORMATS,
+  ...SUPPORTED_RAG_JSON_FORMATS,
+  ...SUPPORTED_RAG_BINARY_FORMATS
+]);
+const SUPPORTED_CHUNK_CONTENT_TYPES = [
+  'text/plain',
+  'text/markdown',
+  'text/x-markdown',
+  'application/json',
+  'application/ld+json',
+  'application/jsonlines',
+  'application/x-ndjson'
+];
 const PDFJS_CDN_BASE = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67';
+
+const storage = createPersistentStorage();
+
+function createPersistentStorage() {
+  if (typeof window !== 'undefined' && window.standaloneStore) {
+    const bridge = window.standaloneStore;
+    return {
+      getItem(key) {
+        return bridge.getItem(key);
+      },
+      setItem(key, value) {
+        bridge.setItem(key, value);
+      },
+      removeItem(key) {
+        bridge.removeItem(key);
+      },
+      keys() {
+        try {
+          const result = bridge.keys();
+          return Array.isArray(result) ? result : [];
+        } catch (error) {
+          console.warn('Failed to list standalone storage keys:', error);
+          return [];
+        }
+      },
+      clear() {
+        bridge.clear();
+      }
+    };
+  }
+
+  if (typeof window !== 'undefined' && window.localStorage) {
+    return {
+      getItem(key) {
+        return window.localStorage.getItem(key);
+      },
+      setItem(key, value) {
+        window.localStorage.setItem(key, value);
+      },
+      removeItem(key) {
+        window.localStorage.removeItem(key);
+      },
+      keys() {
+        return Object.keys(window.localStorage);
+      },
+      clear() {
+        window.localStorage.clear();
+      }
+    };
+  }
+
+  const memory = new Map();
+  return {
+    getItem(key) {
+      return memory.has(key) ? memory.get(key) : null;
+    },
+    setItem(key, value) {
+      memory.set(key, String(value));
+    },
+    removeItem(key) {
+      memory.delete(key);
+    },
+    keys() {
+      return Array.from(memory.keys());
+    },
+    clear() {
+      memory.clear();
+    }
+  };
+}
+
+function storageGetItem(key) {
+  try {
+    return storage.getItem(key);
+  } catch (error) {
+    console.warn('Failed to read storage key', key, error);
+    return null;
+  }
+}
+
+function storageSetItem(key, value) {
+  try {
+    storage.setItem(key, String(value));
+  } catch (error) {
+    console.warn('Failed to persist storage key', key, error);
+  }
+}
+
+function storageRemoveItem(key) {
+  try {
+    storage.removeItem(key);
+  } catch (error) {
+    console.warn('Failed to remove storage key', key, error);
+  }
+}
+
+function syncReasoningTimeoutToShell() {
+  if (typeof window === 'undefined') {
+    return; // CODEx: Skip when running outside the browser shell.
+  }
+  const updater = window.standaloneRuntime?.updateReasoningTimeout;
+  if (typeof updater !== 'function') {
+    return; // CODEx: Standalone shell not active.
+  }
+  try {
+    updater(config.reasoningTimeoutSeconds); // CODEx: Relay current reasoning timeout to Electron main process.
+  } catch (error) {
+    console.debug('Failed to sync reasoning timeout to shell', error); // CODEx: Swallow bridge errors without disruption.
+  }
+}
+
+function storageKeys() {
+  try {
+    const keys = storage.keys?.();
+    if (Array.isArray(keys)) {
+      return keys;
+    }
+    if (typeof storage.length === 'number' && typeof storage.key === 'function') {
+      const result = [];
+      for (let index = 0; index < storage.length; index += 1) {
+        const key = storage.key(index);
+        if (key) {
+          result.push(key);
+        }
+      }
+      return result;
+    }
+    return [];
+  } catch (error) {
+    console.warn('Failed to enumerate storage keys:', error);
+    return [];
+  }
+}
+
+function storageClear() {
+  try {
+    storage.clear();
+  } catch (error) {
+    console.warn('Failed to clear storage:', error);
+  }
+}
+
+function wait(ms) { // CODEx: Promise-based delay helper for retry backoff sequencing.
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0))); // CODEx: Clamp negatives.
+}
+
+function computeBackoffDelay(attempt, base = 400, cap = 5000) { // CODEx: Exponential backoff with an upper cap.
+  const order = Math.max(0, (Number(attempt) || 1) - 1); // CODEx: Normalize attempt index starting at zero.
+  const interval = Math.round((Number(base) || 400) * 2 ** order); // CODEx: Exponentially grow delays per attempt.
+  return Math.min(Math.max(0, interval), Number(cap) || 5000); // CODEx: Enforce non-negative durations within cap.
+}
+
+function shouldRetryStatus(status) { // CODEx: Identify HTTP statuses that merit automatic retry.
+  if (!Number.isFinite(status)) return false; // CODEx: Ignore non-numeric statuses.
+  if (status === 429) return true; // CODEx: Back off on rate limits.
+  return status >= 500 && status < 600; // CODEx: Retry server-side failures.
+}
+
+function isTransientNetworkError(error) { // CODEx: Detect network layer issues eligible for retry.
+  if (!error) return false; // CODEx: Guard nullish references.
+  if (error.name === 'AbortError') return false; // CODEx: Abort errors handled separately.
+  const message = String(error?.message || error || '').toLowerCase(); // CODEx: Normalize message for heuristics.
+  if (message.includes('network') || message.includes('fetch') || message.includes('failed to fetch')) {
+    return true; // CODEx: Treat generic fetch/network failures as transient.
+  }
+  return error instanceof TypeError; // CODEx: Browser fetch errors surface as TypeError and should be retried.
+}
+
+function getDirectoryPath(path) {
+  if (typeof path !== 'string') {
+    return '';
+  }
+  const sanitized = path.split(/[?#]/)[0];
+  const lastSlash = sanitized.lastIndexOf('/');
+  return lastSlash > 0 ? sanitized.slice(0, lastSlash) : '';
+}
+
+function getFileExtension(path) {
+  if (typeof path !== 'string') {
+    return '';
+  }
+  const sanitized = path.split(/[?#]/)[0];
+  const lastSlash = sanitized.lastIndexOf('/');
+  const fileName = lastSlash >= 0 ? sanitized.slice(lastSlash + 1) : sanitized;
+  const dotIndex = fileName.lastIndexOf('.');
+  if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
+    return '';
+  }
+  return fileName.slice(dotIndex + 1).toLowerCase();
+}
+
+function inferContentTypeFromPath(path) {
+  const extension = getFileExtension(path);
+  if (SUPPORTED_RAG_JSON_FORMATS.has(extension)) {
+    return 'application/json';
+  }
+  if (SUPPORTED_RAG_BINARY_FORMATS.has(extension)) {
+    return 'application/pdf';
+  }
+  return 'text/plain';
+}
+
+function getStandaloneFs() {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  return window.standaloneFs ?? null;
+}
+
+function ensureStandaloneDirectory(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.ensureDir) return false;
+  try {
+    return bridge.ensureDir(path) !== false;
+  } catch (error) {
+    console.warn('Failed to ensure standalone directory', path, error);
+    return false;
+  }
+}
+
+function listStandaloneDirectory(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.listDirectory) return null;
+  try {
+    const entries = bridge.listDirectory(path);
+    return Array.isArray(entries) ? entries : null;
+  } catch (error) {
+    console.warn('Failed to list standalone directory', path, error);
+    return null;
+  }
+}
+
+function readStandaloneFile(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.readFile) return null;
+  try {
+    const result = bridge.readFile(path);
+    if (!result) return null;
+    if (typeof result === 'string') {
+      return { content: result, contentType: inferContentTypeFromPath(path) };
+    }
+    if (typeof result === 'object' && typeof result.content === 'string') {
+      return {
+        content: result.content,
+        contentType: result.contentType || inferContentTypeFromPath(path)
+      };
+    }
+  } catch (error) {
+    console.warn('Failed to read standalone file', path, error);
+  }
+  return null;
+}
+
+function writeStandaloneFile(path, content, options = {}) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.writeFile) return false;
+  try {
+    const payload = typeof content === 'string' ? content : String(content);
+    return bridge.writeFile(path, payload, options) !== false;
+  } catch (error) {
+    console.warn('Failed to write standalone file', path, error);
+    return false;
+  }
+}
+
+function deleteStandaloneFile(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.deleteFile) return false;
+  try {
+    return bridge.deleteFile(path) !== false;
+  } catch (error) {
+    console.warn('Failed to delete standalone file', path, error);
+    return false;
+  }
+}
+
+function isSupportedChunkExtension(extension) {
+  if (!extension) return false;
+  return SUPPORTED_CHUNK_EXTENSIONS.has(extension.toLowerCase());
+}
+
+function isSupportedChunkContentType(contentType) {
+  if (!contentType) return false;
+  const normalized = contentType.split(';')[0].trim().toLowerCase();
+  return SUPPORTED_CHUNK_CONTENT_TYPES.includes(normalized);
+}
+
+function isSupportedChunkablePath(path) {
+  return isSupportedChunkExtension(getFileExtension(path));
+}
+
+function isSupportedChunkableFile(path, contentType) {
+  if (isSupportedChunkablePath(path)) {
+    return true;
+  }
+  if (contentType && isSupportedChunkContentType(contentType)) {
+    return true;
+  }
+  return false;
+}
+
+function filterChunkablePaths(paths) {
+  if (!Array.isArray(paths)) return [];
+  return paths.filter((path) => isSupportedChunkablePath(path));
+}
 
 const DEFAULT_BACKGROUND =
   'radial-gradient(circle at top, rgba(77, 124, 255, 0.15), transparent 55%), ' +
@@ -37,16 +384,26 @@ const CUSTOM_BACKGROUND_OVERLAY =
   'linear-gradient(135deg, rgba(12, 16, 24, 0.52), rgba(28, 32, 46, 0.42))';
 
 const defaultConfig = {
-  memoryLimitMB: 500,
+  memoryLimitMB: 100,
   providerPreset: 'custom',
   retrievalCount: 0,
+  reasoningModeEnabled: false,
+  autoInjectMemories: false,
+  useEmbeddingRetrieval: true, // CODEx: Enable embedding-first retrieval unless explicitly disabled.
+  requestTimeoutSeconds: 30,
+  reasoningTimeoutSeconds: 300,
   contextTurns: 12,
   endpoint: 'http://localhost:1234/v1/chat/completions',
   model: 'lmstudio-community/Meta-Llama-3-8B-Instruct',
   apiKey: '',
+  openRouterPolicy: '',
   systemPrompt: 'You are SAM, a helpful memory-augmented assistant who reflects on long-term memories when they are relevant.',
   temperature: 0.7,
-  maxResponseTokens: 512,
+  maxResponseTokens: 4500,
+  embeddingModel: 'text-embedding-3-large',
+  embeddingEndpoint: '',
+  embeddingApiKey: '',
+  embeddingProviderPreference: EMBEDDING_PROVIDERS.AUTO, // CODEx: Default to automatic provider detection.
   autoSpeak: false,
   ttsPreset: 'browser',
   ttsServerUrl: '',
@@ -55,32 +412,66 @@ const defaultConfig = {
   ttsVolume: 100,
   agentAName: 'SAM-A',
   agentAPrompt: 'You are SAM-A, an analytical AI researcher who values precision and structure.',
-  agentBEnabled: true,
+  agentBEnabled: false,
   agentBName: 'SAM-B',
   agentBPrompt: 'You are SAM-B, a creative explorer who loves bold ideas and storytelling.',
-  agentAProviderPreset: 'inherit',
-  agentAEndpoint: '',
-  agentAModel: '',
-  agentAApiKey: '',
   agentBProviderPreset: 'inherit',
   agentBEndpoint: '',
   agentBModel: '',
   agentBApiKey: '',
   dualAutoContinue: true,
   dualTurnLimit: 0,
+  dualTurnDelaySeconds: 15,
   dualSeed: DEFAULT_DUAL_SEED,
   reflexEnabled: true,
   reflexInterval: 8,
-  entropyWindow: 6,
+  entropyWindow: 5,
   backgroundSource: 'default',
   backgroundImage: '',
   backgroundUrl: '',
   debugEnabled: false
 };
 
+const phases = [
+  { id: 1, title: 'Flow Dynamics', prompt: 'phase1.txt' },
+  { id: 2, title: 'Collapse Engine', prompt: 'phase2.txt' },
+  { id: 3, title: 'Entanglement Node', prompt: 'phase3.txt' }
+];
+
+const PHASE_PROMPT_DIR = 'rag/phase-prompts/';
+const WATCHDOG_MESSAGE_SOURCE = 'sam-standalone-watchdog';
+const WATCHDOG_MESSAGE_TYPE = 'check-arena-memory';
+const WATCHDOG_PRESSURE_THRESHOLD = 0.8;
+const WATCHDOG_ARCHIVE_PERCENT = 0.1;
+const ENTROPY_LOOP_THRESHOLD = 0.8;
+const ENTROPY_EXPLORE_THRESHOLD = 0.3;
+const LOOP_DELAY_SCALE = 0.6;
+const EXPLORE_DELAY_SCALE = 1.4;
+const MIN_DYNAMIC_DELAY_SECONDS = 5;
+const MAX_DYNAMIC_DELAY_SECONDS = 120;
+
 const TEST_TTS_PHRASE = 'This is SAM performing a voice check with persistent memory engaged.';
 const TTS_ERROR_COOLDOWN = 15000;
 const PINNED_STORAGE_KEY = 'sam-pinned-messages';
+const RAM_DISK_CHUNK_PREFIX = 'sam-chunked-';
+const RAM_DISK_UNCHUNKED_PREFIX = 'sam-unchunked-';
+const RAM_DISK_ARCHIVE_PREFIX = 'sam-archive-';
+const RAM_DISK_MANIFEST_PREFIX = 'sam-manifest-';
+const REASONING_MODEL_HINTS = [
+  'reason', // CODEx: Preserve legacy hints for bespoke preset labels.
+  'cogito', // CODEx: Retain prior identifier coverage for specialized checkpoints.
+  'sonar', // CODEx: Keep community alias alignment.
+  'think', // CODEx: Maintain compatibility with earlier think-prefixed models.
+  'deepseek-r1', // CODEx: Support DeepSeek reasoning suite detection.
+  'deepseek_reasoner', // CODEx: Alias for DeepSeek reasoning models.
+  'reasoner', // CODEx: Capture general reasoner naming conventions.
+  'o1', // CODEx: Include OpenAI o-series heuristics.
+  'o3', // CODEx: Preserve existing o-series mapping.
+  'reflect', // CODEx: Extend hints for reflect-oriented reasoning checkpoints.
+  'cot' // CODEx: Support chain-of-thought model aliases.
+];
+const REASONING_MODEL_REGEX = /reason|think|deep|reflect|cot|chain|reflection/i; // CODEx: Phase VI expanded reasoning detector.
+const EMBEDDING_MODEL_REGEX = /embed|embedding|textembedding/i; // CODEx: Identify embedding-specialized checkpoints.
 
 const providerPresets = [
   {
@@ -108,10 +499,20 @@ const providerPresets = [
     label: 'Ollama (local)',
     description:
       'Point SAM at an Ollama instance. Run `ollama serve`, pull a model such as `tinyllama`, and enable the OpenAI-compatible endpoint.',
-    endpoint: 'http://localhost:11434/v1/chat/completions',
+    endpoint: 'http://localhost:11434/api/generate', // CODEx hot-fix: align Ollama local default with native generate route.
     model: 'tinyllama',
     requiresKey: false,
     contextLimit: 65536
+  },
+  {
+    id: 'ollama-cloud', // CODEx: Expose Ollama Cloud as a provider preset.
+    label: 'Ollama Cloud', // CODEx: UI label for Ollama Cloud connections.
+    description:
+      'Route SAM through Ollama Cloud. Provide your OLLAMA_API_KEY and the service will mirror OpenAI-compatible chat completions.', // CODEx: Explain Ollama Cloud usage.
+    endpoint: 'https://api.ollama.ai/v1/chat/completions', // CODEx: Default Ollama Cloud chat endpoint.
+    model: 'llama3.1', // CODEx: Reasonable default model identifier for cloud usage.
+    requiresKey: true, // CODEx: Ollama Cloud requires an API key.
+    contextLimit: 65536 // CODEx: Estimated context limit for Ollama Cloud.
   },
   {
     id: 'openrouter',
@@ -357,6 +758,8 @@ const activeDualConnections = {
 };
 let autoContinueTimer;
 let dualAutosaveTimer;
+let dualCountdownTimer;
+let dualCountdownDeadline = null;
 let audioContext;
 let lastTtsErrorAt = 0;
 let userEditedTtsServer = false;
@@ -372,6 +775,7 @@ let reflexInFlight = false;
 let lastReflexSummaryAt = null;
 let reflexSummaryCount = 0;
 let currentEntropyScore = 0;
+let lastEntropyState = 'calibrating';
 let deviceMemoryEstimate;
 let gpuRendererInfo;
 let logEntries = [];
@@ -390,8 +794,375 @@ let ragTelemetry = {
   staticFiles: 0,
   staticBytes: 0,
   staticErrors: [],
-  loaded: false
+  loaded: false,
+  lastRetrievalMs: 0,
+  lastRetrievalMode: 'lexical' // CODEx: Track whether embeddings or keyword fallback handled the last retrieval.
 };
+const ramDiskCache = {
+  chunked: new Map(),
+  unchunked: new Map(),
+  archives: new Map(),
+  manifests: new Map()
+};
+// CODEx: In-memory embedding caches maintain fast retrieval across chat and RAG stores.
+const embeddingCache = new Map();
+const messageEmbeddingCache = new Map();
+const chunkEmbeddingIndex = new Map();
+let chunkEmbeddingFootprintBytes = 0; // CODEx: Measure bytes consumed by cached chunk embeddings.
+const chunkEmbeddingOrder = []; // CODEx: Preserve insertion order for trimming cached embeddings.
+let embeddingServiceHealthy = true; // CODEx: Represent whether the embedding endpoint is responsive.
+let embeddingServiceReason = ''; // CODEx: Store the most recent embedding failure reason for UI diagnostics.
+const embeddingProviderState = { preference: EMBEDDING_PROVIDERS.AUTO, active: EMBEDDING_PROVIDERS.OPENAI, baseUrl: '', lastProbe: 0 }; // CODEx: Track provider selection and probe metadata.
+let embeddingCacheManifest = { entries: [], totalBytes: 0 }; // CODEx: Persisted cache metadata loaded from disk.
+let embeddingCacheManifestLoaded = false; // CODEx: Ensure manifest initialization runs once per session.
+
+// CODEx: High-resolution clock helper for latency tracking.
+function getTimestampMs() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+// CODEx: Model call metrics inform diagnostics and timeout reporting.
+const modelCallMetrics = {
+  totalMs: 0,
+  count: 0,
+  reasoningTimeouts: 0
+};
+
+// CODEx: Reset embedding caches when the embedding model or endpoint changes.
+function clearCachedEmbeddings() {
+  embeddingCache.clear();
+  messageEmbeddingCache.clear();
+  chunkEmbeddingIndex.clear();
+  chunkEmbeddingFootprintBytes = 0; // CODEx: Reset embedding footprint accounting when caches clear.
+  chunkEmbeddingOrder.length = 0; // CODEx: Drop insertion order tracking alongside cache reset.
+}
+
+// CODEx: Detect reasoning-focused checkpoints to adjust timeouts and context.
+function isReasoningModelId(modelId, preset) {
+  if (preset?.anthropicFormat) {
+    return true; // CODEx: Anthropic chat endpoints are treated as reasoning-safe by default.
+  }
+  const normalized = typeof modelId === 'string' ? modelId.toLowerCase() : ''; // CODEx: Normalize identifiers for regex tests.
+  if (!normalized) {
+    return false; // CODEx: Skip empty identifiers.
+  }
+  if (REASONING_MODEL_REGEX.test(normalized)) {
+    return true; // CODEx: Apply Phase II reasoning handshake detector.
+  }
+  return REASONING_MODEL_HINTS.some((hint) => normalized.includes(hint)); // CODEx: Retain heuristic fallback coverage.
+}
+
+// CODEx: Detect embedding-only checkpoints to avoid routing them through text generation endpoints.
+function isEmbeddingModelId(modelId) {
+  if (typeof modelId !== 'string') {
+    return false; // CODEx: Non-string identifiers cannot be matched reliably.
+  }
+  return EMBEDDING_MODEL_REGEX.test(modelId.toLowerCase()); // CODEx: Apply embedding model heuristic pattern.
+}
+
+// CODEx: Determine whether reasoning safeguards should be active for the current request.
+function isReasoningModeActive(overrides = {}) {
+  if (overrides.reasoningMode === true) {
+    return true;
+  }
+  if (overrides.reasoningMode === false) {
+    return false;
+  }
+  if (config.reasoningModeEnabled) {
+    return true;
+  }
+  const preset = providerPresetMap.get(overrides.providerPreset ?? config.providerPreset);
+  const model = overrides.model ?? overrides.modelId ?? config.model;
+  return isReasoningModelId(model, preset);
+}
+
+// CODEx: Embedding retrieval helpers manage vector health and budgeting.
+function isEmbeddingRetrievalEnabled() { // CODEx: Determine if embedding search should run for the current configuration.
+  return config.useEmbeddingRetrieval !== false; // CODEx: Default to enabling embeddings unless explicitly disabled.
+} // CODEx
+// CODEx: Maintain accurate embedding health tracking for UI diagnostics.
+function setEmbeddingServiceHealth(healthy, reason = '') { // CODEx: Persist the embedding provider health status.
+  embeddingServiceHealthy = Boolean(healthy); // CODEx: Normalize provider health to a strict boolean.
+  embeddingServiceReason = healthy ? '' : String(reason || '').slice(0, 60); // CODEx: Retain a trimmed explanation for UI messaging.
+  refreshEmbeddingStatusIndicator(); // CODEx: Keep the embedding status indicator synchronized with the latest health state.
+} // CODEx
+function getActiveEmbeddingProviderLabel() { // CODEx: Present user-friendly provider labels.
+  switch (embeddingProviderState.active) { // CODEx: Branch on current provider value.
+    case EMBEDDING_PROVIDERS.LM_STUDIO:
+      return 'LMStudio'; // CODEx: Normalize LM Studio label casing.
+    case EMBEDDING_PROVIDERS.OLLAMA_LOCAL:
+      return 'Ollama-Local'; // CODEx: Standardize Ollama local label.
+    case EMBEDDING_PROVIDERS.OLLAMA_CLOUD:
+      return 'Ollama-Cloud'; // CODEx: Standardize Ollama cloud label.
+    case EMBEDDING_PROVIDERS.OPENAI:
+      return 'OpenAI'; // CODEx: Remote provider label.
+    default:
+      return 'Auto'; // CODEx: Fallback descriptor when detection pending.
+  }
+} // CODEx
+function getEmbeddingCacheBytes() { // CODEx: Report persisted cache footprint.
+  ensureEmbeddingCacheManifest(); // CODEx: Guarantee manifest ready before reading totals.
+  return Number.isFinite(embeddingCacheManifest.totalBytes) ? embeddingCacheManifest.totalBytes : 0; // CODEx: Guard invalid totals.
+} // CODEx
+// CODEx: Refresh DOM status text to reflect embedding availability.
+function refreshEmbeddingStatusIndicator() { // CODEx: Update the memory drawer indicator for embedding availability.
+  const indicator = elements.embeddingStatus; // CODEx: Reference the DOM node used for embedding status text.
+  if (!indicator) { // CODEx: Exit early when the indicator has not been rendered.
+    return; // CODEx: Avoid errors when the status element is absent.
+  } // CODEx
+  if (!isEmbeddingRetrievalEnabled()) { // CODEx: Display disabled messaging when embeddings are turned off.
+    indicator.textContent = 'Embedding Active ✗ (disabled)'; // CODEx: Communicate the disabled embedding state to the user.
+    return; // CODEx: Skip additional status updates when disabled.
+  } // CODEx
+  const providerLabel = getActiveEmbeddingProviderLabel(); // CODEx: Gather current provider label.
+  const cacheLabel = formatMegabytes(getEmbeddingCacheBytes()); // CODEx: Summarize cache footprint in human-friendly units.
+  if (embeddingServiceHealthy) { // CODEx: Show success when the embedding provider is responding.
+    indicator.textContent = `Embedding Active ✓ (Provider: ${providerLabel}, Cache: ${cacheLabel})`; // CODEx: Display provider and cache footprint on success.
+    return; // CODEx: Finish once success state is displayed.
+  } // CODEx
+  const reason = embeddingServiceReason ? ` (${embeddingServiceReason})` : ' (offline)'; // CODEx: Prepare contextual failure messaging.
+  indicator.textContent = `Embedding Active ✗ (Provider: ${providerLabel}, Cache: ${cacheLabel})${reason}`; // CODEx: Combine failure message with provider context.
+} // CODEx
+// CODEx: Footprint estimation drives cache budgeting accuracy.
+function estimateEmbeddingBytes(vector) { // CODEx: Estimate bytes consumed by an embedding array.
+  if (!Array.isArray(vector)) { // CODEx: Ignore malformed embedding payloads.
+    return 0; // CODEx: Count no memory usage when vectors are invalid.
+  } // CODEx
+  return vector.length * 8; // CODEx: Assume double-precision floats for footprint approximation.
+} // CODEx
+// CODEx: Cache management ensures embeddings respect RAM disk constraints.
+function storeChunkEmbedding(key, vector) { // CODEx: Cache chunk embeddings while tracking memory usage.
+  const previous = chunkEmbeddingIndex.get(key); // CODEx: Retrieve prior embedding to adjust totals.
+  if (!chunkEmbeddingIndex.has(key)) { // CODEx: Track insertion order for new cache entries.
+    chunkEmbeddingOrder.push(key); // CODEx: Record key order for future evictions.
+  } // CODEx
+  if (Array.isArray(previous)) { // CODEx: Remove prior embedding weight from the footprint tally.
+    chunkEmbeddingFootprintBytes -= estimateEmbeddingBytes(previous); // CODEx: Subtract previous vector contribution.
+  } // CODEx
+  chunkEmbeddingIndex.set(key, vector); // CODEx: Persist the latest embedding vector in cache.
+  chunkEmbeddingFootprintBytes += estimateEmbeddingBytes(vector); // CODEx: Add new vector contribution to the footprint.
+  enforceChunkEmbeddingBudget(); // CODEx: Ensure the cache remains within the RAM budget.
+  persistEmbeddingVector(key, vector); // CODEx: Mirror embedding into disk-backed cache for offline reuse.
+} // CODEx
+// CODEx: Periodically trim embeddings to keep memory usage predictable.
+function enforceChunkEmbeddingBudget() { // CODEx: Trim cached embeddings when exceeding RAM disk capacity.
+  if (chunkEmbeddingFootprintBytes <= MAX_RAG_EMBEDDING_BYTES) { // CODEx: Leave cache untouched when within limits.
+    return; // CODEx: No trimming required under the limit.
+  } // CODEx
+  let removed = 0; // CODEx: Track how many embeddings are evicted.
+  while (chunkEmbeddingFootprintBytes > MAX_RAG_EMBEDDING_BYTES && chunkEmbeddingOrder.length) { // CODEx: Continue until usage is within the cap.
+    const oldestKey = chunkEmbeddingOrder.shift(); // CODEx: Pull the oldest embedding key for eviction.
+    const vector = chunkEmbeddingIndex.get(oldestKey); // CODEx: Look up the corresponding embedding payload.
+    if (!Array.isArray(vector)) { // CODEx: Skip keys already cleared or invalid.
+      continue; // CODEx: Proceed to the next queued key when data missing.
+    } // CODEx
+    chunkEmbeddingIndex.delete(oldestKey); // CODEx: Remove the stale embedding from cache.
+    chunkEmbeddingFootprintBytes -= estimateEmbeddingBytes(vector); // CODEx: Reduce tracked footprint after eviction.
+    removed += 1; // CODEx: Count the eviction for diagnostics.
+  } // CODEx
+  if (chunkEmbeddingFootprintBytes < 0) { // CODEx: Prevent negative totals after trimming.
+    chunkEmbeddingFootprintBytes = 0; // CODEx: Reset footprint to zero when underflow occurs.
+  } // CODEx
+  if (removed > 0) { // CODEx: Emit diagnostics when trimming happens.
+    console.debug('Embedding cache trimmed', { removed, remainingBytes: chunkEmbeddingFootprintBytes }); // CODEx: Log trimming metrics for debugging.
+  } // CODEx
+} // CODEx
+function ensureEmbeddingCacheManifest() { // CODEx: Lazy-load embedding manifest from disk.
+  if (embeddingCacheManifestLoaded) { // CODEx: Avoid repeated loading.
+    return; // CODEx: Manifest already initialized.
+  } // CODEx
+  embeddingCacheManifestLoaded = true; // CODEx: Mark initialization attempted.
+  try { // CODEx: Attempt to hydrate manifest from disk storage.
+    ensureStandaloneDirectory(EMBEDDING_CACHE_DIR); // CODEx: Create cache directory when possible.
+    const record = readStandaloneFile(EMBEDDING_CACHE_MANIFEST_PATH); // CODEx: Fetch persisted manifest payload.
+    if (record?.content) { // CODEx: Parse when content available.
+      const parsed = JSON.parse(record.content); // CODEx: Parse manifest JSON.
+      if (parsed && typeof parsed === 'object') { // CODEx: Validate object shape.
+        embeddingCacheManifest = {
+          entries: Array.isArray(parsed.entries) ? parsed.entries : [], // CODEx: Normalize entry array.
+          totalBytes: Number.isFinite(parsed.totalBytes) ? parsed.totalBytes : 0 // CODEx: Normalize total bytes.
+        }; // CODEx: Apply parsed structure.
+      }
+    }
+  } catch (error) { // CODEx: Manifest hydration failures should not break runtime.
+    console.warn('Failed to load embedding cache manifest', error); // CODEx: Surface manifest load error.
+    embeddingCacheManifest = { entries: [], totalBytes: 0 }; // CODEx: Reset manifest to defaults on failure.
+  }
+}
+function persistEmbeddingCacheManifest() { // CODEx: Flush manifest metadata back to disk.
+  try { // CODEx: Serialize and write manifest payload.
+    const payload = JSON.stringify({ entries: embeddingCacheManifest.entries, totalBytes: embeddingCacheManifest.totalBytes }); // CODEx: Compose manifest JSON.
+    const saved = writeStandaloneFile(EMBEDDING_CACHE_MANIFEST_PATH, payload); // CODEx: Save manifest to disk when bridge available.
+    if (saved === false) { // CODEx: Skip warnings when environment lacks filesystem bridge.
+      return; // CODEx: Exit quietly when persistence unsupported.
+    }
+  } catch (error) { // CODEx: Gracefully handle write failures.
+    console.warn('Failed to persist embedding cache manifest', error); // CODEx: Emit warning but continue runtime.
+  }
+}
+function getEmbeddingCachePath(key) { // CODEx: Map cache key to disk filename.
+  const hash = hashString(key || ''); // CODEx: Hash key for filesystem safety.
+  return `${EMBEDDING_CACHE_DIR}/${hash}.json`; // CODEx: Derive deterministic cache path.
+}
+function updateManifestEntry(entry, bytes) { // CODEx: Update entry metadata with new byte counts.
+  const now = Date.now(); // CODEx: Timestamp for LRU ordering.
+  entry.bytes = bytes; // CODEx: Refresh entry footprint.
+  entry.updatedAt = now; // CODEx: Track update timestamp.
+  entry.lastAccess = now; // CODEx: Refresh access timestamp when writing.
+}
+function trimEmbeddingCacheManifest() { // CODEx: Evict least-recently-used entries beyond thresholds.
+  let total = getEmbeddingCacheBytes(); // CODEx: Start with current total footprint.
+  if (total <= EMBEDDING_CACHE_TRIM_THRESHOLD) { // CODEx: Skip trimming under 80% threshold.
+    return; // CODEx: Nothing to evict.
+  }
+  const entries = embeddingCacheManifest.entries.slice().sort((a, b) => (a.lastAccess || 0) - (b.lastAccess || 0)); // CODEx: Sort ascending by last access.
+  for (const entry of entries) { // CODEx: Remove until total falls below threshold.
+    if (total <= EMBEDDING_CACHE_TRIM_THRESHOLD) { // CODEx: Stop trimming when target reached.
+      break; // CODEx: Exit loop once within budget.
+    }
+    if (entry?.path) { // CODEx: Only attempt deletion when path known.
+      deleteStandaloneFile(entry.path); // CODEx: Remove cached vector file.
+    }
+    embeddingCacheManifest.entries = embeddingCacheManifest.entries.filter((candidate) => candidate.key !== entry.key); // CODEx: Remove entry from manifest.
+    const bytes = Number.isFinite(entry?.bytes) ? entry.bytes : 0; // CODEx: Normalize byte count.
+    total -= bytes; // CODEx: Reduce tracked total.
+  }
+  embeddingCacheManifest.totalBytes = Math.max(0, total); // CODEx: Clamp total bytes to zero minimum.
+  persistEmbeddingCacheManifest(); // CODEx: Persist updated manifest after trimming.
+}
+function persistEmbeddingVector(key, vector) { // CODEx: Store embedding vector to disk cache.
+  ensureEmbeddingCacheManifest(); // CODEx: Guarantee manifest initialization.
+  if (!Array.isArray(vector) || !vector.length) { // CODEx: Skip invalid vectors.
+    return; // CODEx: Do not persist malformed embeddings.
+  }
+  try { // CODEx: Serialize vector payload.
+    ensureStandaloneDirectory(EMBEDDING_CACHE_DIR); // CODEx: Ensure directory exists before writing.
+    const path = getEmbeddingCachePath(key); // CODEx: Determine file path for key.
+    const payload = JSON.stringify({ key, vector }); // CODEx: Compose cache entry payload.
+    const bytes = new TextEncoder().encode(payload).length; // CODEx: Measure serialized byte length.
+    const saved = writeStandaloneFile(path, payload); // CODEx: Persist vector to disk.
+    if (saved === false) { // CODEx: Abort caching when filesystem bridge is unavailable.
+      return; // CODEx: Respect environments without disk persistence.
+    }
+    const existingIndex = embeddingCacheManifest.entries.findIndex((entry) => entry.key === key); // CODEx: Locate prior entry.
+    if (existingIndex >= 0) { // CODEx: Update existing entry.
+      const existing = embeddingCacheManifest.entries[existingIndex]; // CODEx: Reference existing manifest entry.
+      const previousBytes = Number.isFinite(existing.bytes) ? existing.bytes : 0; // CODEx: Previous footprint for adjustments.
+      embeddingCacheManifest.totalBytes -= previousBytes; // CODEx: Remove previous byte contribution.
+      updateManifestEntry(existing, bytes); // CODEx: Refresh entry metadata.
+      existing.path = path; // CODEx: Store path for reloading.
+    } else { // CODEx: Create new manifest entry when absent.
+      const entry = { key, path, bytes, updatedAt: Date.now(), lastAccess: Date.now() }; // CODEx: Compose manifest entry.
+      embeddingCacheManifest.entries.push(entry); // CODEx: Append entry to manifest array.
+    }
+    embeddingCacheManifest.totalBytes += bytes; // CODEx: Add new byte contribution.
+    trimEmbeddingCacheManifest(); // CODEx: Enforce disk budget with LRU trimming.
+    persistEmbeddingCacheManifest(); // CODEx: Flush manifest updates to disk.
+  } catch (error) { // CODEx: Handle serialization or IO issues gracefully.
+    console.warn('Failed to persist embedding vector', { key, error }); // CODEx: Warn when caching fails.
+  }
+}
+function loadEmbeddingFromDisk(key) { // CODEx: Retrieve persisted vector for cache misses.
+  ensureEmbeddingCacheManifest(); // CODEx: Ensure manifest available for lookups.
+  const entry = embeddingCacheManifest.entries.find((candidate) => candidate.key === key); // CODEx: Locate manifest entry by key.
+  if (!entry || !entry.path) { // CODEx: Abort when entry missing.
+    return null; // CODEx: Disk cache miss.
+  }
+  const record = readStandaloneFile(entry.path); // CODEx: Read cached file via bridge.
+  if (!record?.content) { // CODEx: Skip when file missing.
+    return null; // CODEx: Disk cache miss due to missing file.
+  }
+  try { // CODEx: Parse cached payload.
+    const parsed = JSON.parse(record.content); // CODEx: Interpret JSON content.
+    const vector = Array.isArray(parsed?.vector) ? parsed.vector : Array.isArray(parsed?.embedding) ? parsed.embedding : null; // CODEx: Accept legacy shapes.
+    if (Array.isArray(vector) && vector.length) { // CODEx: Validate vector.
+      entry.lastAccess = Date.now(); // CODEx: Refresh access timestamp on hit.
+      persistEmbeddingCacheManifest(); // CODEx: Persist updated access time for LRU ordering.
+      return vector; // CODEx: Return hydrated vector.
+    }
+  } catch (error) { // CODEx: Handle JSON parse errors gracefully.
+    console.warn('Failed to parse cached embedding vector', { key, error }); // CODEx: Emit parse warning.
+  }
+  return null; // CODEx: Default to null when payload invalid.
+}
+async function resolveActiveEmbeddingProvider(force = false) { // CODEx: Probe embedding provider based on preference and connectivity.
+  const preference = config.embeddingProviderPreference ?? defaultConfig.embeddingProviderPreference; // CODEx: Read preference from config.
+  embeddingProviderState.preference = preference; // CODEx: Track preference for status UI.
+  const now = Date.now(); // CODEx: Timestamp to throttle probes.
+  const stale = force || !embeddingProviderState.lastProbe || now - embeddingProviderState.lastProbe > 60_000; // CODEx: Re-probe every minute or on demand.
+  if (!stale && embeddingProviderState.active) { // CODEx: Skip detection when provider state fresh.
+    return { ...embeddingProviderState }; // CODEx: Return cached provider snapshot.
+  }
+  try { // CODEx: Attempt detection across local and remote providers.
+    const detection = await detectEmbeddingService({
+      preference,
+      embeddingEndpoint: config.embeddingEndpoint,
+      modelEndpoint: config.endpoint,
+      embeddingApiKey: (config.embeddingApiKey || config.apiKey || '').trim(), // CODEx: Pass configured API keys for provider detection.
+      fetchImpl: (url, options) => fetch(url, options),
+      logger: console
+    });
+    embeddingProviderState.active = detection.provider ?? EMBEDDING_PROVIDERS.OPENAI; // CODEx: Persist detected provider.
+    embeddingProviderState.baseUrl = detection.baseUrl ?? ''; // CODEx: Persist associated base URL.
+    embeddingProviderState.lastProbe = now; // CODEx: Record probe time.
+  } catch (error) { // CODEx: Fallback to remote provider when detection fails.
+    console.warn('Embedding provider detection failed', error); // CODEx: Emit diagnostic warning.
+    embeddingProviderState.active = EMBEDDING_PROVIDERS.OPENAI; // CODEx: Default to remote embeddings.
+    embeddingProviderState.baseUrl = ''; // CODEx: Clear base URL on failure.
+    embeddingProviderState.lastProbe = now; // CODEx: Avoid repeated rapid probes.
+  }
+  refreshEmbeddingStatusIndicator(); // CODEx: Update status indicator with latest provider.
+  return { ...embeddingProviderState }; // CODEx: Return provider snapshot for callers.
+}
+const phasePromptCache = new Map();
+let activePhaseIndex = 0;
+let activePhaseId = null;
+let pendingPhaseAdvance = false;
+let lastReflexSynthesisSignature = null;
+let lastWatchdogArchiveAt = 0;
+
+function getManifestStorageKey(descriptor) {
+  if (!descriptor) return `${RAM_DISK_MANIFEST_PREFIX}default`;
+  const base = descriptor.ramKey || descriptor.url || 'manifest';
+  return `${RAM_DISK_MANIFEST_PREFIX}${base}`;
+}
+
+function cacheManifestInRam(descriptor, manifest) {
+  if (!descriptor?.url || !manifest) return;
+  ramDiskCache.manifests.set(descriptor.url, manifest);
+}
+
+function readManifestFromRam(descriptor) {
+  if (!descriptor?.url) return null;
+  return ramDiskCache.manifests.get(descriptor.url) || null;
+}
+
+function persistManifestToStorage(descriptor, manifest) {
+  if (!manifest) return;
+  try {
+    const key = getManifestStorageKey(descriptor);
+    storageSetItem(key, JSON.stringify(manifest));
+  } catch (error) {
+    console.warn('Failed to persist manifest to RAM disk storage:', error);
+  }
+}
+
+function readManifestFromStorage(descriptor) {
+  try {
+    const key = getManifestStorageKey(descriptor);
+    const stored = storageGetItem(key);
+    if (!stored) return null;
+    const parsed = JSON.parse(stored);
+    cacheManifestInRam(descriptor, parsed);
+    return parsed;
+  } catch (error) {
+    console.warn('Failed to read manifest from RAM disk storage:', error);
+    return null;
+  }
+}
 let chunkerState = {
   chunkSize: 500,
   chunkOverlap: 50,
@@ -445,6 +1216,10 @@ const elements = {
   memorySlider: document.getElementById('memorySlider'),
   memorySliderValue: document.getElementById('memorySliderValue'),
   retrievalCount: document.getElementById('retrievalCount'),
+  reasoningModeToggle: document.getElementById('reasoningModeToggle'),
+  embeddingRetrievalToggle: document.getElementById('embeddingRetrievalToggle'), // CODEx: Toggle element for embedding-based retrieval.
+  embeddingStatus: document.getElementById('embeddingStatus'), // CODEx: Status label showing embedding availability.
+  autoInjectMemories: document.getElementById('autoInjectMemories'),
   contextTurns: document.getElementById('contextTurns'),
   exportButton: document.getElementById('exportMemoryButton'),
   floatingMemoryList: document.getElementById('floatingMemoryList'),
@@ -453,9 +1228,12 @@ const elements = {
   ragMemoryCount: document.getElementById('ragMemoryCount'),
   ragSnapshotCount: document.getElementById('ragSnapshotCount'),
   ragFootprint: document.getElementById('ragFootprint'),
+  ragCompressionRatio: document.getElementById('ragCompressionRatio'),
   ragImportStatus: document.getElementById('ragImportStatus'),
   refreshFloatingButton: document.getElementById('refreshFloatingButton'),
   loadRagButton: document.getElementById('loadRagButton'),
+  loadChunkDataButton: document.getElementById('loadChunkDataButton'),
+  saveChatArchiveButton: document.getElementById('saveChatArchiveButton'),
   archiveUnpinnedButton: document.getElementById('archiveUnpinnedButton'),
   modelARetrievals: document.getElementById('modelARetrievals'),
   modelBRetrievals: document.getElementById('modelBRetrievals'),
@@ -464,6 +1242,12 @@ const elements = {
   providerNotes: document.getElementById('providerNotes'),
   modelInput: document.getElementById('modelInput'),
   apiKeyInput: document.getElementById('apiKeyInput'),
+  embeddingModelInput: document.getElementById('embeddingModelInput'),
+  embeddingEndpointInput: document.getElementById('embeddingEndpointInput'),
+  embeddingApiKeyInput: document.getElementById('embeddingApiKeyInput'),
+  embeddingProviderSelect: document.getElementById('embeddingProviderSelect'), // CODEx: Dropdown for provider selection.
+  openRouterPolicyField: document.getElementById('openRouterPolicyField'),
+  openRouterPolicyInput: document.getElementById('openRouterPolicyInput'),
   systemPromptInput: document.getElementById('systemPromptInput'),
   temperatureInput: document.getElementById('temperatureInput'),
   maxTokensInput: document.getElementById('maxTokensInput'),
@@ -477,6 +1261,7 @@ const elements = {
   exportDualButton: document.getElementById('exportDualButton'),
   dualSeedInput: document.getElementById('dualSeedInput'),
   dualTurnLimit: document.getElementById('dualTurnLimit'),
+  dualTurnDelay: document.getElementById('dualTurnDelay'),
   dualAutoContinue: document.getElementById('dualAutoContinue'),
   reflexToggle: document.getElementById('reflexToggle'),
   reflexInterval: document.getElementById('reflexInterval'),
@@ -484,14 +1269,10 @@ const elements = {
   triggerReflexButton: document.getElementById('triggerReflexButton'),
   reflexStatusText: document.getElementById('reflexStatusText'),
   agentAName: document.getElementById('agentAName'),
-  agentAPrompt: document.getElementById('agentAPrompt'),
   agentBName: document.getElementById('agentBName'),
   agentBPrompt: document.getElementById('agentBPrompt'),
-  agentAProviderSelect: document.getElementById('agentAProviderSelect'),
-  agentAProviderNotes: document.getElementById('agentAProviderNotes'),
-  agentAEndpoint: document.getElementById('agentAEndpoint'),
-  agentAModel: document.getElementById('agentAModel'),
-  agentAApiKey: document.getElementById('agentAApiKey'),
+  requestTimeout: document.getElementById('requestTimeout'),
+  reasoningTimeout: document.getElementById('reasoningTimeout'),
   agentBProviderSelect: document.getElementById('agentBProviderSelect'),
   agentBProviderNotes: document.getElementById('agentBProviderNotes'),
   agentBEndpoint: document.getElementById('agentBEndpoint'),
@@ -551,6 +1332,10 @@ async function init() {
   populateArenaProviderSelects();
   populateTtsControls();
   bindEvents();
+  ensureEmbeddingCacheManifest(); // CODEx: Hydrate embedding cache manifest before retrieval operations.
+  await resolveActiveEmbeddingProvider(true); // CODEx: Probe embedding provider at startup for accurate status.
+  primeRamDiskCache();
+  await ensurePhasePromptBaseline(); // CODEx: Confirm arena phase prompts are provisioned before debates begin.
   applyDebugSetting();
   updateConfigInputs();
   updateSpeakToggle();
@@ -575,6 +1360,7 @@ async function init() {
   updateChunkerStatus();
   addSystemMessage('SAM is ready. Configure Model A to enable live responses and arena debates.');
   setActiveMode(MODE_CHOOSER);
+  window.addEventListener('message', handleStandaloneWatchdogMessage);
   window.addEventListener('beforeunload', () => {
     void recordLog('shutdown', 'Browser session closed.', { level: 'info', silent: true });
   });
@@ -621,25 +1407,29 @@ function setActiveMode(mode) {
 
 function loadConfig() {
   try {
-    const stored = window.localStorage.getItem('sam-config');
+    const stored = storageGetItem('sam-config');
     if (stored) {
       config = { ...config, ...JSON.parse(stored) };
     }
     if (!providerPresetMap.has(config.providerPreset)) {
       config.providerPreset = defaultConfig.providerPreset;
     }
-    if (!config.agentAProviderPreset || (config.agentAProviderPreset !== 'inherit' && !providerPresetMap.has(config.agentAProviderPreset))) {
-      config.agentAProviderPreset = defaultConfig.agentAProviderPreset;
-    }
+    config.memoryLimitMB = clampNumber(
+      config.memoryLimitMB ?? defaultConfig.memoryLimitMB,
+      MIN_MEMORY_LIMIT_MB,
+      MAX_MEMORY_LIMIT_MB,
+      defaultConfig.memoryLimitMB
+    );
     if (!config.agentBProviderPreset || (config.agentBProviderPreset !== 'inherit' && !providerPresetMap.has(config.agentBProviderPreset))) {
       config.agentBProviderPreset = defaultConfig.agentBProviderPreset;
     }
     if (typeof config.agentBEnabled !== 'boolean') {
       config.agentBEnabled = defaultConfig.agentBEnabled;
     }
-    config.agentAEndpoint = config.agentAEndpoint ?? '';
-    config.agentAModel = config.agentAModel ?? '';
-    config.agentAApiKey = config.agentAApiKey ?? '';
+    delete config.agentAProviderPreset;
+    delete config.agentAEndpoint;
+    delete config.agentAModel;
+    delete config.agentAApiKey;
     config.agentBEndpoint = config.agentBEndpoint ?? '';
     config.agentBModel = config.agentBModel ?? '';
     config.agentBApiKey = config.agentBApiKey ?? '';
@@ -657,9 +1447,38 @@ function loadConfig() {
       defaultConfig.maxResponseTokens
     );
     config.maxResponseTokens = Math.round(clampedMaxTokens);
+    config.reasoningModeEnabled = Boolean(config.reasoningModeEnabled);
+    config.useEmbeddingRetrieval = typeof config.useEmbeddingRetrieval === 'boolean' ? config.useEmbeddingRetrieval : defaultConfig.useEmbeddingRetrieval; // CODEx: Normalize embedding toggle with sane default.
+    if (!config.embeddingModel || typeof config.embeddingModel !== 'string') {
+      config.embeddingModel = defaultConfig.embeddingModel;
+    } else {
+      config.embeddingModel = config.embeddingModel.trim();
+    }
+    config.embeddingEndpoint = typeof config.embeddingEndpoint === 'string'
+      ? config.embeddingEndpoint.trim()
+      : '';
+    config.embeddingApiKey = typeof config.embeddingApiKey === 'string'
+      ? config.embeddingApiKey.trim()
+      : '';
+    const allowedEmbeddingProviders = new Set(Object.values(EMBEDDING_PROVIDERS)); // CODEx: Validate provider preference.
+    const storedPreference = typeof config.embeddingProviderPreference === 'string'
+      ? config.embeddingProviderPreference.toLowerCase().trim()
+      : '';
+    const normalizedPreference = storedPreference === 'ollama'
+      ? EMBEDDING_PROVIDERS.OLLAMA_LOCAL
+      : storedPreference; // CODEx: Migrate legacy Ollama preference to explicit local variant.
+    config.embeddingProviderPreference = allowedEmbeddingProviders.has(normalizedPreference)
+      ? normalizedPreference
+      : defaultConfig.embeddingProviderPreference; // CODEx: Default to auto when preference invalid.
     if (typeof config.dualTurnLimit !== 'number' || config.dualTurnLimit < 0) {
       config.dualTurnLimit = defaultConfig.dualTurnLimit;
     }
+    config.dualTurnDelaySeconds = clampNumber(
+      config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds,
+      0,
+      600,
+      defaultConfig.dualTurnDelaySeconds
+    );
     const storedSeed = typeof config.dualSeed === 'string' ? config.dualSeed.trim() : '';
     config.dualSeed = storedSeed || DEFAULT_DUAL_SEED;
     const allowedBackgroundSources = new Set(['default', 'url', 'upload']);
@@ -684,10 +1503,27 @@ function loadConfig() {
     );
     config.entropyWindow = clampNumber(
       config.entropyWindow ?? defaultConfig.entropyWindow,
-      2,
-      50,
+      1,
+      25,
       defaultConfig.entropyWindow
     );
+    config.requestTimeoutSeconds = clampNumber(
+      config.requestTimeoutSeconds ?? defaultConfig.requestTimeoutSeconds,
+      5,
+      600,
+      defaultConfig.requestTimeoutSeconds
+    );
+    const reasoningFallback = Math.max(defaultConfig.reasoningTimeoutSeconds, config.requestTimeoutSeconds);
+    config.reasoningTimeoutSeconds = clampNumber(
+      config.reasoningTimeoutSeconds ?? reasoningFallback,
+      15,
+      900,
+      reasoningFallback
+    );
+    config.reasoningTimeoutSeconds = Math.max(config.reasoningTimeoutSeconds, config.requestTimeoutSeconds);
+    syncReasoningTimeoutToShell(); // CODEx: Propagate timeout to standalone shell.
+    config.autoInjectMemories = Boolean(config.autoInjectMemories);
+    config.openRouterPolicy = (config.openRouterPolicy ?? '').trim();
   } catch (error) {
     console.error('Failed to load config:', error);
   }
@@ -695,7 +1531,7 @@ function loadConfig() {
 
 function loadPinnedMessages() {
   try {
-    const stored = window.localStorage.getItem(PINNED_STORAGE_KEY);
+    const stored = storageGetItem(PINNED_STORAGE_KEY);
     if (!stored) {
       pinnedMessageIds = new Set();
       return;
@@ -712,7 +1548,7 @@ function loadPinnedMessages() {
 
 function loadRetrievalMetrics() {
   try {
-    const stored = window.localStorage.getItem(RETRIEVAL_STORAGE_KEY);
+    const stored = storageGetItem(RETRIEVAL_STORAGE_KEY);
     if (!stored) {
       retrievalMetrics = {
         A: { total: 0, lastCount: 0, lastAt: null },
@@ -753,7 +1589,7 @@ function persistRetrievalMetrics() {
       A: retrievalMetrics.A,
       B: retrievalMetrics.B
     };
-    window.localStorage.setItem(RETRIEVAL_STORAGE_KEY, JSON.stringify(payload));
+    storageSetItem(RETRIEVAL_STORAGE_KEY, JSON.stringify(payload));
   } catch (error) {
     console.error('Failed to persist retrieval metrics:', error);
   }
@@ -805,10 +1641,10 @@ function createRagSessionId(mode) {
 
 function ensureRagSessionId(mode) {
   const key = getRagSessionKey(mode);
-  let sessionId = window.localStorage.getItem(key);
+  let sessionId = storageGetItem(key);
   if (!sessionId) {
     sessionId = createRagSessionId(mode);
-    window.localStorage.setItem(key, sessionId);
+    storageSetItem(key, sessionId);
   }
   if (mode === MODE_CHAT) {
     activeChatSessionId = sessionId;
@@ -821,7 +1657,7 @@ function ensureRagSessionId(mode) {
 function rotateRagSession(mode) {
   const key = getRagSessionKey(mode);
   const sessionId = createRagSessionId(mode);
-  window.localStorage.setItem(key, sessionId);
+  storageSetItem(key, sessionId);
   if (mode === MODE_CHAT) {
     activeChatSessionId = sessionId;
     chatCheckpointBuffer = [];
@@ -854,7 +1690,6 @@ function populateProviderSelect() {
 }
 
 function populateArenaProviderSelects() {
-  populateProviderOptions(elements.agentAProviderSelect, { includeInherit: true });
   populateProviderOptions(elements.agentBProviderSelect, { includeInherit: true });
 }
 
@@ -882,14 +1717,37 @@ function updateProviderNotes() {
   if (preset.requiresKey) {
     parts.push('API key required. Paste it below before saving.');
   }
+  if (preset.id === 'openrouter') {
+    parts.push('Set the data policy below to match your OpenRouter privacy settings.');
+  }
   elements.providerNotes.textContent = parts.filter(Boolean).join(' ');
 }
 
+function applyOpenRouterPolicyVisibility() {
+  const field = elements.openRouterPolicyField;
+  const input = elements.openRouterPolicyInput;
+  if (!field) return;
+  const primaryPreset = config.providerPreset ?? 'custom';
+  const arenaPreset = config.agentBProviderPreset ?? 'inherit';
+  const effectiveArenaPreset = arenaPreset === 'inherit' ? primaryPreset : arenaPreset;
+  const isOpenRouter = primaryPreset === 'openrouter' || effectiveArenaPreset === 'openrouter';
+  field.hidden = !isOpenRouter;
+  field.setAttribute('aria-hidden', String(!isOpenRouter));
+  if (input) {
+    input.disabled = !isOpenRouter;
+  }
+}
+
 function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
-  const prefix = agent === 'A' ? 'agentA' : 'agentB';
+  if (agent === 'A') {
+    return;
+  }
+
+  const prefix = 'agentB';
   if (!presetId || presetId === 'inherit') {
     config[`${prefix}ProviderPreset`] = 'inherit';
     updateAgentConnectionInputs(agent);
+    applyOpenRouterPolicyVisibility();
     saveConfig();
     updateModelConnectionStatus();
     if (!silent) {
@@ -907,6 +1765,7 @@ function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
     config[`${prefix}Model`] = preset.model;
   }
   updateAgentConnectionInputs(agent);
+  applyOpenRouterPolicyVisibility();
   saveConfig();
   updateModelConnectionStatus();
   if (!silent && preset.id !== 'custom') {
@@ -917,22 +1776,55 @@ function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
 }
 
 function getAgentDisplayName(agent) {
-  return agent === 'A' ? config.agentAName || 'SAM-A' : config.agentBName || 'SAM-B';
+  if (agent === 'A') {
+    return config.agentAName || 'SAM-A';
+  }
+  if (agent === 'B') {
+    return config.agentBName || 'SAM-B';
+  }
+  if (agent === 'system') {
+    return 'System';
+  }
+  if (typeof agent === 'string' && agent.trim()) {
+    return agent;
+  }
+  return 'System';
 }
 
 function getAgentPersona(agent) {
-  const raw = agent === 'A' ? config.agentAPrompt : config.agentBPrompt;
-  return raw?.trim() ?? '';
+  if (agent === 'A') {
+    const primary = config.agentAPrompt?.trim();
+    if (primary) {
+      return primary;
+    }
+    return config.systemPrompt?.trim() ?? '';
+  }
+  return config.agentBPrompt?.trim() ?? '';
 }
 
 function saveConfig() {
-  window.localStorage.setItem('sam-config', JSON.stringify(config));
+  storageSetItem('sam-config', JSON.stringify(config));
 }
 
 function updateConfigInputs() {
-  elements.memorySlider.value = config.memoryLimitMB;
+  if (elements.memorySlider) {
+    elements.memorySlider.min = String(MIN_MEMORY_LIMIT_MB);
+    elements.memorySlider.max = String(MAX_MEMORY_LIMIT_MB);
+    elements.memorySlider.step = String(MEMORY_LIMIT_STEP_MB);
+    elements.memorySlider.value = config.memoryLimitMB;
+  }
   elements.memorySliderValue.innerHTML = `${config.memoryLimitMB}&nbsp;MB`;
   elements.retrievalCount.value = config.retrievalCount;
+  if (elements.autoInjectMemories) {
+    elements.autoInjectMemories.checked = Boolean(config.autoInjectMemories);
+  }
+  if (elements.reasoningModeToggle) {
+    elements.reasoningModeToggle.checked = Boolean(config.reasoningModeEnabled);
+  }
+  if (elements.embeddingRetrievalToggle) {
+    elements.embeddingRetrievalToggle.checked = isEmbeddingRetrievalEnabled(); // CODEx: Reflect embedding toggle state in UI.
+  }
+  refreshEmbeddingStatusIndicator(); // CODEx: Update embedding status banner after syncing configuration.
   elements.contextTurns.value = config.contextTurns;
   if (elements.providerSelect) {
     elements.providerSelect.value = config.providerPreset ?? defaultConfig.providerPreset;
@@ -940,18 +1832,41 @@ function updateConfigInputs() {
   elements.endpointInput.value = config.endpoint;
   elements.modelInput.value = config.model;
   elements.apiKeyInput.value = config.apiKey;
+  if (elements.embeddingModelInput) {
+    elements.embeddingModelInput.value = config.embeddingModel ?? defaultConfig.embeddingModel;
+  }
+  if (elements.embeddingEndpointInput) {
+    elements.embeddingEndpointInput.value = config.embeddingEndpoint ?? '';
+  }
+  if (elements.embeddingApiKeyInput) {
+    elements.embeddingApiKeyInput.value = config.embeddingApiKey ?? '';
+  }
+  if (elements.embeddingProviderSelect) {
+    elements.embeddingProviderSelect.value = config.embeddingProviderPreference ?? defaultConfig.embeddingProviderPreference; // CODEx: Reflect provider preference dropdown.
+  }
+  if (elements.openRouterPolicyInput) {
+    elements.openRouterPolicyInput.value = config.openRouterPolicy ?? '';
+  }
+  if (elements.requestTimeout) {
+    elements.requestTimeout.value = config.requestTimeoutSeconds;
+  }
+  if (elements.reasoningTimeout) {
+    elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+  }
   elements.systemPromptInput.value = config.systemPrompt;
   elements.temperatureInput.value = config.temperature;
   if (elements.maxTokensInput) {
     updateMaxTokensCeiling();
   }
-  updateAgentConnectionInputs('A');
   updateAgentConnectionInputs('B');
   if (elements.dualSeedInput) {
     elements.dualSeedInput.value = config.dualSeed ?? DEFAULT_DUAL_SEED;
   }
   const limitValue = config.dualTurnLimit > 0 ? String(config.dualTurnLimit) : '';
   elements.dualTurnLimit.value = limitValue;
+  if (elements.dualTurnDelay) {
+    elements.dualTurnDelay.value = String(config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds);
+  }
   elements.dualAutoContinue.checked = config.dualAutoContinue;
   if (elements.reflexToggle) {
     elements.reflexToggle.checked = Boolean(config.reflexEnabled);
@@ -964,7 +1879,6 @@ function updateConfigInputs() {
   }
   applyAgentBEnabledState();
   elements.agentAName.value = config.agentAName;
-  elements.agentAPrompt.value = config.agentAPrompt;
   elements.agentBName.value = config.agentBName;
   elements.agentBPrompt.value = config.agentBPrompt;
   if (elements.ttsPresetSelect) {
@@ -986,6 +1900,7 @@ function updateConfigInputs() {
     elements.debugToggle.checked = Boolean(config.debugEnabled);
   }
   updateProviderNotes();
+  applyOpenRouterPolicyVisibility();
   updateTtsPresetDetails();
   updateTtsVolumeLabel();
   if (elements.backgroundUrlInput) {
@@ -996,11 +1911,16 @@ function updateConfigInputs() {
 }
 
 function updateAgentConnectionInputs(agent) {
-  const prefix = agent === 'A' ? 'agentA' : 'agentB';
-  const providerSelect = elements[`${prefix}ProviderSelect`];
-  const endpointInput = elements[`${prefix}Endpoint`];
-  const modelInput = elements[`${prefix}Model`];
-  const apiKeyInput = elements[`${prefix}ApiKey`];
+  if (agent === 'A') {
+    updateArenaProviderNotes('A', getAgentConnection('A'));
+    return;
+  }
+
+  const prefix = 'agentB';
+  const providerSelect = elements.agentBProviderSelect;
+  const endpointInput = elements.agentBEndpoint;
+  const modelInput = elements.agentBModel;
+  const apiKeyInput = elements.agentBApiKey;
   const providerKey = config[`${prefix}ProviderPreset`] ?? 'inherit';
   const connection = getAgentConnection(agent);
 
@@ -1008,7 +1928,7 @@ function updateAgentConnectionInputs(agent) {
     providerSelect.value = providerKey;
   }
 
-  if (agent === 'B' && !config.agentBEnabled) {
+  if (!config.agentBEnabled) {
     if (providerSelect) providerSelect.disabled = true;
     if (endpointInput) endpointInput.disabled = true;
     if (modelInput) modelInput.disabled = true;
@@ -1076,13 +1996,16 @@ function applyAgentBEnabledState() {
     if (node) {
       if (!enabled) {
         node.disabled = true;
-      } else if (key === 'agentBProviderSelect' || key === 'agentBName' || key === 'agentBPrompt') {
+      } else {
         node.disabled = false;
       }
     }
   }
   if (!enabled && elements.agentBProviderNotes) {
     elements.agentBProviderNotes.textContent = 'Enable Model B to configure a separate connection.';
+  }
+  if (enabled) {
+    updateAgentConnectionInputs('B');
   }
   updateProcessState(
     'modelB',
@@ -1093,14 +2016,12 @@ function applyAgentBEnabledState() {
 }
 
 function updateArenaProviderNotes(agent, connection = getAgentConnection(agent)) {
-  const notesElement = agent === 'A' ? elements.agentAProviderNotes : elements.agentBProviderNotes;
+  if (agent === 'A') return;
+  const notesElement = elements.agentBProviderNotes;
   if (!notesElement) return;
   if (connection.inherits) {
     const baseLabel = connection.providerLabel || 'Custom';
-    notesElement.textContent =
-      agent === 'A'
-        ? `Using the primary Model A connection (${baseLabel}).`
-        : `Sharing Model A settings (${baseLabel}).`;
+    notesElement.textContent = `Sharing Model A settings (${baseLabel}).`;
     return;
   }
   const parts = [connection.providerLabel];
@@ -1114,23 +2035,34 @@ function updateArenaProviderNotes(agent, connection = getAgentConnection(agent))
 }
 
 function getAgentConnection(agent) {
-  const prefix = agent === 'A' ? 'agentA' : 'agentB';
-  const agentPresetId = config[`${prefix}ProviderPreset`] ?? 'inherit';
-  const inherits = agentPresetId === 'inherit';
   const basePreset = providerPresetMap.get(config.providerPreset) ?? providerPresetMap.get('custom');
+
+  if (agent === 'A') {
+    return {
+      endpoint: config.endpoint,
+      model: config.model,
+      apiKey: config.apiKey,
+      temperature: config.temperature,
+      maxTokens: config.maxResponseTokens,
+      providerPreset: basePreset?.id ?? 'custom',
+      providerLabel: basePreset ? `${basePreset.label} (main)` : 'Custom',
+      presetDescription: basePreset?.description ?? '',
+      requiresKey: Boolean(basePreset?.requiresKey),
+      inherits: false,
+      agentPresetId: basePreset?.id ?? 'custom',
+      openRouterPolicy: config.openRouterPolicy
+    };
+  }
+
+  const agentPresetId = config.agentBProviderPreset ?? 'inherit';
+  const inherits = agentPresetId === 'inherit';
   const preset = inherits
     ? basePreset
     : providerPresetMap.get(agentPresetId) ?? providerPresetMap.get('custom');
 
-  const endpoint = inherits
-    ? config.endpoint
-    : config[`${prefix}Endpoint`] || preset?.endpoint || '';
-  const model = inherits
-    ? config.model
-    : config[`${prefix}Model`] || preset?.model || '';
-  const apiKey = inherits
-    ? config.apiKey
-    : config[`${prefix}ApiKey`] || '';
+  const endpoint = inherits ? config.endpoint : config.agentBEndpoint || preset?.endpoint || '';
+  const model = inherits ? config.model : config.agentBModel || preset?.model || '';
+  const apiKey = inherits ? config.apiKey : config.agentBApiKey || '';
 
   return {
     endpoint,
@@ -1143,7 +2075,8 @@ function getAgentConnection(agent) {
     presetDescription: preset?.description ?? '',
     requiresKey: Boolean(preset?.requiresKey),
     inherits,
-    agentPresetId
+    agentPresetId,
+    openRouterPolicy: config.openRouterPolicy
   };
 }
 
@@ -1232,6 +2165,7 @@ function clearBackgroundImage() {
 
 function applyBackgroundFromConfig() {
   const body = document.body;
+  const root = document.documentElement;
   if (!body) return;
   const source = config.backgroundSource ?? 'default';
   let backgroundValue = DEFAULT_BACKGROUND;
@@ -1242,6 +2176,9 @@ function applyBackgroundFromConfig() {
   } else if (source === 'url' && config.backgroundUrl) {
     backgroundValue = `${CUSTOM_BACKGROUND_OVERLAY}, url(${config.backgroundUrl}), ${DEFAULT_BACKGROUND}`;
     hasCustom = true;
+  }
+  if (root) {
+    root.style.setProperty('--app-bg', backgroundValue);
   }
   body.style.setProperty('--app-bg', backgroundValue);
   body.dataset.hasCustomBg = hasCustom ? 'true' : 'false';
@@ -1338,7 +2275,11 @@ function bindEvents() {
   addListener(elements.clearChatButton, 'click', clearChatWindow);
 
   addListener(elements.memorySlider, 'input', (event) => {
-    const value = Number.parseInt(event.target.value, 10);
+    const rawValue = Number.parseInt(event.target.value, 10);
+    const value = clampNumber(rawValue, MIN_MEMORY_LIMIT_MB, MAX_MEMORY_LIMIT_MB, config.memoryLimitMB);
+    if (String(value) !== event.target.value) {
+      event.target.value = String(value);
+    }
     config.memoryLimitMB = value;
     elements.memorySliderValue.innerHTML = `${value}&nbsp;MB`;
     saveConfig();
@@ -1356,6 +2297,24 @@ function bindEvents() {
     saveConfig();
   });
 
+  addListener(elements.reasoningModeToggle, 'change', (event) => {
+    config.reasoningModeEnabled = event.target.checked;
+    saveConfig();
+    updateMemoryStatus();
+  });
+
+  addListener(elements.autoInjectMemories, 'change', (event) => {
+    config.autoInjectMemories = event.target.checked;
+    saveConfig();
+    updateRagStatusDisplay();
+  });
+  // CODEx: Separate memory injection handling from embedding toggle logic for clarity.
+  addListener(elements.embeddingRetrievalToggle, 'change', (event) => {
+    config.useEmbeddingRetrieval = event.target.checked; // CODEx: Persist embedding toggle state on interaction.
+    saveConfig(); // CODEx: Store updated configuration immediately.
+    refreshEmbeddingStatusIndicator(); // CODEx: Reflect new embedding availability in the UI.
+  });
+
   addListener(elements.contextTurns, 'change', (event) => {
     config.contextTurns = clampNumber(event.target.value, 2, 40, config.contextTurns);
     elements.contextTurns.value = config.contextTurns;
@@ -1364,10 +2323,6 @@ function bindEvents() {
 
   addListener(elements.providerSelect, 'change', (event) => {
     applyProviderPreset(event.target.value, { silent: false });
-  });
-
-  addListener(elements.agentAProviderSelect, 'change', (event) => {
-    applyArenaProviderPreset('A', event.target.value);
   });
 
   addListener(elements.agentBProviderSelect, 'change', (event) => {
@@ -1384,34 +2339,105 @@ function bindEvents() {
 
   addListener(elements.endpointInput, 'input', (event) => {
     config.endpoint = event.target.value.trim();
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
+    void resolveActiveEmbeddingProvider(true); // CODEx: Re-probe embedding provider when base endpoint changes.
   });
 
   addListener(elements.modelInput, 'input', (event) => {
     config.model = event.target.value.trim();
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
   });
 
   addListener(elements.apiKeyInput, 'input', (event) => {
     config.apiKey = event.target.value;
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
+    void resolveActiveEmbeddingProvider(true); // CODEx: Re-evaluate embedding provider when shared API key updates.
   });
 
-  addListener(elements.agentAEndpoint, 'input', (event) => {
-    config.agentAEndpoint = event.target.value.trim();
+  if (elements.embeddingModelInput) {
+    addListener(elements.embeddingModelInput, 'change', (event) => {
+      config.embeddingModel = event.target.value.trim() || defaultConfig.embeddingModel;
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
+  if (elements.embeddingEndpointInput) {
+    addListener(elements.embeddingEndpointInput, 'input', (event) => {
+      config.embeddingEndpoint = event.target.value.trim();
+      saveConfig();
+      clearCachedEmbeddings();
+      void resolveActiveEmbeddingProvider(true); // CODEx: Refresh provider detection when embedding endpoint overrides change.
+    });
+  }
+
+  if (elements.embeddingApiKeyInput) {
+    addListener(elements.embeddingApiKeyInput, 'input', (event) => {
+      config.embeddingApiKey = event.target.value.trim();
+      saveConfig();
+      clearCachedEmbeddings();
+      void resolveActiveEmbeddingProvider(true); // CODEx: Trigger provider probe to reflect new embedding key.
+    });
+  }
+
+  if (elements.embeddingProviderSelect) {
+    addListener(elements.embeddingProviderSelect, 'change', (event) => {
+      config.embeddingProviderPreference = event.target.value; // CODEx: Persist provider preference selection.
+      saveConfig(); // CODEx: Retain selection across sessions.
+      void resolveActiveEmbeddingProvider(true); // CODEx: Re-probe provider immediately after preference change.
+    });
+  }
+
+  if (elements.openRouterPolicyInput) {
+    addListener(elements.openRouterPolicyInput, 'input', (event) => {
+      config.openRouterPolicy = event.target.value.trim();
+      saveConfig();
+    });
+  }
+
+  addListener(elements.requestTimeout, 'change', (event) => {
+    config.requestTimeoutSeconds = clampNumber(event.target.value, 5, 600, config.requestTimeoutSeconds);
+    elements.requestTimeout.value = config.requestTimeoutSeconds;
+    if (config.reasoningTimeoutSeconds < config.requestTimeoutSeconds) {
+      config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
+      if (elements.reasoningTimeout) {
+        elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+      }
+      syncReasoningTimeoutToShell(); // CODEx: Keep shell timeout aligned with new baseline.
+    }
     saveConfig();
   });
 
-  addListener(elements.agentAModel, 'input', (event) => {
-    config.agentAModel = event.target.value.trim();
+  addListener(elements.requestTimeout, 'input', (event) => {
+    config.requestTimeoutSeconds = clampNumber(event.target.value, 5, 600, config.requestTimeoutSeconds);
+    elements.requestTimeout.value = config.requestTimeoutSeconds;
+    if (config.reasoningTimeoutSeconds < config.requestTimeoutSeconds) {
+      config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
+      if (elements.reasoningTimeout) {
+        elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+      }
+      syncReasoningTimeoutToShell(); // CODEx: Reflect live baseline adjustments.
+    }
     saveConfig();
   });
 
-  addListener(elements.agentAApiKey, 'input', (event) => {
-    config.agentAApiKey = event.target.value;
+  addListener(elements.reasoningTimeout, 'change', (event) => {
+    config.reasoningTimeoutSeconds = clampNumber(event.target.value, 15, 900, config.reasoningTimeoutSeconds);
+    if (config.reasoningTimeoutSeconds < config.requestTimeoutSeconds) {
+      config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
+    }
+    elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+    syncReasoningTimeoutToShell(); // CODEx: Mirror manual changes into standalone shell.
+    saveConfig();
+  });
+
+  addListener(elements.reasoningTimeout, 'input', (event) => {
+    config.reasoningTimeoutSeconds = clampNumber(event.target.value, 15, 900, config.reasoningTimeoutSeconds);
+    if (config.reasoningTimeoutSeconds < config.requestTimeoutSeconds) {
+      config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
+    }
+    elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+    syncReasoningTimeoutToShell(); // CODEx: Sync live slider adjustments to shell.
     saveConfig();
   });
 
@@ -1516,6 +2542,14 @@ function bindEvents() {
     void manualRagReload();
   });
 
+  addListener(elements.loadChunkDataButton, 'click', () => {
+    void manualChunkReload();
+  });
+
+  addListener(elements.saveChatArchiveButton, 'click', () => {
+    void saveChatTranscriptToArchive();
+  });
+
   addListener(elements.archiveUnpinnedButton, 'click', () => {
     archiveUnpinnedFloatingMemory();
   });
@@ -1543,6 +2577,18 @@ function bindEvents() {
   addListener(elements.dualAutoContinue, 'change', (event) => {
     config.dualAutoContinue = event.target.checked;
     saveConfig();
+    if (!config.dualAutoContinue) {
+      if (autoContinueTimer) {
+        clearTimeout(autoContinueTimer);
+        autoContinueTimer = undefined;
+      }
+      clearDualCountdownTimer();
+      if (isDualChatRunning && elements.dualStatus) {
+        elements.dualStatus.textContent = 'Auto-continue disabled. Use Step turn to advance.';
+      }
+    } else if (isDualChatRunning) {
+      scheduleNextDualTurn();
+    }
   });
 
   addListener(elements.reflexToggle, 'change', (event) => {
@@ -1560,7 +2606,7 @@ function bindEvents() {
 
   addListener(elements.entropyWindow, 'change', (event) => {
     const value = Number.parseInt(event.target.value, 10);
-    config.entropyWindow = clampNumber(value, 2, 50, defaultConfig.entropyWindow);
+    config.entropyWindow = clampNumber(value, 1, 25, defaultConfig.entropyWindow);
     event.target.value = String(config.entropyWindow);
     saveConfig();
     updateEntropyMeter();
@@ -1587,13 +2633,23 @@ function bindEvents() {
     saveConfig();
   });
 
-  addListener(elements.agentAName, 'input', (event) => {
-    config.agentAName = event.target.value.trim();
+  addListener(elements.dualTurnDelay, 'change', (event) => {
+    const parsed = Number.parseInt(event.target.value, 10);
+    config.dualTurnDelaySeconds = clampNumber(
+      Number.isNaN(parsed) ? defaultConfig.dualTurnDelaySeconds : parsed,
+      0,
+      600,
+      defaultConfig.dualTurnDelaySeconds
+    );
+    elements.dualTurnDelay.value = String(config.dualTurnDelaySeconds);
     saveConfig();
+    if (config.dualAutoContinue && isDualChatRunning && !modelAInFlight && !modelBInFlight) {
+      scheduleNextDualTurn();
+    }
   });
 
-  addListener(elements.agentAPrompt, 'input', (event) => {
-    config.agentAPrompt = event.target.value;
+  addListener(elements.agentAName, 'input', (event) => {
+    config.agentAName = event.target.value.trim();
     saveConfig();
   });
 
@@ -1690,6 +2746,11 @@ function bindEvents() {
   addListener(elements.chunkSizeInput, 'change', (event) => {
     chunkerState.chunkSize = clampNumber(event.target.value, 100, 2000, 500);
     event.target.value = String(chunkerState.chunkSize);
+    const adaptiveOverlap = Math.max(0, Math.round(chunkerState.chunkSize * 0.15));
+    chunkerState.chunkOverlap = adaptiveOverlap;
+    if (elements.chunkOverlapInput) {
+      elements.chunkOverlapInput.value = String(adaptiveOverlap);
+    }
   });
 
   addListener(elements.chunkOverlapInput, 'change', (event) => {
@@ -2059,6 +3120,9 @@ async function initDatabase() {
       if (!database.objectStoreNames.contains(LOG_STORE_NAME)) {
         database.createObjectStore(LOG_STORE_NAME, { keyPath: 'id' });
       }
+      if (!database.objectStoreNames.contains(REFLEX_HISTORY_STORE)) {
+        database.createObjectStore(REFLEX_HISTORY_STORE, { keyPath: 'id', autoIncrement: true });
+      }
     };
 
     request.onsuccess = (event) => {
@@ -2381,23 +3445,53 @@ async function fetchStaticRagRecords() {
     }
   }
 
+  const archiveEntries = listRamDiskArchiveEntries();
+  for (const { path, data } of archiveEntries) {
+    if (!path || !data) continue;
+    const entry = data.entry || {};
+    const content = typeof data.content === 'string' ? data.content : '';
+    const mode = entry.mode || MODE_CHAT;
+    const origin = entry.origin || 'rag-archive';
+    const role = entry.role || 'archive';
+    const label = entry.label || path.replace(/^rag\//, '');
+    const recordSlug = slugify(entry.id || path) || `archive-${Date.now()}`;
+    const recordId = entry.id || `ram-archive-${recordSlug}`;
+    const timestamp = normalizeTimestamp(entry.timestamp ?? data.savedAt ?? Date.now());
+    const message = {
+      id: `${recordId}-entry`,
+      role,
+      content,
+      timestamp,
+      origin,
+      mode,
+      pinned: Boolean(entry.pinned)
+    };
+    const bytes = content ? new Blob([content]).size : estimateMessagesSize([message]);
+    records.push({ id: recordId, label, mode, origin, messages: [message], bytes });
+    filesLoaded += 1;
+    bytesLoaded += bytes;
+  }
+
   return { records, filesLoaded, bytesLoaded, errors };
 }
 
 async function fetchRagManifest(descriptor) {
+  if (!descriptor?.url) return null;
   try {
     const response = await fetch(descriptor.url, { cache: 'no-store' });
-    if (!response.ok) {
-      if (response.status !== 404) {
-        console.warn(`RAG manifest ${descriptor.url} returned ${response.status}`);
-      }
-      return null;
+    if (response.ok) {
+      const manifest = await response.json();
+      cacheManifestInRam(descriptor, manifest);
+      persistManifestToStorage(descriptor, manifest);
+      return manifest;
     }
-    return await response.json();
+    if (response.status !== 404) {
+      console.warn(`RAG manifest ${descriptor.url} returned ${response.status}`);
+    }
   } catch (error) {
     console.warn('Unable to fetch RAG manifest', descriptor.url, error);
-    return null;
   }
+  return readManifestFromRam(descriptor) || readManifestFromStorage(descriptor);
 }
 
 function normalizeRagManifestEntries(manifest) {
@@ -2711,6 +3805,9 @@ function coerceExternalMessage(raw, defaults = {}) {
   if (raw.metadata && !message.metadata) {
     message.metadata = raw.metadata;
   }
+  if (Array.isArray(raw.embedding)) {
+    message.embedding = raw.embedding;
+  }
   return message;
 }
 
@@ -2724,9 +3821,65 @@ function slugify(value) {
     .replace(/^-+|-+$/g, '');
 }
 
+function buildFloatingSeenSet() {
+  const seen = new Set();
+  for (const item of floatingMemory) {
+    const id = normalizeMessageId(item.id ?? item.timestamp);
+    if (id) {
+      seen.add(id);
+    }
+  }
+  return seen;
+}
+
+function ingestRagRecords(records, seen = buildFloatingSeenSet()) {
+  let added = 0;
+  if (!Array.isArray(records)) {
+    return { added, seen };
+  }
+  for (const record of records) {
+    if (!record || !Array.isArray(record.messages)) continue;
+    for (const message of record.messages) {
+      const entry = coerceExternalMessage(message, {
+        baseId: record.id,
+        role: message.role || record.role || (record.mode === MODE_ARENA ? 'arena' : 'memory'),
+        origin: message.origin || record.origin || 'rag-indexed',
+        mode: message.mode || record.mode || MODE_CHAT,
+        pinned: message.pinned,
+        timestamp: message.timestamp
+      });
+      if (!entry || !entry.content) continue;
+      const normalizedId = normalizeMessageId(entry.id ?? entry.timestamp);
+      if (seen.has(normalizedId)) continue;
+      if (entry.pinned) {
+        pinnedMessageIds.add(normalizedId);
+      }
+      if (Array.isArray(entry.embedding)) {
+        messageEmbeddingCache.set(normalizedId, entry.embedding);
+        delete entry.embedding;
+      } else if (Array.isArray(message.embedding)) {
+        messageEmbeddingCache.set(normalizedId, message.embedding);
+      } else if (message.metadata?.embeddingKey) {
+        const cachedVector = chunkEmbeddingIndex.get(message.metadata.embeddingKey);
+        if (Array.isArray(cachedVector)) {
+          messageEmbeddingCache.set(normalizedId, cachedVector);
+        }
+      }
+      floatingMemory.push(entry);
+      seen.add(normalizedId);
+      added += 1;
+    }
+  }
+  if (added > 0) {
+    trimFloatingMemory();
+    persistPinnedMessages();
+  }
+  return { added, seen };
+}
+
 async function hydrateFloatingMemoryFromRag() {
   try {
-    const seen = new Set(floatingMemory.map((item) => normalizeMessageId(item.id ?? item.timestamp)));
+    const seen = buildFloatingSeenSet();
     const [indexedRecords, staticBundle, chunkedRecords] = await Promise.all([
       db
         ? getAllRagRecords().catch((error) => {
@@ -2781,34 +3934,7 @@ async function hydrateFloatingMemoryFromRag() {
       return;
     }
 
-    let added = 0;
-    for (const record of combinedRecords) {
-      if (!record || !Array.isArray(record.messages)) continue;
-      for (const message of record.messages) {
-        const entry = coerceExternalMessage(message, {
-          baseId: record.id,
-          role: message.role || record.role || (record.mode === MODE_ARENA ? 'arena' : 'memory'),
-          origin: message.origin || record.origin || 'rag-indexed',
-          mode: message.mode || record.mode || MODE_CHAT,
-          pinned: message.pinned,
-          timestamp: message.timestamp
-        });
-        if (!entry || !entry.content) continue;
-        const normalizedId = normalizeMessageId(entry.id ?? entry.timestamp);
-        if (seen.has(normalizedId)) continue;
-        if (entry.pinned) {
-          pinnedMessageIds.add(normalizedId);
-        }
-        floatingMemory.push(entry);
-        seen.add(normalizedId);
-        added += 1;
-      }
-    }
-
-    if (added > 0) {
-      trimFloatingMemory();
-      persistPinnedMessages();
-    }
+    const { added } = ingestRagRecords(combinedRecords, seen);
 
     ragTelemetry.lastLoad = Date.now();
     ragTelemetry.lastLoadCount = added;
@@ -2850,86 +3976,103 @@ async function hydrateFloatingMemoryFromRag() {
 async function loadChunkedRagRecords() {
   const records = [];
   try {
-    // First, try to load from actual file system in rag/chunked/
-    try {
-      const manifestResponse = await fetch('rag/manifest.json');
-      if (manifestResponse.ok) {
-        const manifest = await manifestResponse.json();
-        const files = manifest.files || [];
+    const seen = new Set();
 
-        for (const fileEntry of files) {
-          const chunkedPath = `rag/chunked/${fileEntry.path}`;
-          try {
-            const chunkedResponse = await fetch(chunkedPath);
-            if (chunkedResponse.ok) {
-              const data = await chunkedResponse.json();
-              if (data && Array.isArray(data.chunks) && data.chunks.length > 0) {
-                const messages = data.chunks.map((chunk, index) => ({
-                  id: `${data.originalPath}-chunk-${index}`,
-                  role: 'archive',
-                  content: chunk.content,
-                  timestamp: Date.now() + index, // Ensure unique timestamps
-                  origin: 'rag-chunked',
-                  mode: MODE_CHAT,
-                  pinned: false
-                }));
+    const [manifest, chunkedListing] = await Promise.all([
+      fetchRagManifest(STATIC_RAG_MANIFESTS[0]).catch((error) => {
+        console.warn('Could not load RAG manifest for chunked files:', error);
+        void recordLog('error', `Could not load RAG manifest for chunked files: ${error.message}`, { level: 'error' });
+        return null;
+      }),
+      listRagDirectoryEntries('rag/chunked/')
+    ]);
 
-                records.push({
-                  id: data.originalPath,
-                  label: `Chunked: ${data.originalPath}`,
-                  mode: MODE_CHAT,
-                  origin: 'rag-chunked',
-                  messages: messages,
-                  bytes: estimateMessagesSize(messages)
-                });
-                addSystemMessage(`✓ Loaded chunked file: ${fileEntry.path} (${data.chunks.length} chunks)`);
-              }
-            }
-          } catch (fileError) {
-            console.warn(`Could not load chunked file ${chunkedPath}:`, fileError);
-            void recordLog('error', `Could not load chunked file ${chunkedPath}: ${fileError.message}`, { level: 'error' });
-          }
+    const manifestEntries = normalizeRagManifestEntries(manifest);
+    const manifestChunkedPaths = manifestEntries
+      .map((entry) => (entry && entry.path ? toChunkedPath(resolveRagPath('rag/', entry.path)) : null))
+      .filter(Boolean);
+
+    const candidatePaths = filterChunkablePaths(dedupePaths([...manifestChunkedPaths, ...chunkedListing]));
+
+    for (const chunkedPath of candidatePaths) {
+      try {
+        const result = await loadChunkedFileData(chunkedPath, fromChunkedPath(chunkedPath));
+        const chunkList = result?.data?.chunks;
+        if (!Array.isArray(chunkList) || chunkList.length === 0) {
+          continue;
         }
+        const originalPath = result?.data?.originalPath || fromChunkedPath(chunkedPath);
+        const canonical = canonicalizeOriginalPath(originalPath || chunkedPath);
+        if (seen.has(canonical)) {
+          continue;
+        }
+        const messages = chunkList.map((chunk, index) => ({
+          id: `${originalPath}-chunk-${index}`,
+          role: 'archive',
+          content: chunk.content,
+          timestamp: Date.now() + index,
+          origin: 'rag-chunked',
+          mode: MODE_CHAT,
+          pinned: false
+        }));
+        const labelSuffix = result.source === 'ram' ? ' (RAM disk)' : '';
+        records.push({
+          id: originalPath,
+          label: `Chunked: ${originalPath}${labelSuffix}`,
+          mode: MODE_CHAT,
+          origin: 'rag-chunked',
+          messages,
+          bytes: estimateMessagesSize(messages)
+        });
+        seen.add(canonical);
+        const locationLabel = result.source === 'ram' ? 'RAM disk' : 'workspace';
+        addSystemMessage(`✓ Loaded chunked file: ${originalPath.replace(/^rag\//, '')} (${chunkList.length} chunks, ${locationLabel})`);
+      } catch (fileError) {
+        console.warn(`Could not load chunked file ${chunkedPath}:`, fileError);
+        void recordLog('error', `Could not load chunked file ${chunkedPath}: ${fileError.message}`, { level: 'error' });
       }
-    } catch (manifestError) {
-      console.warn('Could not load RAG manifest for chunked files:', manifestError);
-      void recordLog('error', `Could not load RAG manifest for chunked files: ${manifestError.message}`, { level: 'error' });
     }
 
-    // Fallback: load from localStorage
-    const keys = Object.keys(window.localStorage).filter(key => key.startsWith('sam-chunked-'));
-
-    for (const key of keys) {
-      try {
-        const data = JSON.parse(window.localStorage.getItem(key));
-        if (data && Array.isArray(data.chunks) && data.chunks.length > 0) {
-          // Skip if we already loaded this from file system
-          const alreadyLoaded = records.some(record => record.id === data.originalPath);
-          if (alreadyLoaded) continue;
-
-          const messages = data.chunks.map((chunk, index) => ({
-            id: `${data.originalPath}-chunk-${index}`,
-            role: 'archive',
-            content: chunk.content,
-            timestamp: Date.now() + index, // Ensure unique timestamps
-            origin: 'rag-chunked',
-            mode: MODE_CHAT,
-            pinned: false
-          }));
-
-          records.push({
-            id: data.originalPath,
-            label: `Chunked: ${data.originalPath} (localStorage)`,
-            mode: MODE_CHAT,
-            origin: 'rag-chunked',
-            messages: messages,
-            bytes: estimateMessagesSize(messages)
-          });
-        }
-      } catch (error) {
-        console.warn(`Failed to load chunked record ${key}:`, error);
-        void recordLog('error', `Failed to load chunked record ${key}: ${error.message}`, { level: 'error' });
+    for (const { path, data } of listRamDiskChunkedEntries()) {
+      const originalPath = typeof data?.originalPath === 'string' ? data.originalPath : fromChunkedPath(path);
+      const canonical = canonicalizeOriginalPath(originalPath || path);
+      if (!originalPath || seen.has(canonical) || !isSupportedChunkablePath(originalPath)) {
+        continue;
       }
+      const chunkList = Array.isArray(data?.chunks) ? data.chunks : [];
+      if (!chunkList.length) {
+        continue;
+      }
+      const messages = chunkList.map((chunk, index) => {
+        const key = `${canonical}#${index}`;
+        const vector = Array.isArray(chunk.embedding)
+          ? chunk.embedding
+          : chunkEmbeddingIndex.get(key) || null;
+        if (Array.isArray(vector)) {
+          storeChunkEmbedding(key, vector); // CODEx: Refresh cache footprint when hydrating from RAM disk.
+        }
+        return {
+          id: `${originalPath}-chunk-${index}`,
+          role: 'archive',
+          content: chunk.content,
+          timestamp: Date.now() + index,
+          origin: 'rag-chunked',
+          mode: MODE_CHAT,
+          pinned: false,
+          embedding: vector,
+          metadata: { embeddingKey: key }
+        };
+      });
+
+      records.push({
+        id: originalPath,
+        label: `Chunked: ${originalPath} (RAM disk)`,
+        mode: MODE_CHAT,
+        origin: 'rag-chunked',
+        messages,
+        bytes: estimateMessagesSize(messages)
+      });
+      seen.add(canonical);
     }
   } catch (error) {
     console.error('Error loading chunked RAG records:', error);
@@ -2954,6 +4097,701 @@ async function manualRagReload() {
   }
 }
 
+async function manualChunkReload() {
+  try {
+    const seen = buildFloatingSeenSet();
+    const chunkedRecords = await loadChunkedRagRecords();
+    if (!Array.isArray(chunkedRecords) || chunkedRecords.length === 0) {
+      addSystemMessage('No chunked files found to load into floating memory.');
+      return;
+    }
+    const priorRagCount = countRagMemories();
+    const { added } = ingestRagRecords(chunkedRecords, seen);
+    const totalBytes = chunkedRecords.reduce((total, record) => total + (record.bytes || 0), 0);
+    ragTelemetry.lastLoad = Date.now();
+    ragTelemetry.lastLoadCount = added;
+    ragTelemetry.lastLoadRecords = chunkedRecords.length;
+    ragTelemetry.lastLoadBytes = totalBytes;
+    ragTelemetry.staticFiles = 0;
+    ragTelemetry.staticBytes = 0;
+    ragTelemetry.staticErrors = [];
+    if (chunkedRecords.length > 0) {
+      ragTelemetry.loaded = true;
+    }
+    renderFloatingMemoryWorkbench();
+    updateMemoryStatus();
+    updateRagStatusDisplay();
+
+    if (added > 0) {
+      const memoryLabel = added === 1 ? 'memory snippet' : 'memory snippets';
+      const fileLabel = chunkedRecords.length === 1 ? 'chunked file' : 'chunked files';
+      addSystemMessage(`Loaded ${added} ${memoryLabel} from ${chunkedRecords.length} ${fileLabel} into floating memory.`);
+    } else if (priorRagCount === countRagMemories()) {
+      addSystemMessage('Chunked files were already present in floating memory.');
+    } else {
+      addSystemMessage('Checked chunked files. No new memories were added.');
+    }
+  } catch (error) {
+    console.error('Failed to load chunked memories', error);
+    addSystemMessage('Failed to load chunked memories. Check the debug console for details.');
+    void recordLog('error', `Failed to load chunked memories: ${error.message}`, { level: 'error' });
+  }
+}
+
+async function saveChatTranscriptToArchive() {
+  try {
+    const messages = await getAllMessages();
+    if (!Array.isArray(messages) || messages.length === 0) {
+      addSystemMessage('No chat messages available to archive yet.');
+      return;
+    }
+
+    const sorted = [...messages].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    const markdown = formatChatTranscriptMarkdown(sorted);
+    const now = new Date();
+    const iso = now.toISOString();
+    const slug = iso.replace(/[:.]/g, '-');
+    const fileName = `chat-${slug}.md`;
+    const archivePath = `rag/archives/${fileName}`;
+    const label = `Chat ${iso.slice(0, 16).replace('T', ' ')}`;
+    const manifestEntry = {
+      id: `chat-${slug}`,
+      label,
+      path: fileName,
+      mode: MODE_CHAT,
+      role: 'archive',
+      format: 'md',
+      timestamp: iso
+    };
+    const archivePayload = {
+      content: markdown,
+      entry: manifestEntry,
+      savedAt: iso,
+      messageCount: sorted.length
+    };
+
+    cacheArchiveInRam(archivePath, archivePayload);
+
+    let saveLocation = 'workspace';
+    try {
+      const response = await fetch(archivePath, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'text/markdown' },
+        body: markdown
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+    } catch (error) {
+      saveLocation = 'ram';
+      persistArchiveToStorage(archivePath, archivePayload);
+      console.warn('Failed to write chat archive to disk, using RAM disk fallback:', error);
+    }
+
+    const manifestLocation = await upsertArchiveManifest(manifestEntry);
+    if (manifestLocation === 'ram') {
+      saveLocation = 'ram';
+    }
+
+    ragTelemetry.lastSave = Date.now();
+    ragTelemetry.lastSaveMode = MODE_CHAT;
+    ragTelemetry.loaded = true;
+    updateRagStatusDisplay();
+
+    const locationLabel = saveLocation === 'ram' ? 'RAM disk' : 'workspace';
+    addSystemMessage(`Saved chat transcript to ${archivePath} (${locationLabel}).`);
+  } catch (error) {
+    console.error('Failed to save chat transcript', error);
+    addSystemMessage(`Failed to save chat transcript: ${error.message}`);
+    void recordLog('error', `Failed to save chat transcript: ${error.message}`, { level: 'error' });
+  }
+}
+
+function formatChatTranscriptMarkdown(messages) {
+  const lines = ['# Chat transcript', '', `Saved ${new Date().toLocaleString()}`, ''];
+  for (const message of messages) {
+    const timestamp = new Date(normalizeTimestamp(message.timestamp ?? Date.now())).toISOString();
+    const role = (message.role || 'unknown').toUpperCase();
+    const turn = message.turnNumber ? ` (turn ${message.turnNumber})` : '';
+    lines.push(`## ${role}${turn}`);
+    lines.push(`*${timestamp}*`);
+    lines.push('');
+    lines.push(message.content || '');
+    lines.push('');
+  }
+  return lines.join('\n').trim();
+}
+
+async function upsertArchiveManifest(entry) {
+  if (!entry) return 'unknown';
+  const descriptor = STATIC_RAG_MANIFESTS.find((item) => item.url === 'rag/archives/manifest.json');
+  if (!descriptor) return 'unknown';
+  const existing = (await fetchRagManifest(descriptor)) || { entries: [] };
+  const currentEntries = normalizeRagManifestEntries(existing);
+  const nextEntries = currentEntries.filter((item) => {
+    if (!item) return false;
+    const itemPath = item.path || item.file || item.source;
+    if (itemPath && itemPath === entry.path) {
+      return false;
+    }
+    if (item.id && item.id === entry.id) {
+      return false;
+    }
+    return true;
+  });
+  nextEntries.push(entry);
+  const payload = { entries: nextEntries };
+  cacheManifestInRam(descriptor, payload);
+
+  try {
+    const response = await fetch(descriptor.url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload, null, 2)
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return 'workspace';
+  } catch (error) {
+    console.warn('Failed to update archive manifest on disk:', error);
+    persistManifestToStorage(descriptor, payload);
+    return 'ram';
+  }
+}
+
+function toChunkedPath(originalPath) {
+  if (typeof originalPath !== 'string' || !originalPath) {
+    return '';
+  }
+  const normalized = originalPath.replace(/\\/g, '/');
+  if (normalized.startsWith('rag/chunked/')) {
+    return normalized;
+  }
+  if (normalized.startsWith('rag/unchunked/')) {
+    return `rag/chunked/${normalized.slice('rag/unchunked/'.length)}`;
+  }
+  if (normalized.startsWith('rag/')) {
+    return `rag/chunked/${normalized.slice('rag/'.length)}`;
+  }
+  return `rag/chunked/${normalized.replace(/^\//, '')}`;
+}
+
+function fromChunkedPath(chunkedPath) {
+  if (typeof chunkedPath !== 'string' || !chunkedPath) {
+    return '';
+  }
+  const normalized = chunkedPath.replace(/\\/g, '/');
+  if (normalized.startsWith('rag/chunked/')) {
+    return `rag/unchunked/${normalized.slice('rag/chunked/'.length)}`;
+  }
+  return normalized;
+}
+
+function toUnchunkedPath(originalPath) {
+  if (typeof originalPath !== 'string' || !originalPath) {
+    return '';
+  }
+  const normalized = originalPath.replace(/\\/g, '/');
+  if (normalized.startsWith('rag/unchunked/')) {
+    return normalized;
+  }
+  if (normalized.startsWith('rag/chunked/')) {
+    return `rag/unchunked/${normalized.slice('rag/chunked/'.length)}`;
+  }
+  if (normalized.startsWith('rag/')) {
+    return `rag/unchunked/${normalized.slice('rag/'.length)}`;
+  }
+  return `rag/unchunked/${normalized.replace(/^\//, '')}`;
+}
+
+function canonicalizeOriginalPath(path) {
+  if (typeof path !== 'string' || !path) {
+    return '';
+  }
+  return toUnchunkedPath(path);
+}
+
+function dedupePaths(paths) {
+  return Array.from(new Set((Array.isArray(paths) ? paths : [paths]).filter(Boolean)));
+}
+
+function cacheChunkedInRam(paths, data) {
+  if (!data) return;
+  const targets = new Set(dedupePaths(paths));
+  if (data && typeof data.originalPath === 'string') {
+    targets.add(data.originalPath);
+    targets.add(toChunkedPath(data.originalPath));
+  }
+  if (data && typeof data.chunkedPath === 'string') {
+    targets.add(data.chunkedPath);
+  }
+  for (const path of targets) {
+    if (path) {
+      ramDiskCache.chunked.set(path, data);
+    }
+  }
+}
+
+function cacheUnchunkedInRam(paths, content) {
+  if (typeof content !== 'string') return;
+  const targets = dedupePaths(paths);
+  for (const path of targets) {
+    if (path) {
+      ramDiskCache.unchunked.set(path, content);
+    }
+  }
+}
+
+function clearUnchunkedRamEntries(paths) {
+  const targets = dedupePaths(paths);
+  for (const path of targets) {
+    if (!path) continue;
+    ramDiskCache.unchunked.delete(path);
+    try {
+      storageRemoveItem(`${RAM_DISK_UNCHUNKED_PREFIX}${path}`);
+    } catch (error) {
+      console.debug(`Failed to remove cached unchunked entry for ${path}:`, error);
+    }
+  }
+}
+
+function cacheArchiveInRam(path, payload) {
+  if (!path || !payload) return;
+  ramDiskCache.archives.set(path, payload);
+}
+
+function persistArchiveToStorage(path, payload) {
+  if (!path || !payload) return;
+  try {
+    storageSetItem(`${RAM_DISK_ARCHIVE_PREFIX}${path}`, JSON.stringify(payload));
+  } catch (error) {
+    console.warn(`Failed to persist archive ${path} to RAM disk storage:`, error);
+  }
+}
+
+function listRamDiskArchiveEntries() {
+  const results = new Map();
+  for (const [path, data] of ramDiskCache.archives.entries()) {
+    results.set(path, { path, data });
+  }
+  const prefixLength = RAM_DISK_ARCHIVE_PREFIX.length;
+  for (const key of storageKeys()) {
+    if (!key.startsWith(RAM_DISK_ARCHIVE_PREFIX)) continue;
+    const path = key.slice(prefixLength);
+    if (!path || results.has(path)) continue;
+    try {
+      const stored = storageGetItem(key);
+      if (!stored) continue;
+      const parsed = JSON.parse(stored);
+      if (!parsed) continue;
+      ramDiskCache.archives.set(path, parsed);
+      results.set(path, { path, data: parsed });
+    } catch (error) {
+      console.warn(`Failed to read archived transcript from RAM disk (${key}):`, error);
+    }
+  }
+  return Array.from(results.values());
+}
+
+function readRamDiskChunk(paths) {
+  const candidates = dedupePaths(paths);
+  for (const path of candidates) {
+    if (ramDiskCache.chunked.has(path)) {
+      return ramDiskCache.chunked.get(path);
+    }
+  }
+  for (const path of candidates) {
+    const stored = storageGetItem(`${RAM_DISK_CHUNK_PREFIX}${path}`);
+    if (!stored) continue;
+    try {
+      const data = JSON.parse(stored);
+      if (typeof data.chunkedPath !== 'string') {
+        data.chunkedPath = path;
+      }
+      cacheChunkedInRam(candidates, data);
+      return data;
+    } catch (error) {
+      console.warn(`Failed to parse RAM disk chunk for ${path}:`, error);
+    }
+  }
+  return null;
+}
+
+function readRamDiskUnchunked(paths) {
+  const candidates = dedupePaths(paths);
+  for (const path of candidates) {
+    if (ramDiskCache.unchunked.has(path)) {
+      return ramDiskCache.unchunked.get(path);
+    }
+  }
+  for (const path of candidates) {
+    const stored = storageGetItem(`${RAM_DISK_UNCHUNKED_PREFIX}${path}`);
+    if (stored !== null && stored !== undefined) {
+      cacheUnchunkedInRam(candidates, stored);
+      return stored;
+    }
+  }
+  return null;
+}
+
+function listRamDiskChunkedEntries() {
+  const entries = [];
+  const keys = storageKeys().filter((key) => key.startsWith(RAM_DISK_CHUNK_PREFIX));
+  for (const key of keys) {
+    const path = key.slice(RAM_DISK_CHUNK_PREFIX.length);
+    const data = readRamDiskChunk(path);
+    if (data && isSupportedChunkablePath(path)) {
+      entries.push({ path, data });
+    }
+  }
+  return entries;
+}
+
+function listRamDiskUnchunkedEntries() {
+  const entries = [];
+  const keys = storageKeys().filter((key) => key.startsWith(RAM_DISK_UNCHUNKED_PREFIX));
+  for (const key of keys) {
+    const path = key.slice(RAM_DISK_UNCHUNKED_PREFIX.length);
+    const content = readRamDiskUnchunked(path);
+    if (content !== null && isSupportedChunkablePath(path)) {
+      entries.push({ path, content });
+    }
+  }
+  return entries;
+}
+
+function primeRamDiskCache() {
+  try {
+    const keys = storageKeys();
+    for (const key of keys) {
+      if (key.startsWith(RAM_DISK_CHUNK_PREFIX)) {
+        const path = key.slice(RAM_DISK_CHUNK_PREFIX.length);
+        const stored = storageGetItem(key);
+        if (!stored) continue;
+        try {
+          const data = JSON.parse(stored);
+          cacheChunkedInRam([path], data);
+        } catch (error) {
+          console.warn(`Failed to parse cached chunked entry ${path}:`, error);
+        }
+      } else if (key.startsWith(RAM_DISK_UNCHUNKED_PREFIX)) {
+        const path = key.slice(RAM_DISK_UNCHUNKED_PREFIX.length);
+        const stored = storageGetItem(key);
+        if (stored !== null && stored !== undefined) {
+          cacheUnchunkedInRam([path], stored);
+        }
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to prime RAM disk cache:', error);
+  }
+}
+
+function normalizeRagData(data) {
+  if (data == null) {
+    return '';
+  }
+  if (typeof data === 'string') {
+    return data;
+  }
+  if (Array.isArray(data)) {
+    return data.map((item) => normalizeRagData(item)).join('\n');
+  }
+  if (typeof data === 'object') {
+    if (typeof data.content === 'string') {
+      return data.content;
+    }
+    return JSON.stringify(data);
+  }
+  return String(data);
+}
+
+function normalizeRagString(raw) {
+  if (typeof raw !== 'string') {
+    return normalizeRagData(raw);
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return '';
+  }
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return normalizeRagData(parsed);
+    } catch (error) {
+      const lines = trimmed.split(/\r?\n/);
+      const parsedLines = [];
+      let parsedCount = 0;
+      for (const line of lines) {
+        const candidate = line.trim();
+        if (!candidate) continue;
+        if (candidate.startsWith('{') || candidate.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(candidate);
+            parsedLines.push(normalizeRagData(parsed));
+            parsedCount += 1;
+            continue;
+          } catch (lineError) {
+            // fall through to keep the original line
+          }
+        }
+        parsedLines.push(line);
+      }
+      if (parsedCount > 0) {
+        return parsedLines.join('\n');
+      }
+    }
+  }
+  return raw;
+}
+
+async function loadChunkedFileData(chunkedPath, originalPath) {
+  const candidates = dedupePaths([chunkedPath, originalPath]);
+  const cached = readRamDiskChunk(candidates);
+  if (cached) {
+    return { data: cached, source: 'ram' };
+  }
+  for (const path of candidates) {
+    const fsResult = readStandaloneFile(path);
+    if (fsResult) {
+      try {
+        const payload = JSON.parse(fsResult.content);
+        const normalized = { ...payload, chunkedPath: path };
+        hydrateChunkEmbeddingIndex(normalized);
+        cacheChunkedInRam(candidates, normalized);
+        return { data: normalized, source: 'filesystem' };
+      } catch (error) {
+        console.debug(`Failed to parse chunked file ${path} from filesystem:`, error);
+      }
+    }
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        const payload = await response.json();
+        const normalized = { ...payload, chunkedPath: path };
+        hydrateChunkEmbeddingIndex(normalized);
+        cacheChunkedInRam(candidates, normalized);
+        return { data: normalized, source: 'filesystem' };
+      }
+    } catch (error) {
+      console.debug(`Failed to load chunked file ${path}:`, error);
+    }
+  }
+  return null;
+}
+
+async function loadRagFileContent(paths) {
+  const candidates = dedupePaths(paths);
+  for (const path of candidates) {
+    const fsResult = readStandaloneFile(path);
+    if (fsResult) {
+      const { content, contentType } = fsResult;
+      if (contentType === 'application/pdf') {
+        // Defer to fetch/pdf.js pipeline for binary sources.
+      } else if (contentType && contentType.includes('json')) {
+        try {
+          const parsed = JSON.parse(content);
+          const raw = typeof parsed === 'string' ? parsed : JSON.stringify(parsed);
+          cacheUnchunkedInRam(candidates, raw);
+          return { content: normalizeRagData(parsed), source: 'filesystem', contentType: 'application/json' };
+        } catch (error) {
+          cacheUnchunkedInRam(candidates, content);
+          return { content, source: 'filesystem', contentType: 'application/json' };
+        }
+      } else {
+        cacheUnchunkedInRam(candidates, content);
+        return { content, source: 'filesystem', contentType: contentType || 'text/plain' };
+      }
+    }
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await response.json();
+          const raw = typeof data === 'string' ? data : JSON.stringify(data);
+          cacheUnchunkedInRam(candidates, raw);
+          return { content: normalizeRagData(data), source: 'filesystem', contentType };
+        }
+        const text = await response.text();
+        cacheUnchunkedInRam(candidates, text);
+        return { content: text, source: 'filesystem', contentType: contentType || 'text/plain' };
+      }
+    } catch (error) {
+      console.debug(`Failed to fetch ${path} for chunking`, error);
+    }
+  }
+  const ramContent = readRamDiskUnchunked(candidates);
+  if (ramContent !== null) {
+    return { content: normalizeRagString(ramContent), source: 'ram', contentType: 'text/plain' };
+  }
+  return null;
+}
+
+async function detectUnchunkedFile(originalPath, manifestSize = 0) {
+  const candidatePaths = dedupePaths([toUnchunkedPath(originalPath), originalPath]);
+  for (const path of candidatePaths) {
+    const fsResult = readStandaloneFile(path);
+    if (fsResult) {
+      const { content, contentType } = fsResult;
+      if (!isSupportedChunkableFile(originalPath, contentType)) {
+        continue;
+      }
+      cacheUnchunkedInRam(candidatePaths, content);
+      const computedSize = manifestSize || content.length;
+      return {
+        path,
+        originalPath,
+        size: computedSize,
+        source: 'workspace',
+        ramContent: content,
+        contentType: contentType || inferContentTypeFromPath(originalPath)
+      };
+    }
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (!isSupportedChunkableFile(originalPath, contentType)) {
+          continue;
+        }
+        const text = await response.text();
+        cacheUnchunkedInRam(candidatePaths, text);
+        const sizeHeader = Number.parseInt(response.headers.get('content-length') || '', 10);
+        const computedSize = Number.isFinite(sizeHeader) ? sizeHeader : manifestSize || text.length;
+        return {
+          path,
+          originalPath,
+          size: computedSize,
+          source: 'workspace',
+          ramContent: text,
+          contentType
+        };
+      }
+    } catch (error) {
+      console.debug(`Failed to inspect ${path}:`, error);
+    }
+  }
+  const ramContent = readRamDiskUnchunked(candidatePaths);
+  if (ramContent !== null) {
+    if (!isSupportedChunkableFile(originalPath, null)) {
+      return null;
+    }
+    return {
+      path: toUnchunkedPath(originalPath),
+      originalPath,
+      size: manifestSize || ramContent.length,
+      source: 'ram',
+      ramContent
+    };
+  }
+  return null;
+}
+
+async function listRagDirectoryEntries(directory) {
+  const normalizedDir = directory.endsWith('/') ? directory : `${directory}/`;
+  const fsEntries = listStandaloneDirectory(normalizedDir);
+  if (Array.isArray(fsEntries)) {
+    return filterSuspiciousDirectoryEntries(fsEntries);
+  }
+  try {
+    const response = await fetch(normalizedDir, { cache: 'no-store' });
+    if (!response.ok) {
+      return [];
+    }
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('application/json')) {
+      const payload = await response.json();
+      return normalizeDirectoryListingFromJson(payload, normalizedDir);
+    }
+    const text = await response.text();
+    return normalizeDirectoryListingFromText(text, normalizedDir);
+  } catch (error) {
+    console.debug(`Failed to list directory ${directory}:`, error);
+    return [];
+  }
+}
+
+function normalizeDirectoryListingFromJson(payload, basePath) {
+  const results = new Set();
+  if (!payload) return [];
+  const base = basePath.endsWith('/') ? basePath : `${basePath}/`;
+  const candidateArrays = [];
+  if (Array.isArray(payload)) {
+    candidateArrays.push(payload);
+  }
+  if (Array.isArray(payload.files)) {
+    candidateArrays.push(payload.files);
+  }
+  if (Array.isArray(payload.entries)) {
+    candidateArrays.push(payload.entries);
+  }
+  for (const array of candidateArrays) {
+    for (const item of array) {
+      if (!item) continue;
+      if (typeof item === 'string') {
+        results.add(resolveRagPath(base, item));
+      } else if (typeof item.path === 'string') {
+        results.add(resolveRagPath(base, item.path));
+      }
+    }
+  }
+  return filterSuspiciousDirectoryEntries(Array.from(results));
+}
+
+function normalizeDirectoryListingFromText(text, basePath) {
+  const results = new Set();
+  if (!text) return [];
+  const normalizedBase = basePath.endsWith('/') ? basePath : `${basePath}/`;
+  try {
+    const parser = new DOMParser();
+    const baseUrl = new URL(normalizedBase, window.location.origin);
+    const expectedPrefix = baseUrl.pathname.replace(/^\//, '');
+    const doc = parser.parseFromString(text, 'text/html');
+    const anchors = Array.from(doc.querySelectorAll('a[href]'));
+    for (const anchor of anchors) {
+      const href = anchor.getAttribute('href');
+      if (!href || href.startsWith('#') || href.startsWith('?')) continue;
+      const resolvedUrl = new URL(href, baseUrl);
+      const pathname = resolvedUrl.pathname.replace(/^\//, '');
+      if (!pathname || pathname === expectedPrefix) continue;
+      if (!pathname.startsWith(expectedPrefix)) continue;
+      if (pathname.endsWith('/')) continue;
+      if (/["']/.test(pathname)) continue;
+      results.add(pathname);
+    }
+  } catch (error) {
+    console.debug('Failed to parse directory listing HTML', error);
+  }
+
+  if (results.size === 0) {
+    const lines = text.split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '.' || trimmed === '..') continue;
+      if (/[<>]/.test(trimmed)) continue;
+      if (/["']/.test(trimmed) && /=/.test(trimmed)) continue;
+      if (trimmed.endsWith('/')) continue;
+      results.add(resolveRagPath(normalizedBase, trimmed));
+    }
+  }
+
+  return filterSuspiciousDirectoryEntries(Array.from(results));
+}
+
+function filterSuspiciousDirectoryEntries(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries.filter((entry) => {
+    if (!entry) return false;
+    if (/["'<>]/.test(entry)) return false;
+    const lastSegment = entry.split('/').pop();
+    if (!lastSegment || lastSegment === '.' || lastSegment === '..') return false;
+    if (/["'<>]/.test(lastSegment)) return false;
+    return true;
+  });
+}
+
 async function scanForChunkableFiles() {
   if (chunkerState.isProcessing) {
     addSystemMessage('Chunker is already processing. Please wait.');
@@ -2966,65 +4804,154 @@ async function scanForChunkableFiles() {
 
     addSystemMessage('🔍 Scanning rag/ folder for chunkable files...');
 
-    const response = await fetch('rag/manifest.json');
-    if (!response.ok) {
-      throw new Error('Could not load RAG manifest');
-    }
-    const manifest = await response.json();
+    const [manifest, unchunkedListing, chunkedListing] = await Promise.all([
+      fetchRagManifest(STATIC_RAG_MANIFESTS[0]).catch((error) => {
+        console.warn('Could not load primary RAG manifest for chunking', error);
+        return null;
+      }),
+      listRagDirectoryEntries('rag/unchunked/'),
+      listRagDirectoryEntries('rag/chunked/')
+    ]);
 
     chunkerState.unchunkedFiles = [];
     chunkerState.chunkedFiles = [];
     chunkerState.totalChunks = 0;
 
-    // Check for files in rag/ directory
-    for (const entry of manifest.files || []) {
-      const filePath = `rag/${entry.path}`;
-      const chunkedPath = filePath.replace(/^rag\//, 'rag/chunked/');
-      const unchunkedPath = filePath.replace(/^rag\//, 'rag/unchunked/');
+    const seenChunked = new Set();
+    const seenUnchunked = new Set();
 
+    const chunkedPaths = dedupePaths(chunkedListing);
+    for (const chunkedPath of chunkedPaths) {
       try {
-        // Check if chunked version exists
-        const chunkedResponse = await fetch(chunkedPath);
-        if (chunkedResponse.ok) {
-          const chunkedData = await chunkedResponse.json();
-          chunkerState.chunkedFiles.push({
-            originalPath: filePath,
-            chunkedPath,
-            chunks: chunkedData.chunks || []
-          });
-          chunkerState.totalChunks += chunkedData.chunks?.length || 0;
-          addSystemMessage(`✓ Found chunked: ${entry.path} (${chunkedData.chunks?.length || 0} chunks)`);
-        } else {
-          // Check if file exists in unchunked
-          const unchunkedResponse = await fetch(unchunkedPath);
-          if (unchunkedResponse.ok) {
-            chunkerState.unchunkedFiles.push({
-              path: unchunkedPath,
-              originalPath: filePath,
-              size: entry.size || 0
-            });
-            addSystemMessage(`📁 Found unchunked: ${entry.path}`);
-          } else {
-            // Check if file exists in original location
-            const originalResponse = await fetch(filePath);
-            if (originalResponse.ok) {
-              chunkerState.unchunkedFiles.push({
-                path: filePath,
-                originalPath: filePath,
-                size: entry.size || 0
-              });
-              addSystemMessage(`📄 Found original: ${entry.path}`);
-            }
-          }
+        const chunkedRecord = await loadChunkedFileData(chunkedPath, fromChunkedPath(chunkedPath));
+        const chunkList = chunkedRecord?.data?.chunks;
+        if (!Array.isArray(chunkList) || chunkList.length === 0) {
+          continue;
         }
+        const originalPath = chunkedRecord?.data?.originalPath || fromChunkedPath(chunkedPath);
+        const canonical = canonicalizeOriginalPath(originalPath || chunkedPath);
+        if (seenChunked.has(canonical)) {
+          continue;
+        }
+        chunkerState.chunkedFiles.push({
+          originalPath,
+          chunkedPath,
+          chunks: chunkList,
+          source: chunkedRecord.source
+        });
+        chunkerState.totalChunks += chunkList.length;
+        seenChunked.add(canonical);
+        const label = (originalPath || chunkedPath).replace(/^rag\//, '');
+        const locationLabel = chunkedRecord.source === 'ram' ? 'RAM disk' : 'workspace';
+        addSystemMessage(`✓ Found chunked: ${label} (${chunkList.length} chunks, ${locationLabel})`);
       } catch (error) {
-        console.warn(`Error checking ${filePath}:`, error);
-        addSystemMessage(`⚠️ Could not check ${entry.path}`);
+        console.debug(`Failed to inspect chunked file ${chunkedPath}:`, error);
       }
     }
 
+    const manifestEntries = normalizeRagManifestEntries(manifest);
+    const manifestPaths = manifestEntries
+      .map((entry) => (entry && entry.path ? resolveRagPath('rag/', entry.path) : null))
+      .filter(Boolean);
+
+    const candidatePaths = filterChunkablePaths(dedupePaths([...manifestPaths, ...unchunkedListing]));
+
+    for (const candidate of candidatePaths) {
+      const canonicalCandidate = canonicalizeOriginalPath(candidate);
+      if (seenChunked.has(canonicalCandidate) || seenUnchunked.has(canonicalCandidate)) {
+        continue;
+      }
+
+      let chunkedRecord = null;
+      try {
+        const chunkedPath = toChunkedPath(candidate);
+        chunkedRecord = await loadChunkedFileData(chunkedPath, candidate);
+      } catch (error) {
+        console.debug(`Chunked probe failed for ${candidate}:`, error);
+      }
+
+      const chunkList = chunkedRecord?.data?.chunks;
+      if (Array.isArray(chunkList) && chunkList.length > 0) {
+        const originalPath = chunkedRecord?.data?.originalPath || candidate;
+        const canonicalOriginal = canonicalizeOriginalPath(originalPath);
+        if (!seenChunked.has(canonicalOriginal)) {
+          chunkerState.chunkedFiles.push({
+            originalPath,
+            chunkedPath: toChunkedPath(originalPath),
+            chunks: chunkList,
+            source: chunkedRecord.source
+          });
+          chunkerState.totalChunks += chunkList.length;
+          seenChunked.add(canonicalOriginal);
+          const label = originalPath.replace(/^rag\//, '');
+          const locationLabel = chunkedRecord.source === 'ram' ? 'RAM disk' : 'workspace';
+          addSystemMessage(`✓ Found chunked: ${label} (${chunkList.length} chunks, ${locationLabel})`);
+        }
+        continue;
+      }
+
+      const descriptor = await detectUnchunkedFile(candidate);
+      if (descriptor) {
+        const descriptorKey = canonicalizeOriginalPath(descriptor.originalPath || descriptor.path);
+        if (seenChunked.has(descriptorKey) || seenUnchunked.has(descriptorKey)) {
+          continue;
+        }
+        if (!isSupportedChunkablePath(descriptor.originalPath || descriptor.path)) {
+          continue;
+        }
+        chunkerState.unchunkedFiles.push(descriptor);
+        seenUnchunked.add(descriptorKey);
+        const locationLabel = descriptor.source === 'ram' ? 'RAM disk' : 'workspace';
+        const icon = descriptor.source === 'ram' ? '📦' : '📁';
+        const label = (descriptor.originalPath || descriptor.path).replace(/^rag\//, '');
+        addSystemMessage(`${icon} Found unchunked: ${label} (${locationLabel})`);
+      }
+    }
+
+    for (const { path, data } of listRamDiskChunkedEntries()) {
+      const originalPath = typeof data?.originalPath === 'string' ? data.originalPath : fromChunkedPath(path);
+      const canonical = canonicalizeOriginalPath(originalPath || path);
+      if (!originalPath || seenChunked.has(canonical) || !isSupportedChunkablePath(originalPath)) {
+        continue;
+      }
+      const chunks = Array.isArray(data?.chunks) ? data.chunks : [];
+      if (!chunks.length) {
+        continue;
+      }
+      chunkerState.chunkedFiles.push({
+        originalPath,
+        chunkedPath: toChunkedPath(originalPath),
+        chunks,
+        source: 'ram'
+      });
+      chunkerState.totalChunks += chunks.length;
+      seenChunked.add(canonical);
+      const label = originalPath.startsWith('rag/') ? originalPath.slice(4) : originalPath;
+      addSystemMessage(`✓ Found chunked: ${label} (${chunks.length} chunks, RAM disk)`);
+    }
+
+    for (const { path, content } of listRamDiskUnchunkedEntries()) {
+      const canonical = canonicalizeOriginalPath(path);
+      if (!path || seenChunked.has(canonical) || seenUnchunked.has(canonical) || !isSupportedChunkablePath(path)) {
+        continue;
+      }
+      const descriptor = {
+        path: toUnchunkedPath(path),
+        originalPath: path,
+        size: content.length,
+        source: 'ram',
+        ramContent: content
+      };
+      chunkerState.unchunkedFiles.push(descriptor);
+      seenUnchunked.add(canonical);
+      const label = path.startsWith('rag/') ? path.slice(4) : path;
+      addSystemMessage(`📦 Found unchunked: ${label} (RAM disk)`);
+    }
+
     updateChunkerStatus();
-    addSystemMessage(`✅ Scan complete. Found ${chunkerState.unchunkedFiles.length} files to chunk, ${chunkerState.chunkedFiles.length} already chunked.`);
+    addSystemMessage(
+      `✅ Scan complete. Found ${chunkerState.unchunkedFiles.length} files to chunk, ${chunkerState.chunkedFiles.length} already chunked.`
+    );
 
   } catch (error) {
     console.error('Error scanning for chunkable files:', error);
@@ -3056,37 +4983,51 @@ async function chunkAllFiles() {
 
     for (const file of chunkerState.unchunkedFiles) {
       try {
-        addSystemMessage(`Chunking ${file.path}...`);
-        const chunks = await chunkFile(file.path, chunkerState.chunkSize, chunkerState.chunkOverlap);
-        if (chunks && chunks.length > 0) {
+        const originalPath = file.originalPath || file.path;
+        const displayPath = originalPath || file.path;
+        if (!isSupportedChunkablePath(originalPath || '')) {
+          addSystemMessage(`Skipping ${displayPath}: unsupported file type for chunking.`);
+          continue;
+        }
+        addSystemMessage(`Chunking ${displayPath}...`);
+        let chunks = await chunkFile(file, chunkerState.chunkSize, chunkerState.chunkOverlap);
+        chunks = await enrichChunksWithEmbeddings(originalPath, chunks);
+        if (Array.isArray(chunks) && chunks.length > 0) {
           const chunkedData = {
-            originalPath: file.originalPath,
+            originalPath,
             chunkSize: chunkerState.chunkSize,
             chunkOverlap: chunkerState.chunkOverlap,
-            chunks: chunks,
+            embeddingModel: config.embeddingModel,
+            embeddingDimensions: Array.isArray(chunks[0]?.embedding)
+              ? chunks[0].embedding.length
+              : EMBEDDING_HASH_BUCKETS,
+            chunks,
             createdAt: new Date().toISOString()
           };
 
           // Save chunked file to rag/chunked/
-          const chunkedPath = file.originalPath.replace(/^rag\//, 'rag/chunked/');
-          await saveChunkedFileToFS(chunkedPath, chunkedData);
+          const chunkedPath = toChunkedPath(originalPath);
+          const saveLocation = await saveChunkedFileToFS(chunkedPath, chunkedData);
 
           // Move original to rag/unchunked/
-          await moveToUnchunkedFS(file.path, file.originalPath);
+          await moveToUnchunkedFS(file.path, originalPath);
 
           chunkerState.chunkedFiles.push({
-            originalPath: file.originalPath,
+            originalPath,
             chunkedPath,
-            chunks: chunks
+            chunks,
+            source: saveLocation
           });
 
           totalChunksCreated += chunks.length;
           processedCount++;
-          addSystemMessage(`✓ Chunked ${file.path} into ${chunks.length} chunks`);
+          const locationLabel = saveLocation === 'ram' ? 'RAM disk' : 'workspace';
+          addSystemMessage(`✓ Chunked ${displayPath} into ${chunks.length} chunks (${locationLabel})`);
         }
       } catch (error) {
-        console.error(`Error chunking ${file.path}:`, error);
-        addSystemMessage(`✗ Failed to chunk ${file.path}: ${error.message || 'Unknown error'}`);
+        const originalPath = file.originalPath || file.path;
+        console.error(`Error chunking ${originalPath}:`, error);
+        addSystemMessage(`✗ Failed to chunk ${originalPath}: ${error.message || 'Unknown error'}`);
       }
     }
 
@@ -3106,37 +5047,40 @@ async function chunkAllFiles() {
   }
 }
 
-async function chunkFile(filePath, chunkSize, overlap) {
+async function chunkFile(fileDescriptor, chunkSize, overlap) {
+  const descriptor =
+    typeof fileDescriptor === 'string'
+      ? { path: fileDescriptor, originalPath: fileDescriptor }
+      : { ...fileDescriptor };
+  const label = descriptor.originalPath || descriptor.path || 'unknown file';
+  const candidatePaths = dedupePaths([descriptor.path, descriptor.originalPath]);
+  const overlapTokens = Math.max(Math.round(chunkSize * 0.15), overlap);
+
   try {
-    const response = await fetch(filePath);
-    if (!response.ok) {
-      throw new Error(`Failed to load file: ${response.status}`);
-    }
+    let sourceContent = '';
 
-    let content = '';
-    const contentType = response.headers.get('content-type') || '';
-
-    if (contentType.includes('application/json')) {
-      const data = await response.json();
-      if (Array.isArray(data)) {
-        // Handle JSONL or array format
-        content = data.map(item => typeof item === 'string' ? item : JSON.stringify(item)).join('\n');
-      } else if (data.content) {
-        content = data.content;
-      } else {
-        content = JSON.stringify(data);
-      }
+    if (typeof descriptor.ramContent === 'string') {
+      cacheUnchunkedInRam(candidatePaths, descriptor.ramContent);
+      sourceContent = normalizeRagString(descriptor.ramContent);
     } else {
-      content = await response.text();
+      const loaded = await loadRagFileContent(candidatePaths);
+      if (loaded && typeof loaded.content === 'string') {
+        sourceContent = normalizeRagString(loaded.content);
+      } else {
+        const fallback = readRamDiskUnchunked(candidatePaths);
+        if (fallback !== null) {
+          sourceContent = normalizeRagString(fallback);
+        } else {
+          throw new Error('File not found in workspace or RAM disk');
+        }
+      }
     }
 
-    if (!content.trim()) {
+    if (!sourceContent.trim()) {
       return [];
     }
 
-    // Split into sentences/paragraphs for better chunking
-    const segments = content.split(/\n\s*\n/).filter(s => s.trim());
-
+    const segments = sourceContent.split(/\n\s*\n/).filter((segment) => segment.trim());
     const chunks = [];
     let currentChunk = '';
     let currentTokens = 0;
@@ -3145,16 +5089,14 @@ async function chunkFile(filePath, chunkSize, overlap) {
       const segmentTokens = estimateTokenCount(segment);
 
       if (currentTokens + segmentTokens > chunkSize && currentChunk.trim()) {
-        // Save current chunk
         chunks.push({
           content: currentChunk.trim(),
           tokens: currentTokens,
-          startIndex: chunks.length * (chunkSize - overlap)
+          startIndex: chunks.length * Math.max(1, chunkSize - overlapTokens)
         });
 
-        // Start new chunk with overlap
-        const overlapText = extractOverlapText(currentChunk, overlap);
-        currentChunk = overlapText + segment;
+        const overlapText = extractOverlapText(currentChunk, overlapTokens);
+        currentChunk = overlapText ? overlapText + segment : segment;
         currentTokens = estimateTokenCount(currentChunk);
       } else {
         currentChunk += (currentChunk ? '\n\n' : '') + segment;
@@ -3162,20 +5104,18 @@ async function chunkFile(filePath, chunkSize, overlap) {
       }
     }
 
-    // Add final chunk
     if (currentChunk.trim()) {
       chunks.push({
         content: currentChunk.trim(),
         tokens: currentTokens,
-        startIndex: chunks.length * (chunkSize - overlap)
+        startIndex: chunks.length * Math.max(1, chunkSize - overlapTokens)
       });
     }
 
     return chunks;
-
   } catch (error) {
-    console.error(`Error chunking file ${filePath}:`, error);
-    void recordLog('error', `Error chunking file ${filePath}: ${error.message}`, { level: 'error' });
+    console.error(`Error chunking file ${label}:`, error);
+    void recordLog('error', `Error chunking file ${label}: ${error.message}`, { level: 'error' });
     throw error;
   }
 }
@@ -3201,31 +5141,127 @@ function extractOverlapText(text, overlapTokens) {
   return overlapText;
 }
 
+// CODEx: Populate chunk embeddings so RAG retrieval can perform vector search.
+async function enrichChunksWithEmbeddings(originalPath, chunks) {
+  if (!Array.isArray(chunks) || !chunks.length) {
+    return chunks;
+  }
+  const canonical = canonicalizeOriginalPath(originalPath || '');
+  const enriched = await embedAndStore(chunks, {
+    sourceId: canonical,
+    embedder: (content) => generateTextEmbedding(content), // CODEx: Request provider embeddings for each chunk body.
+    lexicalEmbedder: (content) => lexicalEmbedding(content), // CODEx: Produce deterministic fallback vectors when provider fails.
+    registerEmbedding: (sourceId, index, vector) => {
+      storeChunkEmbedding(`${sourceId}#${index}`, vector); // CODEx: Cache embeddings with footprint tracking per chunk.
+    }
+  });
+  return enriched; // CODEx: Return enriched chunk array containing embeddings for persistence.
+}
+
+// CODEx: Cache embeddings when chunk files are reloaded from disk or RAM.
+function hydrateChunkEmbeddingIndex(record) {
+  if (!record || !Array.isArray(record.chunks)) {
+    return;
+  }
+  const canonical = canonicalizeOriginalPath(record.originalPath || record.chunkedPath || '');
+  record.chunks.forEach((chunk, index) => {
+    if (chunk && Array.isArray(chunk.embedding) && chunk.embedding.length) {
+      const key = `${canonical}#${index}`;
+      storeChunkEmbedding(key, chunk.embedding); // CODEx: Rehydrate embedding cache while preserving footprint accounting.
+    }
+  });
+}
+
 async function saveChunkedFileToFS(path, data) {
+  const payloadForCache = { ...data, chunkedPath: path };
+  cacheChunkedInRam([path, data?.originalPath], payloadForCache);
+  const serialized = JSON.stringify(data, null, 2);
+  const directory = getDirectoryPath(path);
+  if (directory) {
+    ensureStandaloneDirectory(directory);
+  }
+  if (writeStandaloneFile(path, serialized, { contentType: 'application/json' })) {
+    console.log(`Saved chunked file to ${path} via standalone bridge`);
+    return 'workspace';
+  }
   try {
-    // Save to actual file system in rag/chunked/
     const response = await fetch(path, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data, null, 2)
+      body: serialized
     });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
     console.log(`Saved chunked file to ${path}`);
+    return 'workspace';
   } catch (error) {
     console.error('Error saving chunked file to FS:', error);
-    // Fallback to localStorage
-    const key = `sam-chunked-${path}`;
-    window.localStorage.setItem(key, JSON.stringify(data));
-    console.log(`Fallback: Saved chunked file to localStorage: ${key}`);
+    try {
+      storageSetItem(`${RAM_DISK_CHUNK_PREFIX}${path}`, JSON.stringify(payloadForCache));
+      cacheChunkedInRam([path, data?.originalPath], payloadForCache);
+      console.log(`Fallback: Saved chunked file to localStorage: ${RAM_DISK_CHUNK_PREFIX}${path}`);
+    } catch (storageError) {
+      console.warn('Failed to persist chunked file to localStorage:', storageError);
+    }
+    return 'ram';
   }
 }
 
 async function moveToUnchunkedFS(fromPath, originalPath) {
+  const normalizedSource = (originalPath || fromPath || '').replace(/\\/g, '/');
+  if (!normalizedSource) {
+    return 'unknown';
+  }
+  const unchunkedPath = toUnchunkedPath(normalizedSource);
+  const candidatePaths = dedupePaths([fromPath, normalizedSource, unchunkedPath]);
+
+  if (normalizedSource.startsWith('rag/unchunked/')) {
+    if (deleteStandaloneFile(normalizedSource)) {
+      clearUnchunkedRamEntries(candidatePaths);
+      console.log(`Deleted ${normalizedSource} via standalone bridge`);
+      return 'workspace';
+    }
+    const cached = readRamDiskUnchunked(candidatePaths);
+    try {
+      const deleteResponse = await fetch(normalizedSource, { method: 'DELETE' });
+      if (deleteResponse?.ok) {
+        clearUnchunkedRamEntries(candidatePaths);
+        console.log(`Deleted ${normalizedSource} after chunking`);
+        return 'workspace';
+      }
+    } catch (error) {
+      console.warn(`Could not delete processed unchunked file ${normalizedSource}:`, error);
+    }
+
+    if (typeof cached === 'string') {
+      cacheUnchunkedInRam(candidatePaths, cached);
+      for (const target of candidatePaths) {
+        if (!target) continue;
+        try {
+          storageSetItem(`${RAM_DISK_UNCHUNKED_PREFIX}${target}`, cached);
+        } catch (storageError) {
+          console.warn(`Failed to persist unchunked fallback for ${target}:`, storageError);
+        }
+      }
+      console.log(`Fallback: retained ${normalizedSource} in RAM disk storage`);
+      return 'ram';
+    }
+    return 'unknown';
+  }
+
+  const fsSource = readStandaloneFile(fromPath) || readStandaloneFile(normalizedSource);
+  if (fsSource && typeof fsSource.content === 'string') {
+    ensureStandaloneDirectory(getDirectoryPath(unchunkedPath));
+    if (writeStandaloneFile(unchunkedPath, fsSource.content, { contentType: fsSource.contentType })) {
+      deleteStandaloneFile(fromPath);
+      cacheUnchunkedInRam(candidatePaths, fsSource.content);
+      console.log(`Moved ${fromPath} to ${unchunkedPath} via standalone bridge`);
+      return 'workspace';
+    }
+  }
+
   try {
-    // Move original file to rag/unchunked/
-    const unchunkedPath = originalPath.replace(/^rag\//, 'rag/unchunked/');
     const response = await fetch(fromPath);
     if (response.ok) {
       const content = await response.text();
@@ -3235,26 +5271,42 @@ async function moveToUnchunkedFS(fromPath, originalPath) {
         body: content
       });
       if (moveResponse.ok) {
-        // Delete original file
         await fetch(fromPath, { method: 'DELETE' });
+        cacheUnchunkedInRam(candidatePaths, content);
         console.log(`Moved ${fromPath} to ${unchunkedPath}`);
+        return 'workspace';
       }
     }
   } catch (error) {
     console.warn('Could not move file to unchunked folder, using localStorage fallback:', error);
-    // Fallback to localStorage
-    const key = `sam-unchunked-${originalPath}`;
-    try {
+  }
+
+  try {
+    let content = readRamDiskUnchunked(candidatePaths);
+    if (content === null) {
       const response = await fetch(fromPath);
       if (response.ok) {
-        const content = await response.text();
-        window.localStorage.setItem(key, content);
-        console.log(`Fallback: Moved file to localStorage: ${key}`);
+        content = await response.text();
       }
-    } catch (fallbackError) {
-      console.warn('Fallback also failed:', fallbackError);
     }
+    if (typeof content === 'string') {
+      cacheUnchunkedInRam(candidatePaths, content);
+      for (const target of candidatePaths) {
+        if (!target) continue;
+        try {
+          storageSetItem(`${RAM_DISK_UNCHUNKED_PREFIX}${target}`, content);
+        } catch (storageError) {
+          console.warn(`Failed to persist unchunked file to localStorage (${target}):`, storageError);
+        }
+      }
+      console.log(`Fallback: Moved file to RAM disk storage for ${normalizedSource}`);
+      return 'ram';
+    }
+  } catch (fallbackError) {
+    console.warn('Fallback also failed:', fallbackError);
   }
+
+  return 'unknown';
 }
 
 function clearAllChunks() {
@@ -3262,13 +5314,19 @@ function clearAllChunks() {
     addSystemMessage('🗑️ Clearing all chunked and unchunked files...');
 
     // Clear localStorage entries
-    const keys = Object.keys(window.localStorage).filter(key => key.startsWith('sam-chunked-') || key.startsWith('sam-unchunked-'));
-    keys.forEach(key => window.localStorage.removeItem(key));
+    const keys = storageKeys().filter(
+      (key) => key.startsWith(RAM_DISK_CHUNK_PREFIX) || key.startsWith(RAM_DISK_UNCHUNKED_PREFIX)
+    );
+    keys.forEach(key => storageRemoveItem(key));
 
     // Try to delete files from file system
     const deletePromises = [];
     chunkerState.chunkedFiles.forEach(file => {
       if (file.chunkedPath) {
+        if (deleteStandaloneFile(file.chunkedPath)) {
+          addSystemMessage(`✓ Deleted ${file.chunkedPath}`);
+          return deletePromises.push(Promise.resolve());
+        }
         deletePromises.push(
           fetch(file.chunkedPath, { method: 'DELETE' })
             .then(() => addSystemMessage(`✓ Deleted ${file.chunkedPath}`))
@@ -3278,6 +5336,10 @@ function clearAllChunks() {
     });
     chunkerState.unchunkedFiles.forEach(file => {
       if (file.path && file.path.includes('/unchunked/')) {
+        if (deleteStandaloneFile(file.path)) {
+          addSystemMessage(`✓ Deleted ${file.path}`);
+          return deletePromises.push(Promise.resolve());
+        }
         deletePromises.push(
           fetch(file.path, { method: 'DELETE' })
             .then(() => addSystemMessage(`✓ Deleted ${file.path}`))
@@ -3291,6 +5353,8 @@ function clearAllChunks() {
       chunkerState.unchunkedFiles = [];
       chunkerState.chunkedFiles = [];
       chunkerState.totalChunks = 0;
+      ramDiskCache.chunked.clear();
+      ramDiskCache.unchunked.clear();
       updateChunkerStatus();
       addSystemMessage(`✅ Cleared all chunked and unchunked files.`);
     });
@@ -3312,10 +5376,16 @@ async function handleUserMessage() {
 }
 
 async function respondToUser(userEntry) {
-  updateProcessState('modelA', { status: 'Retrieving', detail: 'Gathering relevant memories.' });
+  const autoInjecting = Boolean(config.autoInjectMemories);
+  updateProcessState('modelA', {
+    status: 'Retrieving',
+    detail: autoInjecting ? 'Gathering relevant memories.' : 'Auto-injection disabled; using floating buffer as needed.'
+  });
   try {
     const { messages, retrievedMemories } = await buildModelMessages(userEntry);
-    registerRetrieval('A', retrievedMemories.length);
+    if (autoInjecting) {
+      registerRetrieval('A', retrievedMemories.length);
+    }
     if (!config.endpoint || !config.model) {
       addSystemMessage('Configure the model endpoint and name to receive AI replies.');
       updateModelConnectionStatus();
@@ -3378,13 +5448,24 @@ async function respondToUser(userEntry) {
 
 async function buildModelMessages(userEntry) {
   const messages = [];
-  const retrievedMemories = await retrieveRelevantMemories(userEntry.content, config.retrievalCount);
+  let retrievedMemories = [];
+  const shouldAutoRetrieve = Boolean(config.autoInjectMemories);
+  const reasoningActive = isReasoningModeActive();
+
+  if (shouldAutoRetrieve) {
+    const retrievalCap = reasoningActive
+      ? Math.max(0, Math.min(3, config.retrievalCount || 3))
+      : config.retrievalCount;
+    if (retrievalCap !== 0) {
+      retrievedMemories = await retrieveRelevantMemories(userEntry.content, retrievalCap);
+    }
+  }
 
   if (config.systemPrompt?.trim()) {
     messages.push({ role: 'system', content: config.systemPrompt.trim() });
   }
 
-  if (retrievedMemories.length) {
+  if (shouldAutoRetrieve && retrievedMemories.length) {
     const compiled = retrievedMemories
       .map((item) => `${formatTimestamp(item.timestamp)} • ${item.role}: ${item.content}`)
       .join('\n');
@@ -3394,7 +5475,7 @@ async function buildModelMessages(userEntry) {
     });
   }
 
-  const recent = getRecentConversation();
+  const recent = getRecentConversation({ reasoningMode: reasoningActive });
   for (const item of recent) {
     messages.push({ role: item.role, content: item.content });
   }
@@ -3403,9 +5484,41 @@ async function buildModelMessages(userEntry) {
   return { messages, retrievedMemories };
 }
 
-function getRecentConversation() {
-  const limit = Math.max(2, Math.min(config.contextTurns, conversationLog.length));
+function getRecentConversation(options = {}) {
+  if (!conversationLog.length) {
+    return [];
+  }
+  const reasoningActive = isReasoningModeActive(options);
+  const maxTurns = reasoningActive ? Math.min(6, conversationLog.length) : config.contextTurns; // CODEx: Phase II limit on reasoning context.
+  const limit = Math.max(2, Math.min(maxTurns, conversationLog.length));
   return conversationLog.slice(-limit);
+}
+
+// CODEx: Strip heavyweight properties from metadata before persisting chat entries.
+function sanitizeMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object') {
+    return undefined;
+  }
+  const sanitized = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value == null) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      if (key === 'retrievedMemories') {
+        sanitized.retrievalCount = value.length;
+        continue;
+      }
+      if (value.length > 12) {
+        sanitized[`${key}Count`] = value.length;
+        continue;
+      }
+      sanitized[key] = value.slice();
+      continue;
+    }
+    sanitized[key] = value;
+  }
+  return Object.keys(sanitized).length ? sanitized : undefined;
 }
 
 async function appendMessage(role, content, options = {}) {
@@ -3421,19 +5534,20 @@ async function appendMessage(role, content, options = {}) {
     timestamp += 1;
   }
 
+  const sanitizedMetadata = sanitizeMetadata(metadata) ?? {};
   const entry = {
-    id: metadata.id ?? timestamp,
+    id: sanitizedMetadata.id ?? timestamp,
     role,
     content,
     timestamp,
-    origin: metadata.origin ?? 'floating',
-    mode: metadata.mode ?? MODE_CHAT,
-    ...metadata
+    origin: sanitizedMetadata.origin ?? 'floating',
+    mode: sanitizedMetadata.mode ?? MODE_CHAT,
+    ...sanitizedMetadata
   };
 
-  assignTurnNumber(entry, metadata.turnNumber);
+  assignTurnNumber(entry, sanitizedMetadata.turnNumber);
   const normalizedId = normalizeMessageId(entry.id);
-  if (metadata.pinned || pinnedMessageIds.has(normalizedId)) {
+  if (sanitizedMetadata.pinned || pinnedMessageIds.has(normalizedId)) {
     entry.pinned = true;
     pinnedMessageIds.add(normalizedId);
   }
@@ -3652,6 +5766,21 @@ async function putRagRecord(record) {
   });
 }
 
+// CODEx: Persist reflex diagnostics for later analysis.
+async function putReflexHistory(record) {
+  if (!db) return;
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([REFLEX_HISTORY_STORE], 'readwrite');
+    const store = transaction.objectStore(REFLEX_HISTORY_STORE);
+    const request = store.add(record);
+    request.onsuccess = () => resolve();
+    request.onerror = (event) => {
+      console.error('Failed to persist reflex history', event);
+      reject(event);
+    };
+  });
+}
+
 async function persistChatRagSnapshot() {
   if (!db) return;
   const sessionId = ensureRagSessionId(MODE_CHAT);
@@ -3819,6 +5948,13 @@ function updateFloatingSummary() {
   if (elements.ragFootprint) {
     elements.ragFootprint.textContent = formatMegabytes(calculateRagMemoryUsage());
   }
+  if (elements.ragCompressionRatio) {
+    const currentBytes = calculateMemoryUsage();
+    const ragBytes = calculateRagMemoryUsage();
+    const combinedBytes = currentBytes + ragBytes;
+    const compression = combinedBytes > 0 ? 1 - currentBytes / combinedBytes : 0;
+    elements.ragCompressionRatio.textContent = `${(Math.max(0, Math.min(1, compression)) * 100).toFixed(1)}%`;
+  }
   updateRagStatusDisplay();
   updateRetrievalStats();
 }
@@ -3860,7 +5996,9 @@ function updateRagStatusDisplay() {
   }
 
   if (!lastLoad && !lastSave) {
-    elements.ragImportStatus.textContent = 'RAG archives not loaded yet.';
+    elements.ragImportStatus.textContent = config.autoInjectMemories
+      ? 'RAG archives not loaded yet. Auto-injecting floating memories when they match.'
+      : 'RAG archives not loaded yet. Auto-injection disabled; floating memory stays on standby.';
     return;
   }
 
@@ -3897,6 +6035,14 @@ function updateRagStatusDisplay() {
     segments.push(`Skipped ${ragTelemetry.staticErrors.length} ${errorLabel}; open the debug console for details.`);
   }
 
+  if (!config.autoInjectMemories) {
+    segments.push('Auto-injection disabled; floating memory stays on standby.');
+  } else if (Number.isFinite(config.retrievalCount) && config.retrievalCount > 0) {
+    segments.push(`Auto-injecting up to ${config.retrievalCount} memory snippet${config.retrievalCount === 1 ? '' : 's'} per prompt.`);
+  } else {
+    segments.push('Auto-injecting all matching memories per prompt.');
+  }
+
   elements.ragImportStatus.textContent = segments.join(' ');
 }
 
@@ -3915,10 +6061,23 @@ function updateChunkerStatus() {
       elements.chunkerStatus.textContent = '🔄 Processing files…';
       elements.chunkerStatus.style.color = '#ff6b35'; // Orange/red for processing
     } else if (chunkerState.unchunkedFiles.length > 0) {
-      elements.chunkerStatus.textContent = `🟡 ${chunkerState.unchunkedFiles.length} file${chunkerState.unchunkedFiles.length === 1 ? '' : 's'} ready to chunk.`;
+      const pending = chunkerState.unchunkedFiles.length;
+      const ramBacked = chunkerState.unchunkedFiles.filter((file) => file.source === 'ram').length;
+      let status = `🟡 ${pending} file${pending === 1 ? '' : 's'} ready to chunk.`;
+      if (ramBacked > 0) {
+        status += ` ${ramBacked} cached in RAM disk.`;
+      }
+      elements.chunkerStatus.textContent = status;
       elements.chunkerStatus.style.color = '#ffd23f'; // Yellow for ready
     } else {
-      elements.chunkerStatus.textContent = '🟢 No files to chunk. Scan the rag/ folder first.';
+      const chunkedCount = chunkerState.chunkedFiles.length;
+      const ramChunked = chunkerState.chunkedFiles.filter((file) => file.source === 'ram').length;
+      if (chunkedCount > 0) {
+        const ramNote = ramChunked > 0 ? ` (${ramChunked} cached in RAM disk)` : '';
+        elements.chunkerStatus.textContent = `🟢 ${chunkedCount} chunked file${chunkedCount === 1 ? '' : 's'} ready${ramNote}.`;
+      } else {
+        elements.chunkerStatus.textContent = '🟢 No files to chunk. Scan the rag/ folder first.';
+      }
       elements.chunkerStatus.style.color = '#06ffa5'; // Green for idle
     }
   }
@@ -4033,6 +6192,38 @@ function archiveMemoryEntry(id, { silent = false } = {}) {
   return true;
 }
 
+function archiveOldArenaTurns(fraction = WATCHDOG_ARCHIVE_PERCENT, { reason = 'watchdog', silent = false } = {}) {
+  if (!Number.isFinite(fraction) || fraction <= 0) {
+    return 0; // CODEx: Ignore invalid archive fractions.
+  }
+  const arenaEntries = floatingMemory
+    .filter((entry) => entry && entry.origin === 'arena' && !entry.pinned)
+    .sort((a, b) => normalizeTimestamp(a.timestamp) - normalizeTimestamp(b.timestamp)); // CODEx: Oldest-first ordering.
+  if (!arenaEntries.length) {
+    return 0; // CODEx: Nothing to archive.
+  }
+  const removeCount = Math.max(1, Math.floor(arenaEntries.length * fraction)); // CODEx: Ensure at least one record.
+  let archived = 0;
+  for (const entry of arenaEntries.slice(0, removeCount)) {
+    if (archiveMemoryEntry(entry.id, { silent: true })) {
+      archived += 1; // CODEx: Track archived count for telemetry.
+    }
+  }
+  if (archived > 0) {
+    updateMemoryStatus();
+    renderFloatingMemoryWorkbench();
+    persistPinnedMessages();
+    void persistDualRagSnapshot();
+    if (!silent) {
+      const label = reason === 'reflex' ? 'Reflex' : 'Watchdog';
+      addSystemMessage(
+        `${label} archived ${archived} arena ${archived === 1 ? 'turn' : 'turns'} to rag-logs.`
+      ); // CODEx: Surface auto-archive context.
+    }
+  }
+  return archived;
+}
+
 function archiveUnpinnedFloatingMemory() {
   const removable = floatingMemory.filter((item) => !item.pinned);
   if (!removable.length) {
@@ -4049,6 +6240,44 @@ function archiveUnpinnedFloatingMemory() {
   renderFloatingMemoryWorkbench();
   persistPinnedMessages();
   addSystemMessage(`Manually archived ${removed} unpinned ${removed === 1 ? 'memory' : 'memories'}.`);
+}
+
+function handleStandaloneWatchdogMessage(event) {
+  if (!event || typeof event.data !== 'object') {
+    return;
+  }
+  const data = event.data;
+  if (!data || data.source !== WATCHDOG_MESSAGE_SOURCE || data.type !== WATCHDOG_MESSAGE_TYPE) {
+    return;
+  }
+  runStandaloneMemoryWatchdog();
+}
+
+function runStandaloneMemoryWatchdog() {
+  if (typeof window === 'undefined') return;
+  if (!window.standaloneStore && !window.standaloneFs) return;
+  if (!isDualChatRunning) return;
+  const limitBytes = config.memoryLimitMB * MB;
+  if (!Number.isFinite(limitBytes) || limitBytes <= 0) return;
+  const totalBytes = calculateMemoryUsage();
+  if (totalBytes <= 0) return;
+  const utilization = totalBytes / limitBytes;
+  if (!Number.isFinite(utilization) || utilization < WATCHDOG_PRESSURE_THRESHOLD) {
+    return;
+  }
+  if (lastWatchdogArchiveAt && Date.now() - lastWatchdogArchiveAt < 60000) {
+    return;
+  }
+  const archived = archiveOldArenaTurns(WATCHDOG_ARCHIVE_PERCENT, { reason: 'watchdog', silent: true });
+  if (archived === 0) {
+    return;
+  }
+  lastWatchdogArchiveAt = Date.now();
+  const percent = (utilization * 100).toFixed(1);
+  addSystemMessage(
+    `Watchdog archived ${archived} arena ${archived === 1 ? 'turn' : 'turns'} after floating memory hit ${percent}% of its budget.`
+  );
+  void recordLog('arena', `Watchdog archived ${archived} arena turn(s) at ${percent}% utilization.`, { silent: true });
 }
 
 function moveEntryToArchive(entry, { silent = false } = {}) {
@@ -4073,7 +6302,7 @@ function moveEntryToArchive(entry, { silent = false } = {}) {
 
 function persistPinnedMessages() {
   try {
-    window.localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify(Array.from(pinnedMessageIds)));
+    storageSetItem(PINNED_STORAGE_KEY, JSON.stringify(Array.from(pinnedMessageIds)));
   } catch (error) {
     console.error('Failed to persist pinned messages:', error);
   }
@@ -4141,7 +6370,15 @@ function updateMemoryStatus(currentBytes = calculateMemoryUsage()) {
   const messageLabel = totalCount === 1 ? 'msg' : 'msgs';
   const ragCount = countRagMemories();
   const ragLabel = ragCount ? ` • ${ragCount} from RAG` : '';
-  elements.memoryStatus.innerHTML = `Floating memory: ${used} / ${config.memoryLimitMB}&nbsp;MB • ${totalCount} ${messageLabel} (${pinnedCount} pinned)${ragLabel}`;
+  const ragBytes = calculateRagMemoryUsage();
+  const combinedBytes = currentBytes + ragBytes;
+  const compression = combinedBytes > 0 ? 1 - currentBytes / combinedBytes : 0;
+  const compressionPercent = Math.max(0, Math.min(1, compression));
+  const compressionLabel = `${(compressionPercent * 100).toFixed(1)}% compressed`;
+  elements.memoryStatus.innerHTML = `Floating memory: ${used} / ${config.memoryLimitMB}&nbsp;MB • ${totalCount} ${messageLabel} (${pinnedCount} pinned)${ragLabel} • ${compressionLabel}`;
+  if (elements.ragCompressionRatio) {
+    elements.ragCompressionRatio.textContent = `${(compressionPercent * 100).toFixed(1)}%`;
+  }
 }
 
 async function runDiagnostics() {
@@ -4174,14 +6411,45 @@ async function runDiagnostics() {
     `• Arena ${formatArenaConnectionDiagnostic('A', agentAConnection)}`,
     `• Arena ${formatArenaConnectionDiagnostic('B', agentBConnection)}`
   ];
+  const retrievalDescriptor = !config.autoInjectMemories
+    ? 'manual (promote memories when needed)'
+    : Number.isFinite(config.retrievalCount) && config.retrievalCount > 0
+      ? `auto (up to ${config.retrievalCount} snippet${config.retrievalCount === 1 ? '' : 's'})`
+      : 'auto (all matching memories)';
+  diagnostics.push(`• Memory retrieval: ${retrievalDescriptor}`);
+
+  const callCount = modelCallMetrics.count;
+  const averageMs = callCount > 0 ? Math.round(modelCallMetrics.totalMs / callCount) : 0;
+  const timeoutLabel = `${modelCallMetrics.reasoningTimeouts} reasoning timeout${modelCallMetrics.reasoningTimeouts === 1 ? '' : 's'}`;
+  diagnostics.push(
+    callCount > 0
+      ? `• Model calls: ${callCount} run${callCount === 1 ? '' : 's'} averaging ${averageMs} ms (${timeoutLabel})`
+      : `• Model calls: no runs recorded yet (${timeoutLabel})`
+  );
+
+  const ragParts = [];
+  if (Number.isFinite(ragTelemetry.lastRetrievalMs) && ragTelemetry.lastRetrievalMs > 0) {
+    ragParts.push(`${ragTelemetry.lastRetrievalMs} ms last retrieval`);
+  }
+  if (ragTelemetry.lastLoadRecords) {
+    ragParts.push(`${ragTelemetry.lastLoadRecords} chunk${ragTelemetry.lastLoadRecords === 1 ? '' : 's'} loaded`);
+  }
+  if (ragTelemetry.lastLoadBytes) {
+    ragParts.push(`${formatMegabytes(ragTelemetry.lastLoadBytes)} footprint`);
+  }
+  if (ragTelemetry.lastLoad) {
+    ragParts.push(`updated ${formatTimestamp(ragTelemetry.lastLoad)}`);
+  }
+  diagnostics.push(`• RAG telemetry: ${ragParts.length ? ragParts.join(' • ') : 'no retrieval activity yet'}`);
 
   const reflexLabel = config.reflexEnabled
     ? `enabled every ${config.reflexInterval} turn(s)`
     : 'disabled';
   diagnostics.push(`• Reflex mode: ${reflexLabel}`);
   const entropyDetails = describeEntropy(currentEntropyScore);
+  const volleyLabel = `volley${config.entropyWindow === 1 ? '' : 's'}`;
   diagnostics.push(
-    `• Entropy (last ${config.entropyWindow} turns): ${(currentEntropyScore * 100).toFixed(0)}% ${entropyDetails.label}`
+    `• Entropy (last ${config.entropyWindow} ${volleyLabel}): ${(currentEntropyScore * 100).toFixed(0)}% ${entropyDetails.label}`
   );
 
   const endpointResult = await probeModelEndpoint();
@@ -4205,8 +6473,48 @@ async function runDiagnostics() {
     diagnostics.push(`• ${label} probe: ${emoji} ${entry.result.message}`);
   }
 
+  diagnostics.push(`• Request timeout: ${config.requestTimeoutSeconds}s (reasoning: ${config.reasoningTimeoutSeconds}s)`);
+
+  const diagnosticPayload = {
+    timestamp: startedAt.toISOString(),
+    model: {
+      preset: preset?.id ?? 'custom',
+      endpoint: config.endpoint,
+      model: config.model,
+      callCount,
+      averageMs,
+      totalMs: modelCallMetrics.totalMs,
+      reasoningTimeouts: modelCallMetrics.reasoningTimeouts
+    },
+    rag: {
+      lastRetrievalMs: ragTelemetry.lastRetrievalMs,
+      lastLoadCount: ragTelemetry.lastLoadCount,
+      lastLoadRecords: ragTelemetry.lastLoadRecords,
+      lastLoadBytes: ragTelemetry.lastLoadBytes,
+      lastLoad: ragTelemetry.lastLoad
+    },
+    memory: {
+      floatingBytes,
+      limitBytes,
+      pinnedCount,
+      floatingCount: floatingMemory.length,
+      ragCount: countRagMemories()
+    },
+    arena: {
+      running: isDualChatRunning,
+      turnsCompleted: dualTurnsCompleted,
+      entropy: currentEntropyScore
+    },
+    probes: {
+      main: endpointResult,
+      agents: agentProbeEntries
+    }
+  };
+
   const report = `Diagnostics @ ${startedAt.toLocaleTimeString()}\n${diagnostics.join('\n')}`;
   addSystemMessage(report);
+
+  console.info('[Diagnostics]', JSON.stringify(diagnosticPayload, null, 2));
 
   if (endpointResult.status === 'ok') {
     updateModelConnectionStatus();
@@ -4286,8 +6594,10 @@ async function promoteRelevantMemories() {
 }
 
 async function retrieveRelevantMemories(query, limit) {
-  const tokens = tokenize(query);
+  const normalizedQuery = (query ?? '').trim();
+  const tokens = tokenize(normalizedQuery);
   if (!tokens.length) return [];
+  const retrievalStarted = getTimestampMs();
 
   const candidates = new Map();
   for (const entry of floatingMemory) {
@@ -4316,18 +6626,47 @@ async function retrieveRelevantMemories(query, limit) {
       }
     }
   }
+  const candidateList = Array.from(candidates.values()); // CODEx: Normalize candidate map into an iterable list.
+  let useEmbeddings = isEmbeddingRetrievalEnabled() && embeddingServiceHealthy; // CODEx: Determine if vector search should run.
+  let queryVector = null; // CODEx: Placeholder for query embedding when available.
+  if (useEmbeddings) { // CODEx: Only compute embeddings when enabled and healthy.
+    queryVector = await generateQueryEmbedding(normalizedQuery, tokens); // CODEx: Derive query embedding via provider.
+    if (!Array.isArray(queryVector) || !queryVector.length || !embeddingServiceHealthy) { // CODEx: Disable embeddings when unavailable.
+      useEmbeddings = false; // CODEx: Fall back to lexical scoring if embeddings failed.
+    } // CODEx
+  } // CODEx
 
-  const scores = [];
-  candidates.forEach((value) => {
-    const score = cosineSimilarity(tokens, tokenize(value.content));
-    if (score > 0) {
-      scores.push({ entry: value, score });
-    }
+  const scored = await vectorSearch({ // CODEx: Blend vector and lexical scoring through shared helper.
+    candidates: candidateList, // CODEx: Supply full candidate set for scoring.
+    limit, // CODEx: Honor retrieval limit requested by caller.
+    useEmbeddings, // CODEx: Toggle embedding math based on availability.
+    queryVector, // CODEx: Provide precomputed query embedding when available.
+    ensureEmbedding: (entry) => ensureEntryEmbedding(entry), // CODEx: Resolve candidate embeddings lazily.
+    lexicalScorer: (entry) => cosineSimilarity(tokens, tokenize(entry.content)), // CODEx: Compute lexical overlap per entry.
+    similarity: cosineSimilarity, // CODEx: Apply unified cosine similarity for vector comparison.
+    debugHook: (error, entry) => console.debug('Embedding match fallback', { error, id: entry.id }) // CODEx: Surface embedding failures for debugging.
   });
 
-  scores.sort((a, b) => b.score - a.score);
-  const selected = limit > 0 ? scores.slice(0, limit) : scores;
-  return selected.map((item) => item.entry);
+  const selected = limit > 0 ? scored.slice(0, limit) : scored; // CODEx: Respect caller-imposed top-k limit.
+  const result = selected.map((item) => item.entry); // CODEx: Extract memory payloads for downstream use.
+  ragTelemetry.lastRetrievalMs = Math.round(Math.max(0, getTimestampMs() - retrievalStarted)); // CODEx: Record retrieval latency for diagnostics.
+  ragTelemetry.lastRetrievalMode = useEmbeddings ? 'embedding' : 'lexical'; // CODEx: Persist retrieval mode for telemetry overlays.
+
+  if (typeof console !== 'undefined' && typeof console.debug === 'function') { // CODEx: Avoid logging when console missing.
+    const topResults = selected.slice(0, Math.min(5, selected.length)).map((item) => ({ // CODEx: Summarize top matches for debugging output.
+      id: item.entry.id ?? item.entry.timestamp, // CODEx: Provide stable identifier for the retrieved memory.
+      score: Number.isFinite(item.score) ? Number(item.score).toFixed(3) : '0.000', // CODEx: Present combined score with consistent precision.
+      origin: item.entry.origin ?? 'unknown' // CODEx: Include memory origin to aid troubleshooting.
+    }));
+    console.debug('RAG retrieval', { // CODEx: Emit retrieval diagnostics to the debug console.
+      query: normalizedQuery.slice(0, 160), // CODEx: Log truncated query context for reference.
+      latencyMs: ragTelemetry.lastRetrievalMs, // CODEx: Share measured retrieval latency.
+      mode: ragTelemetry.lastRetrievalMode, // CODEx: Indicate whether embeddings or lexical fallback was used.
+      topResults // CODEx: Provide the scored top-k results for debugging.
+    });
+  }
+
+  return result; // CODEx: Return ordered memory results to callers.
 }
 
 function tokenize(text) {
@@ -4337,43 +6676,610 @@ function tokenize(text) {
     ?.filter((token) => token.length > 1) || [];
 }
 
-function cosineSimilarity(queryTokens, docTokens) {
-  if (!docTokens.length) return 0;
-  const tf = new Map();
-  for (const token of docTokens) {
-    tf.set(token, (tf.get(token) || 0) + 1);
-  }
-  let dotProduct = 0;
-  let queryMagnitude = 0;
-  let docMagnitude = 0;
-  const queryCounts = new Map();
-  for (const token of queryTokens) {
-    queryCounts.set(token, (queryCounts.get(token) || 0) + 1);
-  }
-  queryCounts.forEach((count, token) => {
-    queryMagnitude += count * count;
-    if (tf.has(token)) {
-      dotProduct += count * tf.get(token);
+// CODEx: Unified cosine similarity hot-fix supporting numeric vectors and lexical token sets.
+function cosineSimilarity(a, b) {
+  if (Array.isArray(a) && typeof a[0] === 'number') {
+    const dot = a.reduce((sum, value, index) => sum + value * (b?.[index] ?? 0), 0);
+    const magA = Math.sqrt(a.reduce((sum, value) => sum + value * value, 0));
+    const magB = Math.sqrt((Array.isArray(b) ? b : []).reduce((sum, value) => sum + value * value, 0));
+    if (!magA || !magB) {
+      return 0;
     }
-  });
-  tf.forEach((count) => {
-    docMagnitude += count * count;
-  });
-  if (!queryMagnitude || !docMagnitude) return 0;
-  return dotProduct / Math.sqrt(queryMagnitude * docMagnitude);
+    return dot / (magA * magB);
+  }
+  const setA = new Set(Array.isArray(a) ? a : []);
+  const setB = new Set(Array.isArray(b) ? b : []);
+  if (!setA.size || !setB.size) {
+    return 0;
+  }
+  const overlap = [...setA].filter((token) => setB.has(token)).length;
+  return overlap / Math.sqrt(setA.size * setB.size);
 }
 
-function estimateTokenCount(text) {
-  if (!text) return 0;
-  const parts = text
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  let total = 0;
-  for (const part of parts) {
-    total += Math.max(1, Math.ceil(part.length / 4));
+// CODEx: Generate or reuse embeddings for the active query text.
+async function generateQueryEmbedding(query, tokens) {
+  if (!isEmbeddingRetrievalEnabled()) {
+    return null; // CODEx: Skip embedding generation when disabled by configuration.
   }
-  return total;
+  if (!query || query.length < EMBEDDING_MIN_QUERY_LENGTH) {
+    return null; // CODEx: Avoid embedding tiny prompts to conserve provider usage.
+  }
+  try {
+    return await generateTextEmbedding(query); // CODEx: Delegate to shared embedding resolver.
+  } catch (error) {
+    console.debug('Embedding query fallback engaged:', error); // CODEx: Surface provider failures for diagnostics.
+    return null; // CODEx: Allow lexical scoring path to handle retrieval when embeddings fail.
+  }
+}
+
+// CODEx: Ensure a message has an embedding cached for future retrieval.
+async function ensureEntryEmbedding(entry) {
+  const key = normalizeMessageId(entry.id ?? entry.timestamp ?? entry.content);
+  if (messageEmbeddingCache.has(key)) {
+    return messageEmbeddingCache.get(key);
+  }
+  if (entry?.metadata?.embeddingKey) { // CODEx: Attempt to reuse chunk embeddings by key.
+    const chunkKey = entry.metadata.embeddingKey; // CODEx: Extract chunk cache identifier.
+    const cachedVector = chunkEmbeddingIndex.get(chunkKey) || loadEmbeddingFromDisk(chunkKey); // CODEx: Merge RAM and disk caches.
+    if (Array.isArray(cachedVector) && cachedVector.length) { // CODEx: Validate recovered vector.
+      messageEmbeddingCache.set(key, cachedVector); // CODEx: Cache resolved vector for future lookups.
+      return cachedVector; // CODEx: Return cached embedding without recomputation.
+    }
+  }
+  const content = (entry?.content ?? '').trim();
+  if (!content) {
+    return null;
+  }
+  try {
+    const vector = await generateTextEmbedding(content);
+    if (vector) {
+      messageEmbeddingCache.set(key, vector);
+      return vector;
+    }
+  } catch (error) {
+    console.debug('Message embedding fallback:', error);
+  }
+  const fallbackVector = lexicalEmbedding(content);
+  messageEmbeddingCache.set(key, fallbackVector);
+  return fallbackVector;
+}
+
+// CODEx: Produce or reuse an embedding for arbitrary text content.
+async function generateTextEmbedding(text, options = {}) {
+  const trimmed = (text ?? '').trim();
+  if (!trimmed) {
+    return null;
+  }
+  const model = (config.embeddingModel || defaultConfig.embeddingModel || '').trim() || 'text-embedding-3-large';
+  const cacheKey = `${model}::${hashString(trimmed)}`;
+  if (embeddingCache.has(cacheKey)) {
+    return embeddingCache.get(cacheKey);
+  }
+  let vector = null;
+  if (!isEmbeddingRetrievalEnabled()) {
+    vector = lexicalEmbedding(trimmed); // CODEx: Produce lexical vector immediately when embeddings disabled.
+  } else {
+    try {
+      vector = await requestEmbeddingFromProvider(trimmed, model, options); // CODEx: Request embedding from configured provider.
+      if (Array.isArray(vector) && vector.length) {
+        setEmbeddingServiceHealth(true); // CODEx: Mark embedding service healthy on success.
+      } else {
+        setEmbeddingServiceHealth(false, 'empty embedding'); // CODEx: Flag provider failure when response lacks vector data.
+      }
+    } catch (error) {
+      console.debug('Embedding provider unavailable, falling back to lexical vector:', error); // CODEx: Log provider outage for debugging.
+      setEmbeddingServiceHealth(false, error?.message || 'offline'); // CODEx: Persist failure reason for UI indicator.
+    }
+    if (!Array.isArray(vector) || !vector.length) {
+      vector = lexicalEmbedding(trimmed); // CODEx: Fallback to lexical vector when provider fails.
+    }
+  }
+  embeddingCache.set(cacheKey, vector);
+  return vector;
+}
+
+// CODEx: Resolve an embedding endpoint that matches the active provider.
+function resolveEmbeddingEndpoint() {
+  const configured = (config.embeddingEndpoint ?? '').trim();
+  if (configured) {
+    return configured;
+  }
+  const endpoint = (config.endpoint ?? '').trim();
+  if (!endpoint) {
+    return '';
+  }
+  if (isOllamaCloud(endpoint)) { // CODEx: Map Ollama Cloud chat endpoints to embeddings path.
+    if (/\/v1\/chat\/completions$/i.test(endpoint)) { // CODEx: Handle OpenAI-compatible pathing.
+      return endpoint.replace(/\/v1\/chat\/completions$/i, '/v1/embeddings'); // CODEx: Swap chat completions with embeddings endpoint.
+    }
+    if (/\/v1\/chat$/i.test(endpoint)) { // CODEx: Support condensed chat route.
+      return endpoint.replace(/\/v1\/chat$/i, '/v1/embeddings'); // CODEx: Normalize to embeddings endpoint.
+    }
+    return `${stripTrailingSlashes(endpoint)}/v1/embeddings`; // CODEx: Default cloud embeddings suffix.
+  }
+  if (isOllamaLocal(endpoint)) { // CODEx: Map Ollama local chat endpoints to embeddings path.
+    if (/\/v1\/chat\/completions$/i.test(endpoint)) { // CODEx: Handle OpenAI-style local endpoints.
+      return endpoint.replace(/\/v1\/chat\/completions$/i, '/api/embeddings'); // CODEx: Translate to native /api/embeddings path.
+    }
+    if (/\/api\/chat$/i.test(endpoint)) { // CODEx: Handle /api/chat local endpoints.
+      return endpoint.replace(/\/api\/chat$/i, '/api/embeddings'); // CODEx: Swap chat route for embeddings route.
+    }
+    return `${stripTrailingSlashes(endpoint)}/api/embeddings`; // CODEx: Append embeddings suffix for custom bases.
+  }
+  if (isLikelyLmStudio(endpoint)) {
+    return endpoint.replace(/\/v1\/chat\/completions/, '/api/embeddings').replace(/\/api\/chat$/, '/api/embeddings');
+  }
+  if (/\/chat\/completions/.test(endpoint)) {
+    return endpoint.replace(/\/chat\/completions/, '/embeddings');
+  }
+  if (endpoint.endsWith('/api/chat')) {
+    return `${endpoint.slice(0, -5)}embeddings`;
+  }
+  return `${stripTrailingSlashes(endpoint)}/embeddings`;
+}
+
+// CODEx: Detect Ollama Cloud endpoints for schema adjustments.
+function isOllamaCloud(endpoint) {
+  return /api\.ollama\.ai/i.test(endpoint || '');
+}
+
+// CODEx: Detect Ollama local endpoints for schema adjustments.
+function isOllamaLocal(endpoint) {
+  if (!endpoint) {
+    return false;
+  }
+  return /11434/.test(endpoint) || (/ollama/i.test(endpoint) && /localhost|127\.0\.0\.1/i.test(endpoint));
+}
+
+// CODEx: Detect Ollama endpoints for schema adjustments.
+function isLikelyOllama(endpoint) {
+  return isOllamaCloud(endpoint) || isOllamaLocal(endpoint);
+}
+
+// CODEx: Detect LM Studio endpoints for schema adjustments.
+function isLikelyLmStudio(endpoint) {
+  return /1234/.test(endpoint) || /lmstudio/i.test(endpoint);
+}
+
+// CODEx: Strip trailing slashes while preserving protocol prefixes.
+function stripTrailingSlashes(value) {
+  return value.replace(/\/+$/, '');
+}
+
+// CODEx: Reduce an endpoint to its base path.
+function deriveBaseUrl(endpoint) {
+  try {
+    const parsed = new URL(endpoint, window.location.origin);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    if (segments.length > 1) {
+      segments.pop();
+    }
+    parsed.pathname = segments.length ? `/${segments.join('/')}` : '/';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString().replace(/\/$/, '');
+  } catch (error) {
+    const withoutQuery = endpoint.split(/[?#]/)[0];
+    return withoutQuery.replace(/\/[^/]*$/, '');
+  }
+}
+
+// CODEx: Request embeddings from either local or cloud providers with graceful fallback.
+async function requestEmbeddingFromProvider(text, model, { signal } = {}) {
+  const providerSnapshot = await resolveActiveEmbeddingProvider(false); // CODEx: Determine current provider context.
+  const apiKey = (config.embeddingApiKey || config.apiKey || '').trim(); // CODEx: Prefer embedding-specific key.
+  const policyHeader = (config.openRouterPolicy ?? '').trim(); // CODEx: Data policy header for OpenRouter.
+  const embeddingEndpointOverride = (config.embeddingEndpoint ?? '').trim(); // CODEx: Use configured embedding endpoint when provided.
+  const remoteEndpoint = (() => { // CODEx: Derive remote fallback endpoint when applicable.
+    if (embeddingEndpointOverride && !isLikelyLmStudio(embeddingEndpointOverride) && !isLikelyOllama(embeddingEndpointOverride)) {
+      return embeddingEndpointOverride; // CODEx: Honor explicit remote override.
+    }
+    const baseEndpoint = (config.endpoint ?? '').trim(); // CODEx: Inspect primary model endpoint.
+    if (baseEndpoint && !isLikelyLmStudio(baseEndpoint) && !isLikelyOllama(baseEndpoint)) {
+      return resolveEmbeddingEndpoint(); // CODEx: Translate chat endpoint into embeddings path for remote providers.
+    }
+    return ''; // CODEx: Default to module-provided OpenAI endpoint.
+  })();
+
+  const fetchWithPolicy = (url, options = {}) => { // CODEx: Inject OpenRouter policy header when necessary.
+    const next = { ...options, headers: { ...(options?.headers || {}) } }; // CODEx: Clone options to avoid mutation.
+    if (policyHeader && /openrouter\.ai/.test(url)) { // CODEx: Match OpenRouter host heuristically.
+      next.headers['X-OpenRouter-Data-Policy'] = policyHeader; // CODEx: Attach data policy header.
+    }
+    return fetch(url, next); // CODEx: Delegate to native fetch.
+  };
+
+  async function invokeProvider(provider, baseUrl, endpoint) { // CODEx: Shared helper for provider invocation.
+    return requestEmbeddingVector({
+      provider,
+      baseUrl,
+      endpointOverride: endpoint,
+      model,
+      text,
+      apiKey,
+      signal,
+      logger: console,
+      fetchImpl: fetchWithPolicy
+    });
+  }
+
+  try { // CODEx: Attempt primary provider request.
+    const vector = await invokeProvider(
+      providerSnapshot.active,
+      providerSnapshot.baseUrl,
+      embeddingEndpointOverride
+    );
+    setEmbeddingServiceHealth(true); // CODEx: Mark provider healthy on success.
+    return vector; // CODEx: Return resolved embedding vector.
+  } catch (error) {
+    console.warn('[RAG Provider] fallback triggered', { provider: providerSnapshot.active, error }); // CODEx: Log failure for diagnostics with provider context.
+    setEmbeddingServiceHealth(false, error?.message || 'offline'); // CODEx: Update health indicator with failure reason.
+    if (providerSnapshot.active !== EMBEDDING_PROVIDERS.OPENAI) { // CODEx: Only fallback when starting from local provider.
+      try {
+        const vector = await invokeProvider(
+          EMBEDDING_PROVIDERS.OPENAI,
+          '',
+          remoteEndpoint
+        );
+        embeddingProviderState.active = EMBEDDING_PROVIDERS.OPENAI; // CODEx: Promote remote provider after fallback.
+        embeddingProviderState.baseUrl = '';
+        embeddingProviderState.lastProbe = Date.now();
+        setEmbeddingServiceHealth(true); // CODEx: Remote success restores healthy status.
+        return vector;
+      } catch (fallbackError) {
+        console.warn('Remote embedding fallback failed', fallbackError); // CODEx: Surface remote failure.
+        throw fallbackError; // CODEx: Propagate fallback failure to caller.
+      }
+    }
+    throw error; // CODEx: Re-throw when primary provider is already remote.
+  }
+}
+
+// CODEx: Produce hashed lexical embeddings as an offline fallback.
+function lexicalEmbedding(input, dimensions = EMBEDDING_HASH_BUCKETS) {
+  const tokens = Array.isArray(input) ? input : tokenize(input);
+  if (!tokens.length) {
+    return new Array(dimensions).fill(0);
+  }
+  const vector = new Array(dimensions).fill(0);
+  for (const token of tokens) {
+    const bucket = hashString(token) % dimensions;
+    vector[bucket] += 1;
+  }
+  return normalizeVector(vector);
+}
+
+// CODEx: Derive lightweight topic fingerprints for Reflex storage.
+function extractTopicFingerprints(text, limit = 5) {
+  const tokens = tokenize(text)
+    .filter((token) => token.length > 3)
+    .map((token) => token.toLowerCase());
+  if (!tokens.length) {
+    return [];
+  }
+  const counts = new Map();
+  for (const token of tokens) {
+    counts.set(token, (counts.get(token) || 0) + 1);
+  }
+  const sorted = Array.from(counts.entries()).sort((a, b) => {
+    if (b[1] === a[1]) {
+      return a[0].localeCompare(b[0]);
+    }
+    return b[1] - a[1];
+  });
+  return sorted.slice(0, limit).map(([token]) => token);
+}
+
+// CODEx: Normalize vectors to unit length for cosine scoring.
+function normalizeVector(vector) {
+  let magnitude = 0;
+  for (const value of vector) {
+    if (Number.isFinite(value)) {
+      magnitude += value * value;
+    }
+  }
+  if (!magnitude) {
+    return vector;
+  }
+  const scale = 1 / Math.sqrt(magnitude);
+  return vector.map((value) => (Number.isFinite(value) ? value * scale : 0));
+}
+
+// CODEx: Simple 32-bit hash for caching and lexical buckets.
+function hashString(value) {
+  let hash = 0;
+  const text = String(value);
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (hash << 5) - hash + text.charCodeAt(index);
+    hash |= 0;
+  }
+  return hash >>> 0;
+}
+
+// CODEx: Identify the connection strategy for the active endpoint.
+function detectConnectionType(endpoint, preset) {
+  const presetId = preset?.id ?? config.providerPreset;
+  if (presetId === 'ollama-cloud' || isOllamaCloud(endpoint)) { // CODEx: Treat Ollama Cloud as OpenAI-compatible remote API.
+    return 'openai';
+  }
+  if (presetId === 'ollama' || isOllamaLocal(endpoint)) {
+    return 'ollama';
+  }
+  if (presetId === 'lmstudio' || isLikelyLmStudio(endpoint)) {
+    return 'lmstudio';
+  }
+  return 'openai';
+}
+
+// CODEx: Derive the base local endpoint for LM Studio or Ollama.
+function resolveLocalChatEndpoint(endpoint, type, modelName) {
+  const base = stripTrailingSlashes(deriveBaseUrl(endpoint) || endpoint || ''); // CODEx: Normalize base endpoint for routing.
+  const providerLabel = type === 'ollama' ? 'Ollama (Local)' : 'LM Studio'; // CODEx: Human-readable provider label for logs.
+  const isEmbeddingModel = isEmbeddingModelId(modelName); // CODEx: Detect embedding-only checkpoints for guardrails.
+  const url = (() => { // CODEx: Resolve provider-specific chat endpoint.
+    if (type === 'ollama') {
+      if (/\/api\/generate$/i.test(endpoint)) {
+        return endpoint; // CODEx: Respect explicit generate endpoint overrides.
+      }
+      if (/\/v1\/chat\/completions$/i.test(endpoint)) {
+        return endpoint.replace(/\/v1\/chat\/completions$/i, '/api/generate'); // CODEx: Translate legacy OpenAI path.
+      }
+      if (/\/api\/chat$/i.test(endpoint)) {
+        return endpoint.replace(/\/api\/chat$/i, '/api/generate'); // CODEx: Normalize deprecated chat path.
+      }
+      return `${base}/api/generate`; // CODEx: Default Ollama local chat endpoint.
+    }
+    if (type === 'lmstudio') {
+      if (/\/v1\/chat\/completions$/i.test(endpoint)) {
+        return endpoint; // CODEx: Accept already-normalized LM Studio path.
+      }
+      if (/\/api\/chat$/i.test(endpoint)) {
+        return endpoint.replace(/\/api\/chat$/i, '/v1/chat/completions'); // CODEx: Upgrade legacy API path.
+      }
+      return `${base}/v1/chat/completions`; // CODEx: Default LM Studio chat endpoint.
+    }
+    return endpoint; // CODEx: Fallback for unhandled provider types.
+  })();
+  if (isEmbeddingModel && /generate|chat\/completions/i.test(url)) {
+    throw new Error(`Model ${modelName} does not support text generation`); // CODEx: Block embedding checkpoints from chat route.
+  }
+  console.log(`[Bridge] ${providerLabel} → ${url} :: ${modelName}`); // CODEx: Telemetry for provider routing decisions.
+  return url;
+}
+
+// CODEx: Normalize chat messages for local APIs.
+function normalizeLocalMessages(messages) {
+  return messages.map((message) => ({ role: message.role, content: message.content }));
+}
+
+// CODEx: Convert a chat transcript into a single prompt for /api/generate fallbacks.
+function collapseMessagesToPrompt(messages) {
+  return messages.map((message) => `${message.role.toUpperCase()}: ${message.content}`).join('\n\n');
+}
+
+// CODEx: Handle local LM Studio/Ollama requests with context retries and fallbacks.
+async function callLocalModel({
+  type,
+  endpoint,
+  model,
+  messages,
+  temperature,
+  maxTokens,
+  timeoutMs,
+  onStream
+}) { // CODEx: Support streaming callbacks for local backends.
+  if (isEmbeddingModelId(model)) { // CODEx: Guard against embedding-only checkpoints.
+    throw new Error(`Model ${model} does not support text generation`); // CODEx: Block embedding checkpoints from chat usage.
+  }
+  const providerLabel = type === 'ollama' ? 'Ollama (Local)' : 'LM Studio'; // CODEx: Identify provider for telemetry messaging.
+  let numCtx = getProviderContextLimit(type === 'ollama' ? 'ollama' : 'lmstudio'); // CODEx: Initialize local context budget.
+  let attempt = 0; // CODEx: Track retry iteration count.
+  const maxAttempts = 3; // CODEx: Allow retries for watchdog and context recovery.
+  const chatEndpoint = resolveLocalChatEndpoint(endpoint, type, model); // CODEx: Normalize chat endpoint per provider rules.
+  const reasoningMode = isReasoningModelId(model); // CODEx: Drive watchdog budget from reasoning detector.
+  const deadline = Date.now() + Math.max(timeoutMs, 1000); // CODEx: Track overall timeout window.
+
+  async function executeAttempt() {
+    attempt += 1; // CODEx: Increment attempt counter for diagnostics.
+    const isOllamaLocal = type === 'ollama'; // CODEx: Flag Ollama routing for payload construction.
+    const payload = isOllamaLocal
+      ? {
+          model,
+          prompt: collapseMessagesToPrompt(messages),
+          stream: false,
+          options: {
+            temperature,
+            num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx))
+          }
+        }
+      : {
+          model,
+          messages: normalizeLocalMessages(messages),
+          temperature,
+          stream: false,
+          num_ctx: numCtx,
+          num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx))
+        };
+    if (!isOllamaLocal) {
+      payload.use_default_prompt_template = false; // CODEx: Disable LM Studio Jinja templates for raw JSON payloads.
+      payload.input_format = 'json'; // CODEx: Request LM Studio to interpret payload without prompt templating.
+    }
+
+    const remaining = Math.max(0, deadline - Date.now()); // CODEx: Derive remaining overall budget in milliseconds.
+    if (remaining <= 0) { // CODEx: Abort when the global timeout has elapsed.
+      const timeoutError = new Error(`Local request timed out after ${Math.round(timeoutMs / 1000)}s.`); // CODEx: Emit when budget exhausted.
+      timeoutError.code = 'timeout'; // CODEx: Tag timeout errors for upstream handling.
+      throw timeoutError; // CODEx: Surface timeout to caller.
+    }
+
+    const controller = new AbortController(); // CODEx: Manage abort lifecycle per attempt.
+    let watchdogTriggered = false; // CODEx: Track watchdog intervention state.
+    const watchdogLimit = Math.min(remaining, reasoningMode ? 180000 : 60000); // CODEx: Adaptive watchdog budget.
+    const watchdog = setTimeout(() => {
+      watchdogTriggered = true; // CODEx: Flag that the watchdog triggered.
+      controller.abort(); // CODEx: Abort the pending fetch to trigger retry.
+      console.warn(`[Watchdog] ${model} exceeded reasoning timeout; retrying`); // CODEx: Surface watchdog intervention.
+    }, watchdogLimit); // CODEx: Schedule watchdog abort.
+    const globalTimer = setTimeout(() => controller.abort(), remaining); // CODEx: Preserve overall timeout budget.
+
+    try {
+      const response = await fetch(chatEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      clearTimeout(watchdog); // CODEx: Dispose watchdog timer after completion.
+      clearTimeout(globalTimer); // CODEx: Dispose global timeout timer after completion.
+      if (response.ok) {
+        const data = await response.json();
+        const text = isOllamaLocal
+          ? data?.response || data?.output || data?.message?.content || ''
+          : data?.message?.content || data?.output || data?.response || '';
+        if (isOllamaLocal && attempt === 1) {
+          console.log('[RAG] Provider = Ollama Local → /api/generate OK'); // CODEx: Confirm successful local routing.
+        }
+        if (typeof onStream === 'function') {
+          onStream({ type: 'content', text });
+        }
+        return { content: text, reasoning: data?.message?.reasoning || '', truncated: false };
+      }
+      const errorText = await response.text(); // CODEx: Capture response body for diagnostics.
+      if (shouldRetryStatus(response.status) && attempt < maxAttempts) {
+        const delayMs = computeBackoffDelay(attempt, 600); // CODEx: Exponential backoff for transient server errors.
+        console.warn(`[Bridge] ${providerLabel} HTTP ${response.status}; retrying in ${delayMs}ms (attempt ${attempt}/${maxAttempts}).`); // CODEx: Surface provider retry telemetry.
+        await wait(delayMs); // CODEx: Delay subsequent attempt to respect backoff.
+        return executeAttempt(); // CODEx: Re-run local request after cooldown.
+      }
+      if (response.status >= 400 && response.status < 500) {
+        if (/no context/i.test(errorText) && attempt < maxAttempts) {
+          numCtx = Math.max(512, Math.floor(numCtx * 0.7)); // CODEx: Reduce context window on capacity errors.
+          return executeAttempt();
+        }
+        if (/model not found/i.test(errorText) && type === 'ollama') {
+          const fallbackEndpoint = `${stripTrailingSlashes(deriveBaseUrl(endpoint))}/api/generate`;
+          console.warn(`[Bridge] ${providerLabel} fallback to ${fallbackEndpoint} after HTTP ${response.status}.`); // CODEx: Log explicit provider fallback routing.
+          const fallbackResponse = await fetch(fallbackEndpoint, { // CODEx: Retry using canonical generate endpoint.
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model,
+              prompt: collapseMessagesToPrompt(messages),
+              stream: false
+            }),
+            signal: controller.signal
+          });
+          if (!fallbackResponse.ok) {
+            throw new Error(`HTTP ${fallbackResponse.status}: ${await fallbackResponse.text()}`);
+          }
+          const fallbackData = await fallbackResponse.json(); // CODEx: Decode fallback response payload.
+          const fallbackText = fallbackData?.response || fallbackData?.output || ''; // CODEx: Normalize fallback text content.
+          if (typeof onStream === 'function') {
+            onStream({ type: 'content', text: fallbackText });
+          }
+          return { content: fallbackText, reasoning: '', truncated: false };
+        }
+      }
+      throw new Error(`HTTP ${response.status}: ${errorText}`);
+    } catch (error) {
+      clearTimeout(watchdog); // CODEx: Ensure watchdog timer cleared on error path.
+      clearTimeout(globalTimer); // CODEx: Ensure global timer cleared on error path.
+      if (error.name === 'AbortError') {
+        if (watchdogTriggered && attempt < maxAttempts) {
+          return executeAttempt(); // CODEx: Retry automatically after watchdog intervention.
+        }
+        const timeoutError = new Error(`Local request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+        timeoutError.code = 'timeout';
+        throw timeoutError;
+      }
+      if (attempt < maxAttempts && isTransientNetworkError(error)) {
+        const delayMs = computeBackoffDelay(attempt, 600); // CODEx: Compute exponential backoff for transient local failures.
+        console.warn(`[Bridge] ${providerLabel} transient error (${error.message || error}); retrying in ${delayMs}ms.`); // CODEx: Log retry decision for diagnostics.
+        await wait(delayMs); // CODEx: Pause before retrying to give the server breathing room.
+        return executeAttempt(); // CODEx: Attempt the request again after backoff interval.
+      }
+      throw error;
+    }
+  }
+
+  return executeAttempt();
+}
+
+// CODEx: Consume OpenAI-style streaming responses and merge text/reasoning segments.
+async function consumeOpenAiStream(response, options = {}) {
+  const { onContent, onReasoning } = options; // CODEx: Optional callbacks for incremental rendering.
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const fallback = await response.text();
+    return { text: fallback, reasoning: '', truncated: false };
+  }
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  const textParts = [];
+  const reasoningParts = [];
+  let runningText = ''; // CODEx: Track incremental content for streaming updates.
+  let runningReasoning = ''; // CODEx: Track incremental reasoning for streaming updates.
+  let done = false;
+  while (!done) {
+    const { value, done: streamDone } = await reader.read();
+    done = streamDone;
+    if (value) {
+      buffer += decoder.decode(value, { stream: !done });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || line === 'data:' || line === 'data: [DONE]') {
+          continue;
+        }
+        const payloadText = line.startsWith('data:') ? line.slice(5).trim() : line;
+        if (payloadText === '[DONE]') {
+          done = true;
+          break;
+        }
+        try {
+          const chunk = JSON.parse(payloadText);
+          const delta = chunk?.choices?.[0]?.delta ?? {};
+          if (typeof delta.content === 'string') {
+            textParts.push(delta.content);
+            runningText += delta.content; // CODEx: Build incremental assistant response.
+            if (typeof onContent === 'function') {
+              onContent(runningText); // CODEx: Emit partial assistant text.
+            }
+          }
+          if (typeof delta.reasoning === 'string') {
+            reasoningParts.push(delta.reasoning);
+            runningReasoning += delta.reasoning; // CODEx: Build incremental reasoning trace.
+            if (typeof onReasoning === 'function') {
+              onReasoning(runningReasoning); // CODEx: Emit partial reasoning text.
+            }
+          }
+          if (Array.isArray(delta.reasoning)) {
+            for (const item of delta.reasoning) {
+              if (typeof item?.text === 'string') {
+                reasoningParts.push(item.text);
+                runningReasoning += item.text; // CODEx: Extend reasoning accumulation for array payloads.
+                if (typeof onReasoning === 'function') {
+                  onReasoning(runningReasoning); // CODEx: Emit aggregated reasoning updates.
+                }
+              }
+            }
+          }
+        } catch (error) {
+          textParts.push(payloadText);
+          runningText += payloadText; // CODEx: Append raw payload fallback.
+          if (typeof onContent === 'function') {
+            onContent(runningText); // CODEx: Emit fallback chunk.
+          }
+        }
+      }
+    }
+  }
+  return {
+    text: textParts.join(''),
+    reasoning: reasoningParts.join('\n').trim(),
+    truncated: false
+  };
 }
 
 function trimResponseToTokenLimit(text, limit) {
@@ -4480,28 +7386,158 @@ function normalizeModelMessage(message) {
   };
 }
 
+async function consumeTextStream(response, options = {}) {
+  const { onContent } = options; // CODEx: Allow streaming updates for chunked JSON/text payloads.
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const fallback = await response.text();
+    if (typeof onContent === 'function') {
+      onContent(fallback); // CODEx: Emit fallback content when streaming is unavailable.
+    }
+    return { text: fallback, reasoning: '', truncated: false };
+  }
+  const decoder = new TextDecoder('utf-8');
+  let aggregated = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (value) {
+      aggregated += decoder.decode(value, { stream: true }); // CODEx: Accumulate streamed chunk.
+      if (typeof onContent === 'function') {
+        onContent(aggregated); // CODEx: Push incremental buffer to UI.
+      }
+    }
+  }
+  aggregated += decoder.decode(); // CODEx: Flush decoder state.
+  if (typeof onContent === 'function') {
+    onContent(aggregated); // CODEx: Emit finalized aggregation for completeness.
+  }
+  return { text: aggregated, reasoning: '', truncated: false };
+}
+
+function resolveRequestTimeout(modelId, preset, overrideTimeout) {
+  if (Number.isFinite(overrideTimeout) && overrideTimeout > 0) {
+    return overrideTimeout;
+  }
+
+  const requestSeconds = Number.isFinite(config?.requestTimeoutSeconds)
+    ? config.requestTimeoutSeconds
+    : defaultConfig.requestTimeoutSeconds;
+  const reasoningSeconds = Number.isFinite(config?.reasoningTimeoutSeconds)
+    ? config.reasoningTimeoutSeconds
+    : defaultConfig.reasoningTimeoutSeconds;
+
+  const baseMs = Math.max(1000, Math.round(requestSeconds * 1000));
+  let reasoningMs = Math.max(baseMs, Math.round(reasoningSeconds * 1000));
+  reasoningMs = Math.max(reasoningMs, 300000);
+
+  if (preset?.reasoningTimeoutMs && Number.isFinite(preset.reasoningTimeoutMs) && preset.reasoningTimeoutMs > 0) {
+    reasoningMs = Math.max(reasoningMs, preset.reasoningTimeoutMs);
+  }
+
+  const reasoningActive = isReasoningModeActive({
+    model: modelId,
+    providerPreset: preset?.id ?? config.providerPreset
+  });
+
+  if (reasoningActive) {
+    return reasoningMs;
+  }
+
+  return baseMs;
+}
+
 async function callModel(messages, overrides = {}) {
   const endpoint = overrides.endpoint ?? config.endpoint;
   const model = overrides.model ?? config.model;
   const temperature = overrides.temperature ?? config.temperature;
   const apiKey = overrides.apiKey ?? config.apiKey;
-  const maxTokens = overrides.maxTokens ?? config.maxResponseTokens;
   const providerPreset = overrides.providerPreset ?? config.providerPreset;
+  const openRouterPolicy = (overrides.openRouterPolicy ?? config.openRouterPolicy ?? '').trim();
 
   if (!endpoint || !model) {
     throw new Error('Model endpoint or name missing.');
   }
 
   const preset = providerPresetMap.get(providerPreset);
+  const timeoutMs = resolveRequestTimeout(model, preset, overrides.timeoutMs);
+  const connectionType = detectConnectionType(endpoint, preset);
+  const reasoningActive = isReasoningModeActive({ model, providerPreset });
+  const streamCallback = typeof overrides.onStream === 'function' ? overrides.onStream : null; // CODEx: Capture optional streaming hook.
+  const contextLimit = getProviderContextLimit(providerPreset);
+  let effectiveMaxTokens = overrides.maxTokens ?? config.maxResponseTokens ?? contextLimit;
+  if (!Number.isFinite(effectiveMaxTokens) || effectiveMaxTokens <= 0) {
+    effectiveMaxTokens = contextLimit;
+  }
+  if (reasoningActive) {
+    const reasoningCeiling = Math.min(contextLimit, 6000); // CODEx: Cap reasoning responses to a 6k token ceiling.
+    const reasoningFloor = Math.min(reasoningCeiling, 4500); // CODEx: Ensure at least 4.5k tokens when possible.
+    effectiveMaxTokens = Math.max(effectiveMaxTokens, reasoningFloor); // CODEx: Lift lower bound for reasoning mode.
+    effectiveMaxTokens = Math.min(effectiveMaxTokens, reasoningCeiling); // CODEx: Guard against runaway token budgets.
+  }
+  effectiveMaxTokens = Math.min(contextLimit, effectiveMaxTokens);
+  let plannedTokens = effectiveMaxTokens; // CODEx: Track requested token budget for telemetry.
+
+  const callStarted = getTimestampMs();
+  // CODEx: Collect model latency metrics for diagnostics output.
+  const finalizeMetrics = () => {
+    const duration = Math.max(0, getTimestampMs() - callStarted);
+    modelCallMetrics.totalMs += duration;
+    modelCallMetrics.count += 1;
+  };
+  const logReasoningDiagnostics = () => {
+    if (!reasoningActive) {
+      return; // CODEx: Only emit telemetry for reasoning-enabled runs.
+    }
+    const turnDuration = Math.max(0, getTimestampMs() - callStarted); // CODEx: Derive latency for reporting.
+    console.table({
+      model, // CODEx: Report model identifier.
+      reasoningMode: reasoningActive, // CODEx: Confirm reasoning handshake state.
+      tokensUsed: plannedTokens, // CODEx: Surface negotiated token budget.
+      turnDuration, // CODEx: Highlight runtime in milliseconds.
+      entropyScore: Number.isFinite(currentEntropyScore)
+        ? Number(currentEntropyScore.toFixed(3))
+        : null, // CODEx: Snapshot current entropy loop score.
+      reflexTriggered: Boolean(lastReflexSummaryAt && lastReflexSummaryAt >= callStarted) // CODEx: Flag reflex overlap.
+    });
+  }; // CODEx: Emit structured diagnostics for debugging exports.
+
+  if (connectionType !== 'openai') {
+    try {
+      const result = await callLocalModel({
+        type: connectionType,
+        endpoint,
+        model,
+        messages,
+        temperature,
+        maxTokens: effectiveMaxTokens,
+        timeoutMs,
+        onStream: streamCallback
+      });
+      finalizeMetrics();
+      logReasoningDiagnostics(); // CODEx: Mirror remote telemetry for local providers.
+      return result;
+    } catch (error) {
+      finalizeMetrics();
+      if (reasoningActive && (error?.code === 'timeout' || /timed out/i.test(error?.message ?? ''))) {
+        modelCallMetrics.reasoningTimeouts += 1;
+      }
+      throw error;
+    }
+  }
+
   const isAnthropic = preset?.anthropicFormat;
   const isGoogle = preset?.googleFormat;
+  const usingOpenRouter = (preset?.id ?? providerPreset) === 'openrouter' || /openrouter\.ai/.test(endpoint);
+  const shouldStream = overrides.stream === true || (overrides.stream !== false && reasoningActive && !isAnthropic && !isGoogle);
 
   let headers = { 'Content-Type': 'application/json' };
   let payload = {};
   let requestEndpoint = endpoint;
 
   if (isAnthropic) {
-    // Anthropic format
     headers = {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
@@ -4509,85 +7545,186 @@ async function callModel(messages, overrides = {}) {
     };
     payload = {
       model,
-      max_tokens: Math.round(maxTokens) || 4096,
+      max_tokens: Math.round(effectiveMaxTokens) || 4096,
       temperature,
-      messages: messages.map(msg => ({
+      messages: messages.map((msg) => ({
         role: msg.role === 'assistant' ? 'assistant' : 'user',
         content: msg.content
       }))
     };
+    plannedTokens = payload.max_tokens; // CODEx: Record anthropic token ceiling for telemetry.
   } else if (isGoogle) {
-    // Google Gemini format
     requestEndpoint = `${endpoint}${model}:generateContent?key=${apiKey}`;
     payload = {
       contents: [{
-        parts: [{ text: messages.map(msg => `${msg.role}: ${msg.content}`).join('\n\n') }]
+        parts: [{ text: messages.map((msg) => `${msg.role}: ${msg.content}`).join('\n\n') }]
       }],
       generationConfig: {
         temperature,
-        maxOutputTokens: Math.round(maxTokens) || 2048
+        maxOutputTokens: Math.round(effectiveMaxTokens) || 2048
       }
     };
+    plannedTokens = payload.generationConfig.maxOutputTokens; // CODEx: Track Google token plan for telemetry output.
   } else {
-    // Standard OpenAI format
     if (apiKey) {
       headers.Authorization = `Bearer ${apiKey}`;
+    }
+    if (usingOpenRouter && openRouterPolicy) {
+      headers['X-OpenRouter-Data-Policy'] = openRouterPolicy;
     }
     payload = {
       model,
       messages,
       temperature,
-      stream: false
+      stream: shouldStream
     };
-    if (Number.isFinite(maxTokens) && maxTokens > 0) {
-      payload.max_tokens = Math.round(maxTokens);
+    if (Number.isFinite(effectiveMaxTokens) && effectiveMaxTokens > 0) {
+      payload.max_tokens = Math.round(effectiveMaxTokens);
+      plannedTokens = payload.max_tokens; // CODEx: Persist adjusted max token budget for diagnostics.
     }
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+  const maxAttempts = 3; // CODEx: Allow exponential backoff retries for transient failures.
+  let attempt = 0; // CODEx: Track remote retry attempts.
 
-  try {
-    const response = await fetch(requestEndpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      throw new Error('Request timed out after 30 seconds.');
+  async function issueRequest() {
+    attempt += 1; // CODEx: Increment attempt counter for diagnostics.
+    const controller = new AbortController(); // CODEx: Manage fetch cancellation per attempt.
+    let watchdogTriggered = false; // CODEx: Track watchdog activation state.
+    const watchdogLimit = reasoningActive ? 180000 : 60000; // CODEx: Adaptive watchdog threshold.
+    const watchdogTimer = setTimeout(() => {
+      watchdogTriggered = true; // CODEx: Record watchdog activation.
+      controller.abort(); // CODEx: Abort fetch to enable retry.
+      console.warn(`[Watchdog] ${model} exceeded reasoning timeout; retrying`); // CODEx: Surface watchdog telemetry.
+    }, watchdogLimit); // CODEx: Schedule watchdog for long requests.
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs); // CODEx: Preserve configured timeout budget.
+    try {
+      const response = await fetch(requestEndpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId); // CODEx: Dispose configured timeout timer.
+      clearTimeout(watchdogTimer); // CODEx: Dispose watchdog timer after completion.
+      return { response, watchdogTriggered }; // CODEx: Return response with watchdog flag.
+    } catch (error) {
+      clearTimeout(timeoutId); // CODEx: Ensure timers cleared on error path.
+      clearTimeout(watchdogTimer); // CODEx: Ensure watchdog timer cleared on error path.
+      if (error.name === 'AbortError') {
+        if (watchdogTriggered) {
+          error.code = 'watchdog-abort'; // CODEx: Flag watchdog-driven abort for backoff handling.
+          throw error; // CODEx: Bubble to outer retry controller.
+        }
+        if (reasoningActive) {
+          modelCallMetrics.reasoningTimeouts += 1; // CODEx: Track reasoning timeout metrics.
+        }
+        const seconds = Math.round(timeoutMs / 100) / 10; // CODEx: Convert timeout to seconds with decimal precision.
+        const timeoutError = new Error(`Request timed out after ${seconds}s.`); // CODEx: Provide human-readable timeout error.
+        timeoutError.code = 'timeout'; // CODEx: Tag timeout errors for upstream handling.
+        throw timeoutError;
+      }
+      throw error; // CODEx: Propagate non-timeout errors.
     }
-    throw error;
   }
+
+  let response;
+  let lastError = null; // CODEx: Track last failure for final error reporting.
+  while (attempt < maxAttempts) {
+    try {
+      const { response: resolvedResponse } = await issueRequest(); // CODEx: Execute request with watchdog handling.
+      response = resolvedResponse; // CODEx: Normalize response reference for downstream logic.
+    } catch (error) {
+      lastError = error; // CODEx: Preserve error for diagnostics.
+      if (attempt < maxAttempts && (error.code === 'watchdog-abort' || isTransientNetworkError(error))) {
+        const delayMs = computeBackoffDelay(attempt, 600); // CODEx: Determine exponential backoff interval.
+        console.warn(`[Bridge] ${model} retry after ${error.code === 'watchdog-abort' ? 'watchdog abort' : error.message}; waiting ${delayMs}ms.`); // CODEx: Emit retry telemetry for remote providers.
+        await wait(delayMs); // CODEx: Pause before attempting again.
+        continue; // CODEx: Retry request after cooldown.
+      }
+      finalizeMetrics(); // CODEx: Preserve metrics on terminal failure.
+      throw error; // CODEx: Propagate non-retriable error to caller.
+    }
+    if (!response) {
+      break; // CODEx: Should not occur, but guard to avoid infinite loop.
+    }
+    if (!response.ok) {
+      if (attempt < maxAttempts && shouldRetryStatus(response.status)) {
+        const delayMs = computeBackoffDelay(attempt, 600); // CODEx: Compute retry interval for server failures.
+        console.warn(`[Bridge] HTTP ${response.status} at ${requestEndpoint}; retrying in ${delayMs}ms (attempt ${attempt}/${maxAttempts}).`); // CODEx: Log remote fallback path clearly.
+        await wait(delayMs); // CODEx: Delay before reissuing request.
+        continue; // CODEx: Attempt request again following backoff.
+      }
+    }
+    break; // CODEx: Exit loop when response obtained (success or terminal failure).
+  }
+
+  if (!response) {
+    finalizeMetrics(); // CODEx: Preserve metrics when no response obtained.
+    throw lastError || new Error('Model request failed without response.'); // CODEx: Report absence of response clearly.
+  }
+
+  const contentType = response.headers.get('content-type') ?? ''; // CODEx: Capture response type for streaming selection.
 
   if (!response.ok) {
     const text = await response.text();
+    finalizeMetrics();
     throw new Error(`HTTP ${response.status}: ${text}`);
+  }
+
+  if (shouldStream && response.body) {
+    if (contentType.includes('text/event-stream')) {
+      const streamed = await consumeOpenAiStream(response, {
+        onContent: (text) => {
+          if (streamCallback) {
+            streamCallback({ type: 'content', text }); // CODEx: Surface incremental assistant text.
+          }
+        },
+        onReasoning: (text) => {
+          if (streamCallback) {
+            streamCallback({ type: 'reasoning', text }); // CODEx: Surface incremental reasoning trace.
+          }
+        }
+      });
+      finalizeMetrics();
+      logReasoningDiagnostics();
+      return { content: streamed.text, truncated: streamed.truncated, reasoning: streamed.reasoning };
+    }
+    const streamed = await consumeTextStream(response, {
+      onContent: (text) => {
+        if (streamCallback) {
+          streamCallback({ type: 'content', text }); // CODEx: Relay chunked text buffers for non-SSE streaming.
+        }
+      }
+    });
+    finalizeMetrics();
+    logReasoningDiagnostics();
+    return { content: streamed.text, truncated: streamed.truncated ?? false, reasoning: streamed.reasoning ?? '' };
   }
 
   const data = await response.json();
 
   let message = {};
   if (isAnthropic) {
-    // Anthropic response format
     message = {
       content: data.content?.[0]?.text || '',
-      reasoning: data.content?.find(c => c.type === 'thinking')?.thinking || ''
+      reasoning: data.content?.find((c) => c.type === 'thinking')?.thinking || ''
     };
   } else if (isGoogle) {
-    // Google Gemini response format
     message = {
       content: data.candidates?.[0]?.content?.parts?.[0]?.text || ''
     };
   } else {
-    // Standard OpenAI format
     message = data?.choices?.[0]?.message ?? {};
   }
 
   const { text, reasoning } = normalizeModelMessage(message);
+  if (streamCallback) {
+    streamCallback({ type: 'content', text }); // CODEx: Emit final consolidated content for UI sync.
+    if (reasoning) {
+      streamCallback({ type: 'reasoning', text: reasoning }); // CODEx: Share reasoning payload when available.
+    }
+  }
   const segments = [];
   if (reasoning) {
     segments.push(`Reasoning:\n${reasoning}`);
@@ -4597,14 +7734,20 @@ async function callModel(messages, overrides = {}) {
   }
   const combined = segments.join('\n\n').trim();
   if (!combined) {
+    finalizeMetrics();
+    logReasoningDiagnostics();
     return { content: '', truncated: false, reasoning: reasoning ?? '' };
   }
 
-  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+  if (!Number.isFinite(effectiveMaxTokens) || effectiveMaxTokens <= 0) {
+    finalizeMetrics();
+    logReasoningDiagnostics();
     return { content: combined, truncated: false, reasoning };
   }
 
-  const trimmedResult = trimResponseToTokenLimit(combined, Math.round(maxTokens));
+  const trimmedResult = trimResponseToTokenLimit(combined, Math.round(effectiveMaxTokens));
+  finalizeMetrics();
+  logReasoningDiagnostics();
   return { ...trimmedResult, reasoning };
 }
 
@@ -4927,6 +8070,7 @@ async function startDualChat() {
   activeDualSeed = seed;
   rotateRagSession(MODE_ARENA);
   resetDualChat();
+  clearDualCountdownTimer();
   activeDualConnections.A = agentAConnection;
   activeDualConnections.B = agentBConnection;
   isDualChatRunning = true;
@@ -4951,6 +8095,7 @@ async function startDualChat() {
   elements.dualStatus.textContent = 'Dual chat running…';
   updateModelConnectionStatus();
   startDualAutosaveTimer();
+  await activatePhase(0, { force: true, announce: true });
   updateReflexStatus(config.reflexEnabled ? 'Reflex armed' : 'Reflex disabled', config.reflexEnabled ? 'ready' : 'disabled');
   updateEntropyMeter();
   await generateDualTurn('A', seed, { isInitial: true });
@@ -4970,6 +8115,11 @@ function resetDualChat() {
   reflexSummaryCount = 0;
   lastReflexSummaryAt = null;
   reflexInFlight = false;
+  activePhaseIndex = 0;
+  activePhaseId = null;
+  pendingPhaseAdvance = false;
+  lastEntropyState = 'calibrating';
+  lastReflexSynthesisSignature = null;
   updateProcessState('arena', { status: 'Idle', detail: 'Dual chat reset.' });
   updateEntropyMeter();
   updateReflexStatus();
@@ -4981,6 +8131,7 @@ function stopDualChat() {
     clearTimeout(autoContinueTimer);
     autoContinueTimer = undefined;
   }
+  clearDualCountdownTimer();
   stopDualAutosaveTimer();
   activeDualConnections.A = null;
   activeDualConnections.B = null;
@@ -4989,6 +8140,7 @@ function stopDualChat() {
   updateModelConnectionStatus();
   void persistDualRagSnapshot();
   reflexInFlight = false;
+  pendingPhaseAdvance = false;
   updateProcessState('arena', { status: 'Idle', detail: 'Dual chat stopped.' });
   updateProcessState('modelA', { status: 'Idle', detail: 'Waiting for user prompt.' });
   const modelBDetail = config.agentBEnabled ? 'Awaiting arena start.' : 'Model B is disabled.';
@@ -5019,10 +8171,41 @@ async function advanceDualTurn() {
     stopDualChat();
     return;
   }
+  if (autoContinueTimer) {
+    clearTimeout(autoContinueTimer);
+    autoContinueTimer = undefined;
+  }
+  clearDualCountdownTimer();
   await generateDualTurn(nextDualSpeaker);
   if (config.dualAutoContinue) {
     scheduleNextDualTurn();
   }
+}
+
+function clearDualCountdownTimer() {
+  if (dualCountdownTimer) {
+    clearInterval(dualCountdownTimer);
+    dualCountdownTimer = undefined;
+  }
+  dualCountdownDeadline = null;
+}
+
+function updateDualCountdownStatus() {
+  if (!elements.dualStatus) return;
+  if (!isDualChatRunning || dualCountdownDeadline === null) {
+    if (isDualChatRunning) {
+      elements.dualStatus.textContent = 'Dual chat running…';
+    }
+    return;
+  }
+  const remainingMs = dualCountdownDeadline - Date.now();
+  if (remainingMs <= 0) {
+    elements.dualStatus.textContent = 'Dual chat running…';
+    clearDualCountdownTimer();
+    return;
+  }
+  const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  elements.dualStatus.textContent = `Next turn in ${seconds}s…`;
 }
 
 function scheduleNextDualTurn() {
@@ -5032,9 +8215,81 @@ function scheduleNextDualTurn() {
     stopDualChat();
     return;
   }
+  clearTimeout(autoContinueTimer);
+  clearDualCountdownTimer();
+  const delaySeconds = resolveDualTurnDelaySeconds();
+  const delayMs = Math.max(0, Math.round(delaySeconds * 1000));
+  if (delayMs === 0) {
+    elements.dualStatus.textContent = 'Dual chat running…';
+    autoContinueTimer = setTimeout(() => {
+      autoContinueTimer = undefined;
+      void safeDualTurnInvocation(); // CODEx: Route through watchdog wrapper for error recovery.
+    }, 0);
+    return;
+  }
+  dualCountdownDeadline = Date.now() + delayMs;
+  updateDualCountdownStatus();
+  dualCountdownTimer = setInterval(() => {
+    updateDualCountdownStatus();
+  }, 1000);
   autoContinueTimer = setTimeout(() => {
-    void advanceDualTurn();
-  }, 2000);
+    autoContinueTimer = undefined;
+    clearDualCountdownTimer();
+    void safeDualTurnInvocation(); // CODEx: Protect auto loop from transient failures.
+  }, delayMs);
+}
+
+function resolveDualTurnDelaySeconds() {
+  const baseDelay = clampNumber(
+    config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds,
+    0,
+    600,
+    defaultConfig.dualTurnDelaySeconds
+  );
+  const nextConnection = activeDualConnections[nextDualSpeaker] ?? getAgentConnection(nextDualSpeaker); // CODEx: Inspect next speaker handshake.
+  const reasoningLoop = isReasoningModeActive({
+    model: nextConnection?.model,
+    providerPreset: nextConnection?.providerPreset
+  }); // CODEx: Determine if adaptive reasoning delay applies.
+  const entropyScore = Number.isFinite(currentEntropyScore) ? currentEntropyScore : 0; // CODEx: Normalize entropy metric.
+  if (reasoningLoop) {
+    const target = entropyScore > 0.8 ? 25 : 12; // CODEx: Apply Phase II adaptive windowing.
+    return Math.min(45, Math.max(8, target));
+  }
+  if (baseDelay === 0) {
+    return 0;
+  }
+  if (!Number.isFinite(currentEntropyScore)) {
+    return baseDelay;
+  }
+  if (currentEntropyScore >= ENTROPY_LOOP_THRESHOLD) {
+    return Math.max(MIN_DYNAMIC_DELAY_SECONDS, Math.round(baseDelay * LOOP_DELAY_SCALE));
+  }
+  if (currentEntropyScore <= ENTROPY_EXPLORE_THRESHOLD) {
+    return Math.min(MAX_DYNAMIC_DELAY_SECONDS, Math.round(baseDelay * EXPLORE_DELAY_SCALE));
+  }
+  return baseDelay;
+}
+
+async function safeDualTurnInvocation() {
+  if (!isDualChatRunning) {
+    return; // CODEx: Avoid scheduling when arena is idle.
+  }
+  try {
+    await advanceDualTurn();
+  } catch (error) {
+    console.warn('Turn crash — retrying in 5 s', error); // CODEx: Surface watchdog retry notice.
+    if (!isDualChatRunning) {
+      return;
+    }
+    if (elements.dualStatus) {
+      elements.dualStatus.textContent = 'Recovering from model error…'; // CODEx: Inform operators about retry cycle.
+    }
+    autoContinueTimer = setTimeout(() => {
+      autoContinueTimer = undefined;
+      void safeDualTurnInvocation();
+    }, 5000);
+  }
 }
 
 function startDualAutosaveTimer() {
@@ -5057,35 +8312,67 @@ function stopDualAutosaveTimer() {
   updateProcessState('autosave', { status: 'Idle', detail: 'Next snapshot pending.' });
 }
 
+function tokenizeForEntropy(content) {
+  const normalized = (content ?? '')
+    .toLowerCase()
+    .replace(/[“”]/g, '"')
+    .replace(/[’]/g, "'");
+  const tokens = normalized.match(/[a-z0-9]+/g);
+  return tokens ? tokens.filter(Boolean) : [];
+}
+
+function buildEntropyVector(content) {
+  return tokenizeForEntropy(content); // CODEx: Reuse lexical tokens for unified cosine similarity.
+}
+
 function computeEntropyScore(history, windowSize) {
   if (!Array.isArray(history) || history.length === 0) {
     return 0;
   }
-  const size = clampNumber(windowSize ?? config.entropyWindow ?? defaultConfig.entropyWindow, 2, 50, 6);
-  const recent = history.slice(-size);
-  const tokens = recent
-    .map((entry) => entry?.content ?? '')
-    .join(' ')
-    .toLowerCase()
-    .match(/[\w\-']+/g);
-  if (!tokens || tokens.length === 0) {
+  const volleyWindow = clampNumber(
+    windowSize ?? config.entropyWindow ?? defaultConfig.entropyWindow,
+    1,
+    25,
+    defaultConfig.entropyWindow
+  );
+  const sampleSize = Math.max(2, volleyWindow * 2);
+  const relevant = history.filter(
+    (entry) => entry && entry.countsAsTurn !== false && entry.speaker !== 'system' && typeof entry.content === 'string'
+  );
+  if (relevant.length < 2) {
     return 0;
   }
-  const unique = new Set(tokens);
-  return unique.size / tokens.length;
+  const recent = relevant.slice(-sampleSize);
+  if (recent.length < 2) {
+    return 0;
+  }
+  const vectors = recent.map((entry) => buildEntropyVector(entry.content));
+  let total = 0;
+  let comparisons = 0;
+  for (let index = 1; index < vectors.length; index += 1) {
+    const similarity = cosineSimilarity(vectors[index - 1], vectors[index]);
+    if (Number.isFinite(similarity)) {
+      total += similarity;
+      comparisons += 1;
+    }
+  }
+  if (comparisons === 0) {
+    return 0;
+  }
+  return total / comparisons;
 }
 
 function describeEntropy(score) {
   if (!Number.isFinite(score) || score <= 0) {
     return { state: 'calibrating', label: 'Calibrating…' };
   }
-  if (score < 0.3) {
+  if (score >= ENTROPY_LOOP_THRESHOLD) {
     return { state: 'loop', label: 'Looping' };
   }
-  if (score < 0.55) {
-    return { state: 'steady', label: 'Steady' };
+  if (score <= ENTROPY_EXPLORE_THRESHOLD) {
+    return { state: 'explore', label: 'Exploring' };
   }
-  return { state: 'explore', label: 'Exploring' };
+  return { state: 'steady', label: 'Steady' };
 }
 
 function updateEntropyMeter() {
@@ -5101,6 +8388,12 @@ function updateEntropyMeter() {
     meter.setAttribute('aria-valuenow', String(percent));
   }
   elements.entropyStatus.textContent = description.label;
+  if (description.state !== lastEntropyState) {
+    if (description.state === 'loop') {
+      void maybeAdvancePhase();
+    }
+    lastEntropyState = description.state;
+  }
 }
 
 function updateReflexStatus(message, state) {
@@ -5152,7 +8445,8 @@ async function runReflexSummary(speaker, options = {}) {
     const agentName = getAgentDisplayName(agent);
     const partnerName = getAgentDisplayName(partner);
     const persona = getAgentPersona(agent);
-    const lookback = Math.max(config.entropyWindow ?? 6, config.reflexInterval ?? 4, 6);
+    const volleyWindow = config.entropyWindow ?? defaultConfig.entropyWindow;
+    const lookback = Math.max(volleyWindow * 2, config.reflexInterval ?? 4, 6);
     const recent = dualChatHistory.slice(-lookback);
     const transcript = recent
       .map((item) => {
@@ -5179,15 +8473,33 @@ async function runReflexSummary(speaker, options = {}) {
       updateReflexStatus('Reflex ready (no summary returned)', 'ready');
       return;
     }
-    const decorated = `Reflex summary\n${summary.trim()}`;
+    const trimmedSummary = summary.trim();
+    const topicFingerprints = extractTopicFingerprints(trimmedSummary);
+    const fingerprintLine = topicFingerprints.length
+      ? `\n\nTopic fingerprints: ${topicFingerprints.join(', ')}`
+      : '';
+    const decorated = `Reflex summary\n${trimmedSummary}${fingerprintLine}`;
     recordDualMessage(agent, decorated, {
       marker: 'reflex',
       label: 'Reflex',
-      countsAsTurn: false
+      countsAsTurn: false,
+      metadata: { topicFingerprints }
     });
-    lastReflexSummaryAt = Date.now();
+    const reflexTimestamp = Date.now();
+    lastReflexSummaryAt = reflexTimestamp;
     reflexSummaryCount += 1;
+    void recordReflexHistory({
+      timestamp: reflexTimestamp,
+      speaker: agent,
+      summary: trimmedSummary,
+      keywords: topicFingerprints,
+      entropy: currentEntropyScore,
+      arenaTurn: dualTurnCounter,
+      phaseId: activePhaseId ?? null,
+      source: forced ? 'manual' : 'scheduled'
+    });
     void recordLog('arena', `${agentName} posted Reflex summary #${reflexSummaryCount}`, { silent: true });
+    archiveOldArenaTurns(WATCHDOG_ARCHIVE_PERCENT, { reason: 'reflex', silent: false }); // CODEx: Keep floating memory below pressure threshold.
     updateReflexStatus();
   } catch (error) {
     console.error('Reflex summary failed', error);
@@ -5200,13 +8512,319 @@ async function runReflexSummary(speaker, options = {}) {
   }
 }
 
+// CODEx: Persist Reflex metrics for later diagnostics.
+async function recordReflexHistory(entry) {
+  const payload = {
+    timestamp: entry.timestamp ?? Date.now(),
+    speaker: entry.speaker ?? 'system',
+    summary: entry.summary ?? '',
+    keywords: Array.isArray(entry.keywords) ? entry.keywords : [],
+    entropy: Number.isFinite(entry.entropy) ? entry.entropy : currentEntropyScore,
+    arenaTurn: entry.arenaTurn ?? dualTurnCounter,
+    phaseId: entry.phaseId ?? activePhaseId ?? null,
+    source: entry.source ?? 'auto'
+  };
+  try {
+    await putReflexHistory(payload);
+  } catch (error) {
+    console.debug('Unable to store Reflex history record', error);
+  }
+}
+
+function findLastTurnBySpeaker(agent) {
+  for (let index = dualChatHistory.length - 1; index >= 0; index -= 1) {
+    const entry = dualChatHistory[index];
+    if (!entry) continue;
+    if (entry.speaker === agent && entry.countsAsTurn !== false) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function extractReflexSegments(content) {
+  const segments = { outcome: null, test: null };
+  if (typeof content !== 'string') {
+    return segments;
+  }
+  const pattern = /\[(Predicted Outcome|Test)[^\]]*?(?:→|->|=>|:)\s*([^\]\n\r]+)/gi;
+  let match;
+  while ((match = pattern.exec(content)) !== null) {
+    const label = match[1]?.toLowerCase();
+    const value = match[2]?.trim();
+    if (!value) continue;
+    if (label && label.includes('predicted') && !segments.outcome) {
+      segments.outcome = value;
+    } else if (label === 'test' && !segments.test) {
+      segments.test = value;
+    }
+  }
+  return segments;
+}
+
+function ensureSentence(text) {
+  if (!text) return '';
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+function composeReflexSynthesisParagraph(segmentsA, segmentsB) {
+  const aName = getAgentDisplayName('A');
+  const bName = getAgentDisplayName('B');
+  const sentences = [];
+  if (segmentsA.outcome) {
+    sentences.push(ensureSentence(`${aName} anticipates ${segmentsA.outcome}`));
+  }
+  if (segmentsB.outcome) {
+    sentences.push(ensureSentence(`${bName} expects ${segmentsB.outcome}`));
+  }
+  const testClauses = [];
+  if (segmentsA.test) {
+    testClauses.push(`${aName} proposes ${segmentsA.test}`);
+  }
+  if (segmentsB.test) {
+    testClauses.push(`${bName} suggests ${segmentsB.test}`);
+  }
+  if (testClauses.length) {
+    sentences.push(ensureSentence(testClauses.join('; ')));
+  }
+  return sentences.join(' ');
+}
+
+function maybeTriggerReflexHooks() {
+  if (!config.reflexEnabled) return;
+  if (dualChatHistory.length < 2) return;
+  const lastA = findLastTurnBySpeaker('A');
+  const lastB = findLastTurnBySpeaker('B');
+  if (!lastA || !lastB) return;
+  const segmentsA = extractReflexSegments(lastA.content);
+  const segmentsB = extractReflexSegments(lastB.content);
+  if (!segmentsA.outcome || !segmentsA.test || !segmentsB.outcome || !segmentsB.test) {
+    return;
+  }
+  const signature = `${normalizeTimestamp(lastA.timestamp)}|${normalizeTimestamp(lastB.timestamp)}`;
+  if (lastReflexSynthesisSignature === signature) {
+    return;
+  }
+  const summaryParagraph = composeReflexSynthesisParagraph(segmentsA, segmentsB);
+  if (!summaryParagraph) {
+    return;
+  }
+  const topicFingerprints = extractTopicFingerprints(summaryParagraph);
+  const fingerprintLine = topicFingerprints.length
+    ? `\n\nTopic fingerprints: ${topicFingerprints.join(', ')}`
+    : '';
+  const content = `Reflex summary\n${summaryParagraph}${fingerprintLine}`;
+  recordDualMessage('system', content, {
+    marker: 'reflex',
+    label: 'Reflex',
+    countsAsTurn: false,
+    metadata: { topicFingerprints }
+  });
+  const reflexTimestamp = Date.now();
+  lastReflexSummaryAt = reflexTimestamp;
+  reflexSummaryCount += 1;
+  lastReflexSynthesisSignature = signature;
+  updateReflexStatus();
+  void recordReflexHistory({
+    timestamp: reflexTimestamp,
+    speaker: 'system',
+    summary: summaryParagraph,
+    keywords: topicFingerprints,
+    entropy: currentEntropyScore,
+    arenaTurn: dualTurnCounter,
+    phaseId: activePhaseId ?? null,
+    source: 'auto-hook'
+  });
+  void recordLog('arena', 'Reflex auto-synthesis posted.', { silent: true });
+}
+
+async function readPhasePromptFile(fileName) {
+  if (!fileName) return null;
+  if (phasePromptCache.has(fileName)) {
+    return phasePromptCache.get(fileName);
+  }
+  const relativePath = `${PHASE_PROMPT_DIR}${fileName}`;
+  const fsResult = readStandaloneFile(relativePath);
+  if (fsResult?.content) {
+    phasePromptCache.set(fileName, fsResult.content);
+    return fsResult.content;
+  }
+  try {
+    const response = await fetch(relativePath, { cache: 'no-store' });
+    if (response.ok) {
+      const text = await response.text();
+      phasePromptCache.set(fileName, text);
+      return text;
+    }
+  } catch (error) {
+    console.warn('Failed to fetch phase prompt', relativePath, error);
+  }
+  return null;
+}
+
+async function ensurePhasePromptBaseline() { // CODEx: Guarantee the primary phase prompt exists for arena rotation.
+  const baselinePath = `${PHASE_PROMPT_DIR}phase1.txt`; // CODEx: Target baseline prompt path.
+  const directory = PHASE_PROMPT_DIR.replace(/\/$/, ''); // CODEx: Normalize directory path without trailing slash.
+  const existing = readStandaloneFile(baselinePath); // CODEx: Attempt to read from standalone bridge first.
+  if (existing?.content) {
+    return true; // CODEx: Baseline already provisioned.
+  }
+  let seeded = false; // CODEx: Track whether a file was created during this check.
+  if (ensureStandaloneDirectory(directory)) { // CODEx: Ensure directory exists when bridge available.
+    const defaultContent = [
+      '# Flow Dynamics Primer', // CODEx: Provide concise placeholder guidance for phase one.
+      'Use this phase to establish shared definitions, goals, and system constraints before diving deeper.', // CODEx: Explain the intent of the initial debate phase.
+      'Highlight any conflicting assumptions so later phases can resolve them efficiently.' // CODEx: Encourage surfacing disagreements early.
+    ].join('\n');
+    seeded = writeStandaloneFile(baselinePath, defaultContent, { contentType: 'text/plain' }) !== false; // CODEx: Seed file via bridge when possible.
+    if (seeded) {
+      console.log(`[RAG] Seeded baseline phase prompt at ${baselinePath}`); // CODEx: Log successful creation for diagnostics.
+      phasePromptCache.set('phase1.txt', defaultContent); // CODEx: Prime cache with seeded content.
+      return true; // CODEx: Early exit after successful creation.
+    }
+  }
+  try {
+    const response = await fetch(baselinePath, { cache: 'no-store' }); // CODEx: Probe bundled asset when filesystem write unavailable.
+    if (response.ok) {
+      return true; // CODEx: Asset already present on the server.
+    }
+  } catch (error) {
+    console.debug('[RAG] Phase prompt fetch fallback failed', error); // CODEx: Emit debug trace without interrupting startup.
+  }
+  if (!seeded) {
+    console.warn(`[RAG] Baseline phase prompt missing at ${baselinePath}.`); // CODEx: Surface absence so operators can provision it.
+  }
+  return false; // CODEx: Signal that prompt could not be confirmed.
+}
+
+async function activatePhase(index, options = {}) {
+  if (!Array.isArray(phases) || phases.length === 0) return;
+  if (index < 0 || index >= phases.length) return;
+  const phase = phases[index];
+  const alreadyActive = activePhaseId === phase.id && activePhaseIndex === index;
+  if (alreadyActive && !options.force) {
+    return;
+  }
+  let content = null;
+  if (phase.prompt) {
+    content = await readPhasePromptFile(phase.prompt);
+  }
+  activePhaseIndex = index;
+  activePhaseId = phase.id;
+  pendingPhaseAdvance = false;
+  lastEntropyState = 'calibrating';
+  lastReflexSynthesisSignature = null;
+  if (!content) {
+    const message = `Phase ${phase.id} (${phase.title}) prompt not found at ${PHASE_PROMPT_DIR}${phase.prompt || ''}.`;
+    addSystemMessage(message);
+    void recordLog('error', message, { level: 'warn' });
+    return;
+  }
+  const trimmed = content.trim();
+  const header = `Phase ${phase.id}: ${phase.title}`;
+  const body = trimmed ? `${header}\n${trimmed}` : header;
+  recordDualMessage('system', body, {
+    marker: 'phase',
+    label: `Phase ${phase.id}`,
+    countsAsTurn: false
+  });
+  if (options.announce) {
+    addSystemMessage(`Loaded ${header} from ${PHASE_PROMPT_DIR}.`);
+  }
+  void recordLog('arena', `Activated phase ${phase.id} – ${phase.title}`, { silent: true });
+}
+
+async function maybeAdvancePhase() {
+  if (!isDualChatRunning) return;
+  if (pendingPhaseAdvance) return;
+  if (!Array.isArray(phases) || phases.length === 0) return;
+  if (activePhaseIndex >= phases.length - 1) return;
+  pendingPhaseAdvance = true;
+  try {
+    await activatePhase(activePhaseIndex + 1, { auto: true });
+  } finally {
+    pendingPhaseAdvance = false;
+  }
+}
+
+function createDualStreamHandle(speaker, speakerName) {
+  if (!elements.dualMessageTemplate || !elements.dualChatWindow) {
+    return null; // CODEx: Skip placeholder when template is unavailable.
+  }
+  const node = elements.dualMessageTemplate.content.firstElementChild.cloneNode(true); // CODEx: Clone dual message template.
+  node.classList.add('dual-message--streaming'); // CODEx: Flag streaming placeholder.
+  node.dataset.streaming = 'true'; // CODEx: Surface state for styling/debugging.
+  const timestamp = Date.now(); // CODEx: Track placeholder creation time.
+  const speakerEl = node.querySelector('.dual-speaker');
+  if (speakerEl) {
+    speakerEl.textContent = speakerName; // CODEx: Render speaker name immediately.
+  }
+  const turnEl = node.querySelector('.dual-turn');
+  if (turnEl) {
+    turnEl.textContent = '';
+    turnEl.hidden = true; // CODEx: Hide turn index until final commit.
+  }
+  const badgeEl = node.querySelector('.dual-badge');
+  if (badgeEl) {
+    badgeEl.textContent = 'streaming…'; // CODEx: Indicate active stream state.
+    badgeEl.hidden = false;
+  }
+  const timeEl = node.querySelector('.dual-time');
+  if (timeEl) {
+    timeEl.textContent = formatTimestamp(timestamp); // CODEx: Timestamp placeholder for continuity.
+  }
+  const contentEl = node.querySelector('.dual-content');
+  if (contentEl) {
+    contentEl.textContent = '…'; // CODEx: Seed placeholder text.
+  }
+  elements.dualChatWindow.appendChild(node); // CODEx: Attach streaming placeholder to arena view.
+  scrollContainerToBottom(elements.dualChatWindow); // CODEx: Ensure placeholder is visible.
+  return { node, contentEl, badgeEl, timestamp, speaker }; // CODEx: Return handle for incremental updates.
+}
+
+function updateDualStreamHandle(handle, text) {
+  if (!handle || !handle.node) {
+    return; // CODEx: Guard against absent handles.
+  }
+  const payload = text && text.trim() ? text : '…';
+  if (handle.contentEl) {
+    handle.contentEl.textContent = payload; // CODEx: Update placeholder content text.
+  }
+  if (handle.badgeEl) {
+    handle.badgeEl.textContent = payload === '…' ? 'streaming…' : 'live'; // CODEx: Reflect stream progress.
+    handle.badgeEl.hidden = false;
+  }
+}
+
+function finalizeDualStreamHandle(handle) {
+  if (!handle || !handle.node) {
+    return; // CODEx: Nothing to finalize.
+  }
+  handle.node.classList.remove('dual-message--streaming'); // CODEx: Remove streaming styling.
+  handle.node.dataset.streaming = 'false'; // CODEx: Reset state flag.
+  if (handle.badgeEl) {
+    handle.badgeEl.hidden = true; // CODEx: Hide streaming badge once finalized.
+  }
+}
+
 async function generateDualTurn(speaker, seed, options = {}) {
   if (!isDualChatRunning) return;
   const partner = speaker === 'A' ? 'B' : 'A';
   const speakerName = getAgentDisplayName(speaker);
   const partnerName = getAgentDisplayName(partner);
+  const normalizedSeed = typeof seed === 'string' && seed.trim() ? seed : activeDualSeed || config.dualSeed || DEFAULT_DUAL_SEED;
   const persona = getAgentPersona(speaker);
   const connection = activeDualConnections[speaker] ?? getAgentConnection(speaker);
+  const reasoningActive = isReasoningModeActive({
+    model: connection.model,
+    providerPreset: connection.providerPreset
+  }); // CODEx: Detect reasoning mode per agent connection.
+  clearDualCountdownTimer();
+  if (elements.dualStatus) {
+    elements.dualStatus.textContent = `${speakerName} is thinking…`;
+  }
   if (!connection.endpoint || !connection.model) {
     addSystemMessage(`${speakerName} lost its connection details. Stop and reconfigure before resuming the arena.`);
     stopDualChat();
@@ -5214,9 +8832,12 @@ async function generateDualTurn(speaker, seed, options = {}) {
   }
 
   const processKey = speaker === 'A' ? 'modelA' : 'modelB';
+  const autoInjecting = Boolean(config.autoInjectMemories);
   updateProcessState(processKey, {
     status: 'Retrieving',
-    detail: `${speakerName} is gathering arena memories.`
+    detail: autoInjecting
+      ? `${speakerName} is gathering arena memories.`
+      : `${speakerName} is skipping auto retrieval.`
   });
 
   const historyMessages = [];
@@ -5225,7 +8846,15 @@ async function generateDualTurn(speaker, seed, options = {}) {
     content: persona || `You are ${speakerName}, an autonomous AI who is collaborating with ${partnerName}. Reply as ${speakerName}.`
   });
 
-  for (const turn of dualChatHistory) {
+  const historyLookback = reasoningActive ? Math.min(dualChatHistory.length, 6) : dualChatHistory.length; // CODEx: Restrict history depth for reasoning safety.
+  const historySource = dualChatHistory.slice(-historyLookback); // CODEx: Extract relevant history window.
+
+  for (const turn of historySource) {
+    if (!turn) continue;
+    if (turn.speaker === 'system' || turn.marker === 'reflex' || turn.marker === 'phase') {
+      historyMessages.push({ role: 'system', content: turn.content });
+      continue;
+    }
     const label = turn.speaker === speaker ? speakerName : partnerName;
     const role = turn.speaker === speaker ? 'assistant' : 'user';
     historyMessages.push({ role, content: `${label}: ${turn.content}` });
@@ -5235,30 +8864,47 @@ async function generateDualTurn(speaker, seed, options = {}) {
   if (options.isInitial) {
     historyMessages.push({
       role: 'user',
-      content: `${partnerName}: ${seed}`
+      content: `${partnerName}: ${normalizedSeed}`
     });
-  } else if (latestPartnerTurn) {
-    historyMessages.push({
-      role: 'user',
-      content: `${partnerName}: ${latestPartnerTurn.content}`
-    });
+  } else {
+    const lastMessage = historyMessages[historyMessages.length - 1];
+    if (!lastMessage || lastMessage.role !== 'user') {
+      const fallbackContent = latestPartnerTurn
+        ? `${partnerName}: ${latestPartnerTurn.content}`
+        : `${partnerName}: ${normalizedSeed}`;
+      historyMessages.push({ role: 'user', content: fallbackContent });
+    }
   }
 
   const retrievalQuery = options.isInitial ? seed : latestPartnerTurn?.content ?? seed;
   let retrievedMemories = [];
-  if (retrievalQuery) {
-    retrievedMemories = await retrieveRelevantMemories(retrievalQuery, config.retrievalCount);
+  if (autoInjecting && retrievalQuery) {
+    const retrievalCap = reasoningActive
+      ? Math.max(0, Math.min(2, config.retrievalCount || 2))
+      : config.retrievalCount; // CODEx: Lighten RAG load under reasoning pressure.
+    if (retrievalCap !== 0) {
+      retrievedMemories = await retrieveRelevantMemories(retrievalQuery, retrievalCap);
+    }
+    if (reasoningActive && retrievedMemories.length > 2) {
+      retrievedMemories = retrievedMemories.slice(0, 2); // CODEx: Cap inserted cues when reasoning.
+    }
     if (retrievedMemories.length) {
       const compiled = retrievedMemories
-        .map((item) => `${formatTimestamp(item.timestamp)} • ${item.role}: ${item.content}`)
-        .join('\n');
+        .map((item) => `• ${formatTimestamp(item.timestamp)} ${formatMemoryPreview(item.content, reasoningActive ? 140 : 220)}`)
+        .join('\n'); // CODEx: Compress cue payload for reasoning focus.
       historyMessages.push({
         role: 'system',
-        content: `Shared long-term memories:\n${compiled}`
+        content: reasoningActive
+          ? `Brief memory cues:\n${compiled}`
+          : `Shared long-term memories:\n${compiled}` // CODEx: Swap to light cue format when reasoning.
       });
     }
   }
-  registerRetrieval(speaker, retrievedMemories.length);
+  if (autoInjecting) {
+    registerRetrieval(speaker, retrievedMemories.length);
+  }
+
+  const streamHandle = createDualStreamHandle(speaker, speakerName); // CODEx: Prime arena UI for streaming output.
 
   try {
     updateProcessState(processKey, {
@@ -5270,7 +8916,15 @@ async function generateDualTurn(speaker, seed, options = {}) {
     } else {
       modelBInFlight = true;
     }
-    const { content: reply, truncated, reasoning } = await callModel(historyMessages, connection);
+    const { content: reply, truncated, reasoning } = await callModel(historyMessages, {
+      ...connection,
+      onStream: (payload) => {
+        if (!streamHandle) return; // CODEx: Skip when placeholder unavailable.
+        if (payload?.type === 'content') {
+          updateDualStreamHandle(streamHandle, payload.text ?? ''); // CODEx: Render incremental text.
+        }
+      }
+    });
     if (!reply) {
       addSystemMessage(`${speakerName} did not respond.`);
       stopDualChat();
@@ -5281,6 +8935,7 @@ async function generateDualTurn(speaker, seed, options = {}) {
         `${speakerName} reply trimmed to stay within the ~${config.maxResponseTokens} token response guard.`
       );
     }
+    finalizeDualStreamHandle(streamHandle); // CODEx: Remove streaming badge before committing history.
     const badgeParts = [];
     if (retrievedMemories.length) {
       badgeParts.push(`${retrievedMemories.length} memories`);
@@ -5293,7 +8948,10 @@ async function generateDualTurn(speaker, seed, options = {}) {
     }
     recordDualMessage(speaker, reply, {
       marker: truncated ? 'truncated' : undefined,
-      label: badgeParts.length ? badgeParts.join(' • ') : undefined
+      label: badgeParts.length ? badgeParts.join(' • ') : undefined,
+      existingNode: streamHandle?.node,
+      contentNode: streamHandle?.contentEl,
+      timestamp: streamHandle?.timestamp
     });
     updateProcessState(processKey, {
       status: 'Reply delivered',
@@ -5304,6 +8962,9 @@ async function generateDualTurn(speaker, seed, options = {}) {
     void maybeTriggerReflexSummary(speaker);
     updateEntropyMeter();
   } catch (error) {
+    if (streamHandle?.node?.isConnected) {
+      streamHandle.node.remove(); // CODEx: Clear placeholder on failure.
+    }
     const errorMessage = error.message || 'Unknown error occurred';
     addSystemMessage(`Dual chat error: ${errorMessage}`);
     updateProcessState(processKey, { status: 'Error', detail: errorMessage });
@@ -5330,20 +8991,32 @@ async function generateDualTurn(speaker, seed, options = {}) {
 }
 
 function recordDualMessage(speaker, content, options = {}) {
-  const { saveHistory = true, label, marker, turnNumber: providedTurn, countsAsTurn = true } = options;
-  const timestamp = Date.now();
+  const {
+    saveHistory = true,
+    label,
+    marker,
+    turnNumber: providedTurn,
+    existingNode,
+    contentNode,
+    timestamp: providedTimestamp
+  } = options; // CODEx: Support streaming placeholders when recording turns.
+  const metadata = sanitizeMetadata(options.metadata);
+  const countsOption = options.countsAsTurn;
+  const timestamp = Number.isFinite(providedTimestamp) ? providedTimestamp : Date.now(); // CODEx: Preserve streaming timestamps.
   let turnNumber = typeof providedTurn === 'number' ? providedTurn : null;
+  const normalizedSpeaker = speaker === 'B' ? 'B' : speaker === 'system' ? 'system' : 'A';
+  const countsAsTurn = typeof countsOption === 'boolean' ? countsOption : normalizedSpeaker !== 'system';
 
-  const speakerName = getAgentDisplayName(speaker);
+  const speakerName = getAgentDisplayName(normalizedSpeaker);
 
   if (saveHistory) {
     if (countsAsTurn) {
-      if (speaker === 'A') {
+      if (normalizedSpeaker === 'A') {
         dualTurnCounter += 1;
         if (turnNumber === null) {
           turnNumber = dualTurnCounter;
         }
-      } else {
+      } else if (normalizedSpeaker === 'B') {
         if (dualTurnCounter === 0) {
           dualTurnCounter = 1;
         }
@@ -5354,18 +9027,30 @@ function recordDualMessage(speaker, content, options = {}) {
     } else if (turnNumber === null && dualChatHistory.length) {
       turnNumber = dualChatHistory[dualChatHistory.length - 1].turnNumber ?? dualTurnCounter;
     }
-    dualChatHistory.push({ speaker, content, timestamp, turnNumber });
+    dualChatHistory.push({
+      speaker: normalizedSpeaker,
+      content,
+      timestamp,
+      turnNumber,
+      marker,
+      countsAsTurn,
+      metadata
+    });
 
     const memoryEntry = {
-      id: `arena-${timestamp}-${speaker}-${dualChatHistory.length}`,
+      id: `arena-${timestamp}-${normalizedSpeaker}-${dualChatHistory.length}`,
       role: speakerName,
-      speaker,
+      speaker: normalizedSpeaker,
       speakerName,
       content,
       timestamp,
       origin: 'arena',
       turnNumber,
-      mode: MODE_ARENA
+      mode: MODE_ARENA,
+      marker,
+      countsAsTurn,
+      phaseId: activePhaseId ?? null,
+      metadata
     };
     floatingMemory.push(memoryEntry);
     trimFloatingMemory();
@@ -5373,7 +9058,15 @@ function recordDualMessage(speaker, content, options = {}) {
     void persistMessage(memoryEntry);
   }
 
-  const node = elements.dualMessageTemplate.content.firstElementChild.cloneNode(true);
+  const templateNode = elements.dualMessageTemplate?.content?.firstElementChild;
+  const node = existingNode ?? (templateNode ? templateNode.cloneNode(true) : null);
+  if (!node) {
+    return; // CODEx: Bail when template is missing and no placeholder provided.
+  }
+  if (existingNode) {
+    node.classList.remove('dual-message--streaming'); // CODEx: Ensure finalized styling.
+    node.dataset.streaming = 'false';
+  }
   const turnNode = node.querySelector('.dual-turn');
   if (turnNode) {
     if (turnNumber) {
@@ -5395,14 +9088,25 @@ function recordDualMessage(speaker, content, options = {}) {
     }
   }
   node.querySelector('.dual-speaker').textContent = speakerName;
-  node.querySelector('.dual-time').textContent = formatTimestamp(timestamp);
-  node.querySelector('.dual-content').textContent = content;
+  const timeNode = node.querySelector('.dual-time');
+  if (timeNode) {
+    timeNode.textContent = formatTimestamp(timestamp); // CODEx: Use supplied timestamp for continuity.
+  }
+  const contentTarget = contentNode ?? node.querySelector('.dual-content');
+  if (contentTarget) {
+    contentTarget.textContent = content; // CODEx: Finalize streamed content.
+  }
   if (marker) {
     node.classList.add(`dual-message--${marker}`);
   }
-  elements.dualChatWindow.appendChild(node);
-  scrollContainerToBottom(elements.dualChatWindow);
+  if (!existingNode) {
+    elements.dualChatWindow.appendChild(node); // CODEx: Append fresh entry when no placeholder exists.
+    scrollContainerToBottom(elements.dualChatWindow);
+  }
   void persistDualRagSnapshot();
+  if (countsAsTurn && (normalizedSpeaker === 'A' || normalizedSpeaker === 'B')) {
+    maybeTriggerReflexHooks();
+  }
   updateEntropyMeter();
 }
 
