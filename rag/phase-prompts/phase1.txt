@@ -1,0 +1,3 @@
+# Flow Dynamics Primer
+Use this phase to establish shared definitions, goals, and system constraints before diving deeper.
+Highlight any conflicting assumptions so later phases can resolve them efficiently.
