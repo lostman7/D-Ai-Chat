@@ -97,6 +97,19 @@ const RAM_DISK_CHUNK_PREFIX = 'sam-chunked-';
 const RAM_DISK_UNCHUNKED_PREFIX = 'sam-unchunked-';
 const RAM_DISK_ARCHIVE_PREFIX = 'sam-archive-';
 const RAM_DISK_MANIFEST_PREFIX = 'sam-manifest-';
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+const REASONING_REQUEST_TIMEOUT_MS = 120000;
+const REASONING_MODEL_HINTS = [
+  'reason',
+  'cogito',
+  'sonar',
+  'think',
+  'deepseek-r1',
+  'deepseek_reasoner',
+  'reasoner',
+  'o1',
+  'o3'
+];
 
 const providerPresets = [
   {
@@ -5391,6 +5404,31 @@ function normalizeModelMessage(message) {
   };
 }
 
+function resolveRequestTimeout(modelId, preset, overrideTimeout) {
+  if (Number.isFinite(overrideTimeout) && overrideTimeout > 0) {
+    return overrideTimeout;
+  }
+
+  if (preset?.reasoningTimeoutMs && Number.isFinite(preset.reasoningTimeoutMs) && preset.reasoningTimeoutMs > 0) {
+    return preset.reasoningTimeoutMs;
+  }
+
+  const normalizedModel = typeof modelId === 'string' ? modelId.toLowerCase() : '';
+  if (!normalizedModel) {
+    return DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+
+  if (preset?.anthropicFormat) {
+    return REASONING_REQUEST_TIMEOUT_MS;
+  }
+
+  if (REASONING_MODEL_HINTS.some((hint) => normalizedModel.includes(hint))) {
+    return REASONING_REQUEST_TIMEOUT_MS;
+  }
+
+  return DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
 async function callModel(messages, overrides = {}) {
   const endpoint = overrides.endpoint ?? config.endpoint;
   const model = overrides.model ?? config.model;
@@ -5404,6 +5442,7 @@ async function callModel(messages, overrides = {}) {
   }
 
   const preset = providerPresetMap.get(providerPreset);
+  const timeoutMs = resolveRequestTimeout(model, preset, overrides.timeoutMs);
   const isAnthropic = preset?.anthropicFormat;
   const isGoogle = preset?.googleFormat;
 
@@ -5456,7 +5495,7 @@ async function callModel(messages, overrides = {}) {
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   let response;
 
@@ -5471,7 +5510,8 @@ async function callModel(messages, overrides = {}) {
   } catch (error) {
     clearTimeout(timeoutId);
     if (error.name === 'AbortError') {
-      throw new Error('Request timed out after 30 seconds.');
+      const seconds = Math.round(timeoutMs / 100) / 10;
+      throw new Error(`Request timed out after ${seconds}s.`);
     }
     throw error;
   }
