@@ -4,6 +4,111 @@ const fs = require('fs');
 
 const STORAGE_DIR_NAME = 'sam-storage';
 const ramStore = new Map();
+const APP_BASE_PATH = path.resolve(__dirname);
+const BINARY_EXTENSIONS = new Set(['.pdf']);
+
+function normalizeRelativePath(input) {
+  if (!input) return '';
+  const normalized = String(input).replace(/\\/g, '/');
+  return normalized.replace(/^\/+/, '');
+}
+
+function resolveAppPath(relativePath) {
+  const normalized = normalizeRelativePath(relativePath);
+  const target = path.resolve(APP_BASE_PATH, normalized || '.');
+  if (!target.startsWith(APP_BASE_PATH)) {
+    throw new Error(`Refusing to access path outside app directory: ${relativePath}`);
+  }
+  return target;
+}
+
+function inferContentTypeFromPath(relativePath) {
+  const extension = path.extname(relativePath || '').replace('.', '').toLowerCase();
+  if (extension === 'json' || extension === 'jsonl') {
+    return 'application/json';
+  }
+  if (extension === 'pdf') {
+    return 'application/pdf';
+  }
+  if (extension === 'md' || extension === 'markdown' || extension === 'txt' || extension === 'text') {
+    return 'text/plain';
+  }
+  return 'text/plain';
+}
+
+function ensureAppDirectory(relativeDir) {
+  const normalized = normalizeRelativePath(relativeDir);
+  const target = resolveAppPath(normalized || '.');
+  if (!fs.existsSync(target)) {
+    fs.mkdirSync(target, { recursive: true });
+  }
+  return true;
+}
+
+function listAppDirectory(relativeDir) {
+  const normalized = normalizeRelativePath(relativeDir);
+  ensureAppDirectory(normalized);
+  const target = resolveAppPath(normalized || '.');
+  const entries = fs.readdirSync(target, { withFileTypes: true });
+  const prefix = normalized ? normalized.replace(/\/+$/, '') : '';
+  const results = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const entryPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    results.push(entryPath);
+  }
+  return results;
+}
+
+function readAppFile(relativePath) {
+  const normalized = normalizeRelativePath(relativePath);
+  if (!normalized) return null;
+  const target = resolveAppPath(normalized);
+  if (!fs.existsSync(target)) {
+    return null;
+  }
+  const stats = fs.lstatSync(target);
+  if (stats.isDirectory()) {
+    return null;
+  }
+  const extension = path.extname(normalized).toLowerCase();
+  if (BINARY_EXTENSIONS.has(extension)) {
+    return null;
+  }
+  const content = fs.readFileSync(target, 'utf8');
+  return { content, contentType: inferContentTypeFromPath(normalized) };
+}
+
+function writeAppFile(relativePath, content) {
+  const normalized = normalizeRelativePath(relativePath);
+  if (!normalized) return false;
+  const extension = path.extname(normalized).toLowerCase();
+  if (BINARY_EXTENSIONS.has(extension)) {
+    return false;
+  }
+  const dirName = path.posix.dirname(normalized);
+  if (dirName && dirName !== '.') {
+    ensureAppDirectory(dirName);
+  }
+  const target = resolveAppPath(normalized);
+  fs.writeFileSync(target, String(content ?? ''), 'utf8');
+  return true;
+}
+
+function deleteAppFile(relativePath) {
+  const normalized = normalizeRelativePath(relativePath);
+  if (!normalized) return false;
+  const target = resolveAppPath(normalized);
+  if (!fs.existsSync(target)) {
+    return true;
+  }
+  const stats = fs.lstatSync(target);
+  if (!stats.isFile()) {
+    return false;
+  }
+  fs.unlinkSync(target);
+  return true;
+}
 
 function ensureStorageDir() {
   const dir = path.join(app.getPath('userData'), STORAGE_DIR_NAME);
@@ -175,6 +280,53 @@ function registerStorageHandlers() {
   });
 }
 
+function registerFilesystemHandlers() {
+  ipcMain.on('standalone-fs-list', (event, relativeDir) => {
+    try {
+      event.returnValue = listAppDirectory(relativeDir);
+    } catch (error) {
+      console.warn('Failed to list directory for renderer', relativeDir, error);
+      event.returnValue = [];
+    }
+  });
+
+  ipcMain.on('standalone-fs-read', (event, relativePath) => {
+    try {
+      event.returnValue = readAppFile(relativePath);
+    } catch (error) {
+      console.warn('Failed to read file for renderer', relativePath, error);
+      event.returnValue = null;
+    }
+  });
+
+  ipcMain.on('standalone-fs-write', (event, relativePath, content) => {
+    try {
+      event.returnValue = writeAppFile(relativePath, content);
+    } catch (error) {
+      console.warn('Failed to write file for renderer', relativePath, error);
+      event.returnValue = false;
+    }
+  });
+
+  ipcMain.on('standalone-fs-delete', (event, relativePath) => {
+    try {
+      event.returnValue = deleteAppFile(relativePath);
+    } catch (error) {
+      console.warn('Failed to delete file for renderer', relativePath, error);
+      event.returnValue = false;
+    }
+  });
+
+  ipcMain.on('standalone-fs-ensure', (event, relativeDir) => {
+    try {
+      event.returnValue = ensureAppDirectory(relativeDir);
+    } catch (error) {
+      console.warn('Failed to ensure directory for renderer', relativeDir, error);
+      event.returnValue = false;
+    }
+  });
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
@@ -198,6 +350,7 @@ app.whenReady().then(() => {
   ensureStorageDir();
   primeRamStore();
   registerStorageHandlers();
+  registerFilesystemHandlers();
   createWindow();
 
   app.on('activate', () => {

@@ -17,3 +17,21 @@ contextBridge.exposeInMainWorld('standaloneStore', {
     return ipcRenderer.sendSync('standalone-store-clear');
   }
 });
+
+contextBridge.exposeInMainWorld('standaloneFs', {
+  listDirectory(target) {
+    return ipcRenderer.sendSync('standalone-fs-list', target);
+  },
+  readFile(target) {
+    return ipcRenderer.sendSync('standalone-fs-read', target);
+  },
+  writeFile(target, content, options) {
+    return ipcRenderer.sendSync('standalone-fs-write', target, content, options);
+  },
+  deleteFile(target) {
+    return ipcRenderer.sendSync('standalone-fs-delete', target);
+  },
+  ensureDir(target) {
+    return ipcRenderer.sendSync('standalone-fs-ensure', target);
+  }
+});

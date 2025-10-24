@@ -184,6 +184,15 @@ function storageClear() {
   }
 }
 
+function getDirectoryPath(path) {
+  if (typeof path !== 'string') {
+    return '';
+  }
+  const sanitized = path.split(/[?#]/)[0];
+  const lastSlash = sanitized.lastIndexOf('/');
+  return lastSlash > 0 ? sanitized.slice(0, lastSlash) : '';
+}
+
 function getFileExtension(path) {
   if (typeof path !== 'string') {
     return '';
@@ -196,6 +205,91 @@ function getFileExtension(path) {
     return '';
   }
   return fileName.slice(dotIndex + 1).toLowerCase();
+}
+
+function inferContentTypeFromPath(path) {
+  const extension = getFileExtension(path);
+  if (SUPPORTED_RAG_JSON_FORMATS.has(extension)) {
+    return 'application/json';
+  }
+  if (SUPPORTED_RAG_BINARY_FORMATS.has(extension)) {
+    return 'application/pdf';
+  }
+  return 'text/plain';
+}
+
+function getStandaloneFs() {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  return window.standaloneFs ?? null;
+}
+
+function ensureStandaloneDirectory(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.ensureDir) return false;
+  try {
+    return bridge.ensureDir(path) !== false;
+  } catch (error) {
+    console.warn('Failed to ensure standalone directory', path, error);
+    return false;
+  }
+}
+
+function listStandaloneDirectory(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.listDirectory) return null;
+  try {
+    const entries = bridge.listDirectory(path);
+    return Array.isArray(entries) ? entries : null;
+  } catch (error) {
+    console.warn('Failed to list standalone directory', path, error);
+    return null;
+  }
+}
+
+function readStandaloneFile(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.readFile) return null;
+  try {
+    const result = bridge.readFile(path);
+    if (!result) return null;
+    if (typeof result === 'string') {
+      return { content: result, contentType: inferContentTypeFromPath(path) };
+    }
+    if (typeof result === 'object' && typeof result.content === 'string') {
+      return {
+        content: result.content,
+        contentType: result.contentType || inferContentTypeFromPath(path)
+      };
+    }
+  } catch (error) {
+    console.warn('Failed to read standalone file', path, error);
+  }
+  return null;
+}
+
+function writeStandaloneFile(path, content, options = {}) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.writeFile) return false;
+  try {
+    const payload = typeof content === 'string' ? content : String(content);
+    return bridge.writeFile(path, payload, options) !== false;
+  } catch (error) {
+    console.warn('Failed to write standalone file', path, error);
+    return false;
+  }
+}
+
+function deleteStandaloneFile(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.deleteFile) return false;
+  try {
+    return bridge.deleteFile(path) !== false;
+  } catch (error) {
+    console.warn('Failed to delete standalone file', path, error);
+    return false;
+  }
 }
 
 function isSupportedChunkExtension(extension) {
@@ -246,6 +340,7 @@ const defaultConfig = {
   endpoint: 'http://localhost:1234/v1/chat/completions',
   model: 'lmstudio-community/Meta-Llama-3-8B-Instruct',
   apiKey: '',
+  openRouterPolicy: '',
   systemPrompt: 'You are SAM, a helpful memory-augmented assistant who reflects on long-term memories when they are relevant.',
   temperature: 0.7,
   maxResponseTokens: 512,
@@ -266,7 +361,7 @@ const defaultConfig = {
   agentBApiKey: '',
   dualAutoContinue: true,
   dualTurnLimit: 0,
-  dualTurnDelaySeconds: 30,
+  dualTurnDelaySeconds: 15,
   dualSeed: DEFAULT_DUAL_SEED,
   reflexEnabled: true,
   reflexInterval: 8,
@@ -729,6 +824,8 @@ const elements = {
   providerNotes: document.getElementById('providerNotes'),
   modelInput: document.getElementById('modelInput'),
   apiKeyInput: document.getElementById('apiKeyInput'),
+  openRouterPolicyField: document.getElementById('openRouterPolicyField'),
+  openRouterPolicyInput: document.getElementById('openRouterPolicyInput'),
   systemPromptInput: document.getElementById('systemPromptInput'),
   temperatureInput: document.getElementById('temperatureInput'),
   maxTokensInput: document.getElementById('maxTokensInput'),
@@ -750,10 +847,8 @@ const elements = {
   triggerReflexButton: document.getElementById('triggerReflexButton'),
   reflexStatusText: document.getElementById('reflexStatusText'),
   agentAName: document.getElementById('agentAName'),
-  agentAPrompt: document.getElementById('agentAPrompt'),
   agentBName: document.getElementById('agentBName'),
   agentBPrompt: document.getElementById('agentBPrompt'),
-  arenaPrimaryConfig: document.getElementById('arenaPrimaryConfig'),
   requestTimeout: document.getElementById('requestTimeout'),
   reasoningTimeout: document.getElementById('reasoningTimeout'),
   agentBProviderSelect: document.getElementById('agentBProviderSelect'),
@@ -978,6 +1073,7 @@ function loadConfig() {
     );
     config.reasoningTimeoutSeconds = Math.max(config.reasoningTimeoutSeconds, config.requestTimeoutSeconds);
     config.autoInjectMemories = Boolean(config.autoInjectMemories);
+    config.openRouterPolicy = (config.openRouterPolicy ?? '').trim();
   } catch (error) {
     console.error('Failed to load config:', error);
   }
@@ -1171,7 +1267,25 @@ function updateProviderNotes() {
   if (preset.requiresKey) {
     parts.push('API key required. Paste it below before saving.');
   }
+  if (preset.id === 'openrouter') {
+    parts.push('Set the data policy below to match your OpenRouter privacy settings.');
+  }
   elements.providerNotes.textContent = parts.filter(Boolean).join(' ');
+}
+
+function applyOpenRouterPolicyVisibility() {
+  const field = elements.openRouterPolicyField;
+  const input = elements.openRouterPolicyInput;
+  if (!field) return;
+  const primaryPreset = config.providerPreset ?? 'custom';
+  const arenaPreset = config.agentBProviderPreset ?? 'inherit';
+  const effectiveArenaPreset = arenaPreset === 'inherit' ? primaryPreset : arenaPreset;
+  const isOpenRouter = primaryPreset === 'openrouter' || effectiveArenaPreset === 'openrouter';
+  field.hidden = !isOpenRouter;
+  field.setAttribute('aria-hidden', String(!isOpenRouter));
+  if (input) {
+    input.disabled = !isOpenRouter;
+  }
 }
 
 function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
@@ -1183,6 +1297,7 @@ function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
   if (!presetId || presetId === 'inherit') {
     config[`${prefix}ProviderPreset`] = 'inherit';
     updateAgentConnectionInputs(agent);
+    applyOpenRouterPolicyVisibility();
     saveConfig();
     updateModelConnectionStatus();
     if (!silent) {
@@ -1200,6 +1315,7 @@ function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
     config[`${prefix}Model`] = preset.model;
   }
   updateAgentConnectionInputs(agent);
+  applyOpenRouterPolicyVisibility();
   saveConfig();
   updateModelConnectionStatus();
   if (!silent && preset.id !== 'custom') {
@@ -1214,8 +1330,14 @@ function getAgentDisplayName(agent) {
 }
 
 function getAgentPersona(agent) {
-  const raw = agent === 'A' ? config.agentAPrompt : config.agentBPrompt;
-  return raw?.trim() ?? '';
+  if (agent === 'A') {
+    const primary = config.agentAPrompt?.trim();
+    if (primary) {
+      return primary;
+    }
+    return config.systemPrompt?.trim() ?? '';
+  }
+  return config.agentBPrompt?.trim() ?? '';
 }
 
 function saveConfig() {
@@ -1241,6 +1363,9 @@ function updateConfigInputs() {
   elements.endpointInput.value = config.endpoint;
   elements.modelInput.value = config.model;
   elements.apiKeyInput.value = config.apiKey;
+  if (elements.openRouterPolicyInput) {
+    elements.openRouterPolicyInput.value = config.openRouterPolicy ?? '';
+  }
   if (elements.requestTimeout) {
     elements.requestTimeout.value = config.requestTimeoutSeconds;
   }
@@ -1273,7 +1398,6 @@ function updateConfigInputs() {
   }
   applyAgentBEnabledState();
   elements.agentAName.value = config.agentAName;
-  elements.agentAPrompt.value = config.agentAPrompt;
   elements.agentBName.value = config.agentBName;
   elements.agentBPrompt.value = config.agentBPrompt;
   if (elements.ttsPresetSelect) {
@@ -1295,6 +1419,7 @@ function updateConfigInputs() {
     elements.debugToggle.checked = Boolean(config.debugEnabled);
   }
   updateProviderNotes();
+  applyOpenRouterPolicyVisibility();
   updateTtsPresetDetails();
   updateTtsVolumeLabel();
   if (elements.backgroundUrlInput) {
@@ -1373,16 +1498,11 @@ function applyAgentBEnabledState() {
   if (elements.agentBEnabled) {
     elements.agentBEnabled.checked = enabled;
   }
-  if (elements.arenaPrimaryConfig) {
-    elements.arenaPrimaryConfig.hidden = !enabled;
-    elements.arenaPrimaryConfig.setAttribute('aria-hidden', String(!enabled));
-  }
   if (elements.agentBConfig) {
     elements.agentBConfig.hidden = !enabled;
     elements.agentBConfig.setAttribute('aria-hidden', String(!enabled));
   }
   const toggledFields = [
-    'agentAPrompt',
     'agentBProviderSelect',
     'agentBEndpoint',
     'agentBModel',
@@ -1448,7 +1568,8 @@ function getAgentConnection(agent) {
       presetDescription: basePreset?.description ?? '',
       requiresKey: Boolean(basePreset?.requiresKey),
       inherits: false,
-      agentPresetId: basePreset?.id ?? 'custom'
+      agentPresetId: basePreset?.id ?? 'custom',
+      openRouterPolicy: config.openRouterPolicy
     };
   }
 
@@ -1473,7 +1594,8 @@ function getAgentConnection(agent) {
     presetDescription: preset?.description ?? '',
     requiresKey: Boolean(preset?.requiresKey),
     inherits,
-    agentPresetId
+    agentPresetId,
+    openRouterPolicy: config.openRouterPolicy
   };
 }
 
@@ -1737,6 +1859,13 @@ function bindEvents() {
     updateAgentConnectionInputs('B');
   });
 
+  if (elements.openRouterPolicyInput) {
+    addListener(elements.openRouterPolicyInput, 'input', (event) => {
+      config.openRouterPolicy = event.target.value.trim();
+      saveConfig();
+    });
+  }
+
   addListener(elements.requestTimeout, 'change', (event) => {
     config.requestTimeoutSeconds = clampNumber(event.target.value, 5, 600, config.requestTimeoutSeconds);
     elements.requestTimeout.value = config.requestTimeoutSeconds;
@@ -1988,11 +2117,6 @@ function bindEvents() {
 
   addListener(elements.agentAName, 'input', (event) => {
     config.agentAName = event.target.value.trim();
-    saveConfig();
-  });
-
-  addListener(elements.agentAPrompt, 'input', (event) => {
-    config.agentAPrompt = event.target.value;
     saveConfig();
   });
 
@@ -3863,6 +3987,17 @@ async function loadChunkedFileData(chunkedPath, originalPath) {
     return { data: cached, source: 'ram' };
   }
   for (const path of candidates) {
+    const fsResult = readStandaloneFile(path);
+    if (fsResult) {
+      try {
+        const payload = JSON.parse(fsResult.content);
+        const normalized = { ...payload, chunkedPath: path };
+        cacheChunkedInRam(candidates, normalized);
+        return { data: normalized, source: 'filesystem' };
+      } catch (error) {
+        console.debug(`Failed to parse chunked file ${path} from filesystem:`, error);
+      }
+    }
     try {
       const response = await fetch(path);
       if (response.ok) {
@@ -3881,6 +4016,26 @@ async function loadChunkedFileData(chunkedPath, originalPath) {
 async function loadRagFileContent(paths) {
   const candidates = dedupePaths(paths);
   for (const path of candidates) {
+    const fsResult = readStandaloneFile(path);
+    if (fsResult) {
+      const { content, contentType } = fsResult;
+      if (contentType === 'application/pdf') {
+        // Defer to fetch/pdf.js pipeline for binary sources.
+      } else if (contentType && contentType.includes('json')) {
+        try {
+          const parsed = JSON.parse(content);
+          const raw = typeof parsed === 'string' ? parsed : JSON.stringify(parsed);
+          cacheUnchunkedInRam(candidates, raw);
+          return { content: normalizeRagData(parsed), source: 'filesystem', contentType: 'application/json' };
+        } catch (error) {
+          cacheUnchunkedInRam(candidates, content);
+          return { content, source: 'filesystem', contentType: 'application/json' };
+        }
+      } else {
+        cacheUnchunkedInRam(candidates, content);
+        return { content, source: 'filesystem', contentType: contentType || 'text/plain' };
+      }
+    }
     try {
       const response = await fetch(path);
       if (response.ok) {
@@ -3909,6 +4064,23 @@ async function loadRagFileContent(paths) {
 async function detectUnchunkedFile(originalPath, manifestSize = 0) {
   const candidatePaths = dedupePaths([toUnchunkedPath(originalPath), originalPath]);
   for (const path of candidatePaths) {
+    const fsResult = readStandaloneFile(path);
+    if (fsResult) {
+      const { content, contentType } = fsResult;
+      if (!isSupportedChunkableFile(originalPath, contentType)) {
+        continue;
+      }
+      cacheUnchunkedInRam(candidatePaths, content);
+      const computedSize = manifestSize || content.length;
+      return {
+        path,
+        originalPath,
+        size: computedSize,
+        source: 'workspace',
+        ramContent: content,
+        contentType: contentType || inferContentTypeFromPath(originalPath)
+      };
+    }
     try {
       const response = await fetch(path);
       if (response.ok) {
@@ -3951,6 +4123,10 @@ async function detectUnchunkedFile(originalPath, manifestSize = 0) {
 
 async function listRagDirectoryEntries(directory) {
   const normalizedDir = directory.endsWith('/') ? directory : `${directory}/`;
+  const fsEntries = listStandaloneDirectory(normalizedDir);
+  if (Array.isArray(fsEntries)) {
+    return filterSuspiciousDirectoryEntries(fsEntries);
+  }
   try {
     const response = await fetch(normalizedDir, { cache: 'no-store' });
     if (!response.ok) {
@@ -4394,11 +4570,20 @@ function extractOverlapText(text, overlapTokens) {
 async function saveChunkedFileToFS(path, data) {
   const payloadForCache = { ...data, chunkedPath: path };
   cacheChunkedInRam([path, data?.originalPath], payloadForCache);
+  const serialized = JSON.stringify(data, null, 2);
+  const directory = getDirectoryPath(path);
+  if (directory) {
+    ensureStandaloneDirectory(directory);
+  }
+  if (writeStandaloneFile(path, serialized, { contentType: 'application/json' })) {
+    console.log(`Saved chunked file to ${path} via standalone bridge`);
+    return 'workspace';
+  }
   try {
     const response = await fetch(path, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data, null, 2)
+      body: serialized
     });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -4427,6 +4612,11 @@ async function moveToUnchunkedFS(fromPath, originalPath) {
   const candidatePaths = dedupePaths([fromPath, normalizedSource, unchunkedPath]);
 
   if (normalizedSource.startsWith('rag/unchunked/')) {
+    if (deleteStandaloneFile(normalizedSource)) {
+      clearUnchunkedRamEntries(candidatePaths);
+      console.log(`Deleted ${normalizedSource} via standalone bridge`);
+      return 'workspace';
+    }
     const cached = readRamDiskUnchunked(candidatePaths);
     try {
       const deleteResponse = await fetch(normalizedSource, { method: 'DELETE' });
@@ -4453,6 +4643,17 @@ async function moveToUnchunkedFS(fromPath, originalPath) {
       return 'ram';
     }
     return 'unknown';
+  }
+
+  const fsSource = readStandaloneFile(fromPath) || readStandaloneFile(normalizedSource);
+  if (fsSource && typeof fsSource.content === 'string') {
+    ensureStandaloneDirectory(getDirectoryPath(unchunkedPath));
+    if (writeStandaloneFile(unchunkedPath, fsSource.content, { contentType: fsSource.contentType })) {
+      deleteStandaloneFile(fromPath);
+      cacheUnchunkedInRam(candidatePaths, fsSource.content);
+      console.log(`Moved ${fromPath} to ${unchunkedPath} via standalone bridge`);
+      return 'workspace';
+    }
   }
 
   try {
@@ -4517,6 +4718,10 @@ function clearAllChunks() {
     const deletePromises = [];
     chunkerState.chunkedFiles.forEach(file => {
       if (file.chunkedPath) {
+        if (deleteStandaloneFile(file.chunkedPath)) {
+          addSystemMessage(`✓ Deleted ${file.chunkedPath}`);
+          return deletePromises.push(Promise.resolve());
+        }
         deletePromises.push(
           fetch(file.chunkedPath, { method: 'DELETE' })
             .then(() => addSystemMessage(`✓ Deleted ${file.chunkedPath}`))
@@ -4526,6 +4731,10 @@ function clearAllChunks() {
     });
     chunkerState.unchunkedFiles.forEach(file => {
       if (file.path && file.path.includes('/unchunked/')) {
+        if (deleteStandaloneFile(file.path)) {
+          addSystemMessage(`✓ Deleted ${file.path}`);
+          return deletePromises.push(Promise.resolve());
+        }
         deletePromises.push(
           fetch(file.path, { method: 'DELETE' })
             .then(() => addSystemMessage(`✓ Deleted ${file.path}`))
@@ -5796,6 +6005,7 @@ async function callModel(messages, overrides = {}) {
   const apiKey = overrides.apiKey ?? config.apiKey;
   const maxTokens = overrides.maxTokens ?? config.maxResponseTokens;
   const providerPreset = overrides.providerPreset ?? config.providerPreset;
+  const openRouterPolicy = (overrides.openRouterPolicy ?? config.openRouterPolicy ?? '').trim();
 
   if (!endpoint || !model) {
     throw new Error('Model endpoint or name missing.');
@@ -5805,6 +6015,7 @@ async function callModel(messages, overrides = {}) {
   const timeoutMs = resolveRequestTimeout(model, preset, overrides.timeoutMs);
   const isAnthropic = preset?.anthropicFormat;
   const isGoogle = preset?.googleFormat;
+  const usingOpenRouter = (preset?.id ?? providerPreset) === 'openrouter' || /openrouter\.ai/.test(endpoint);
 
   let headers = { 'Content-Type': 'application/json' };
   let payload = {};
@@ -5842,6 +6053,9 @@ async function callModel(messages, overrides = {}) {
     // Standard OpenAI format
     if (apiKey) {
       headers.Authorization = `Bearer ${apiKey}`;
+    }
+    if (usingOpenRouter && openRouterPolicy) {
+      headers['X-OpenRouter-Data-Policy'] = openRouterPolicy;
     }
     payload = {
       model,

@@ -276,6 +276,11 @@
           <label for="apiKeyInput">API key (optional)</label>
           <input id="apiKeyInput" type="password" autocomplete="off">
         </div>
+        <div class="field" id="openRouterPolicyField">
+          <label for="openRouterPolicyInput">OpenRouter data policy</label>
+          <input id="openRouterPolicyInput" type="text" placeholder="e.g. default, opt-out, free">
+          <p class="field-hint">Match your OpenRouter privacy mode to avoid 404 data-policy errors.</p>
+        </div>
         <div class="field">
           <label for="agentAName">Model A display name</label>
           <input id="agentAName" type="text" placeholder="SAM-A">
@@ -300,13 +305,6 @@
           <input id="agentBEnabled" type="checkbox">
           <span>Enable Model B for dual debates</span>
         </label>
-        <div id="arenaPrimaryConfig" class="arena-primary-config" hidden aria-hidden="true">
-          <div class="field">
-            <label for="agentAPrompt">Model A arena persona</label>
-            <textarea id="agentAPrompt" rows="3" placeholder="You are SAM-A, an analytical thinker."></textarea>
-          </div>
-        </div>
-
         <div class="field field--inline">
           <label for="requestTimeout">Request timeout (seconds)</label>
           <input id="requestTimeout" type="number" min="10" max="600" value="30">
@@ -352,7 +350,7 @@
         </div>
         <div class="field field--inline">
           <label for="dualTurnDelay">Dual turn delay (seconds)</label>
-          <input id="dualTurnDelay" type="number" min="0" max="600" value="30" placeholder="30">
+          <input id="dualTurnDelay" type="number" min="0" max="600" value="15" placeholder="15">
           <p class="field-hint">Wait this long before auto-starting the partner&apos;s next turn.</p>
         </div>
         <label class="toggle">
