@@ -3,10 +3,18 @@ import { EMBEDDING_PROVIDERS, detectEmbeddingService, requestEmbeddingVector } f
 // CODEx: Maintain explicit separation between module imports and runtime constants.
 const MB = 1024 * 1024; // CODEx: Base multiplier for megabyte calculations across memory limits.
 const MAX_RAG_EMBEDDING_BYTES = 100 * MB; // CODEx: Cap chunk embedding footprint to 100 MB within the RAM disk budget.
-const EMBEDDING_CACHE_DIR = 'rag/cache'; // CODEx: Directory for persisted embedding cache entries.
-const EMBEDDING_CACHE_MANIFEST_PATH = `${EMBEDDING_CACHE_DIR}/manifest.json`; // CODEx: Manifest tracking persisted vectors.
 const EMBEDDING_CACHE_MAX_BYTES = MAX_RAG_EMBEDDING_BYTES; // CODEx: Align disk cache limit with RAM disk budget.
 const EMBEDDING_CACHE_TRIM_THRESHOLD = Math.floor(EMBEDDING_CACHE_MAX_BYTES * 0.8); // CODEx: Trigger LRU eviction at 80% usage.
+const EMBEDDING_BUCKET_KEYS = Object.freeze({ // CODEx: Namespace embedding caches for shared and arena agents.
+  SHARED: 'shared', // CODEx: Default bucket for general chat retrieval.
+  SAM_A: 'sam-a', // CODEx: Dedicated cache bucket for SAM-A embeddings.
+  SAM_B: 'sam-b' // CODEx: Dedicated cache bucket for SAM-B embeddings.
+});
+const EMBEDDING_CACHE_DIRECTORIES = Object.freeze({ // CODEx: Map cache buckets to their on-disk directories.
+  [EMBEDDING_BUCKET_KEYS.SHARED]: 'rag/cache', // CODEx: Shared cache directory.
+  [EMBEDDING_BUCKET_KEYS.SAM_A]: 'rag/a_cache', // CODEx: Arena SAM-A cache directory.
+  [EMBEDDING_BUCKET_KEYS.SAM_B]: 'rag/b_cache' // CODEx: Arena SAM-B cache directory.
+});
 const MIN_MEMORY_LIMIT_MB = 50;
 const MAX_MEMORY_LIMIT_MB = 200;
 const MEMORY_LIMIT_STEP_MB = 10;
@@ -404,6 +412,7 @@ const defaultConfig = {
   embeddingEndpoint: '',
   embeddingApiKey: '',
   embeddingProviderPreference: EMBEDDING_PROVIDERS.AUTO, // CODEx: Default to automatic provider detection.
+  embeddingContextLength: 1024, // CODEx: Default embedding context window.
   autoSpeak: false,
   ttsPreset: 'browser',
   ttsServerUrl: '',
@@ -411,13 +420,19 @@ const defaultConfig = {
   ttsApiKey: '',
   ttsVolume: 100,
   agentAName: 'SAM-A',
-  agentAPrompt: 'You are SAM-A, an analytical AI researcher who values precision and structure.',
+  agentAPrompt:
+    'You are SAM-A, the Flowfield advocate. Defend the Flowfield hypothesis with technical precision, cite mechanisms, and ground arguments in empirical detail.', // CODEx: Flowfield persona for SAM-A.
   agentBEnabled: false,
   agentBName: 'SAM-B',
-  agentBPrompt: 'You are SAM-B, a creative explorer who loves bold ideas and storytelling.',
+  agentBPrompt:
+    'You are SAM-B, the analytical skeptic. Probe Flowfield assumptions, raise counterexamples, and demand rigorous justification before conceding ground.', // CODEx: Skeptical persona for SAM-B.
   agentBProviderPreset: 'inherit',
   agentBEndpoint: '',
   agentBModel: '',
+  agentAEmbeddingProvider: EMBEDDING_PROVIDERS.OLLAMA_LOCAL, // CODEx: Default SAM-A embedding provider.
+  agentAEmbeddingModel: 'mxbai-embed-large', // CODEx: Default SAM-A embedding checkpoint.
+  agentBEmbeddingProvider: EMBEDDING_PROVIDERS.LM_STUDIO, // CODEx: Default SAM-B embedding provider.
+  agentBEmbeddingModel: 'text-embedding-3-large', // CODEx: Default SAM-B embedding checkpoint.
   agentBApiKey: '',
   dualAutoContinue: true,
   dualTurnLimit: 0,
@@ -807,14 +822,13 @@ const ramDiskCache = {
 // CODEx: In-memory embedding caches maintain fast retrieval across chat and RAG stores.
 const embeddingCache = new Map();
 const messageEmbeddingCache = new Map();
-const chunkEmbeddingIndex = new Map();
-let chunkEmbeddingFootprintBytes = 0; // CODEx: Measure bytes consumed by cached chunk embeddings.
-const chunkEmbeddingOrder = []; // CODEx: Preserve insertion order for trimming cached embeddings.
+const embeddingRuntimeBuckets = new Map(); // CODEx: Track in-memory embedding state per cache bucket.
+let totalEmbeddingFootprintBytes = 0; // CODEx: Aggregate bytes consumed by all embedding buckets.
 let embeddingServiceHealthy = true; // CODEx: Represent whether the embedding endpoint is responsive.
 let embeddingServiceReason = ''; // CODEx: Store the most recent embedding failure reason for UI diagnostics.
 const embeddingProviderState = { preference: EMBEDDING_PROVIDERS.AUTO, active: EMBEDDING_PROVIDERS.OPENAI, baseUrl: '', lastProbe: 0 }; // CODEx: Track provider selection and probe metadata.
-let embeddingCacheManifest = { entries: [], totalBytes: 0 }; // CODEx: Persisted cache metadata loaded from disk.
-let embeddingCacheManifestLoaded = false; // CODEx: Ensure manifest initialization runs once per session.
+const embeddingBucketManifests = new Map(); // CODEx: Persisted manifest metadata keyed by cache bucket.
+const embeddingBucketManifestLoaded = new Set(); // CODEx: Track which manifests have been hydrated from disk.
 
 // CODEx: High-resolution clock helper for latency tracking.
 function getTimestampMs() {
@@ -835,9 +849,8 @@ const modelCallMetrics = {
 function clearCachedEmbeddings() {
   embeddingCache.clear();
   messageEmbeddingCache.clear();
-  chunkEmbeddingIndex.clear();
-  chunkEmbeddingFootprintBytes = 0; // CODEx: Reset embedding footprint accounting when caches clear.
-  chunkEmbeddingOrder.length = 0; // CODEx: Drop insertion order tracking alongside cache reset.
+  embeddingRuntimeBuckets.clear(); // CODEx: Reset per-bucket embedding state for shared and arena caches.
+  totalEmbeddingFootprintBytes = 0; // CODEx: Reset aggregate embedding footprint across all buckets.
 }
 
 // CODEx: Detect reasoning-focused checkpoints to adjust timeouts and context.
@@ -903,11 +916,96 @@ function getActiveEmbeddingProviderLabel() { // CODEx: Present user-friendly pro
       return 'Auto'; // CODEx: Fallback descriptor when detection pending.
   }
 } // CODEx
-function getEmbeddingCacheBytes() { // CODEx: Report persisted cache footprint.
-  ensureEmbeddingCacheManifest(); // CODEx: Guarantee manifest ready before reading totals.
-  return Number.isFinite(embeddingCacheManifest.totalBytes) ? embeddingCacheManifest.totalBytes : 0; // CODEx: Guard invalid totals.
+function normalizeEmbeddingBucket(bucketKey) { // CODEx: Resolve a valid embedding bucket identifier.
+  if (bucketKey && EMBEDDING_CACHE_DIRECTORIES[bucketKey]) { // CODEx: Accept known bucket keys directly.
+    return bucketKey; // CODEx: Use provided bucket when valid.
+  }
+  if (bucketKey === 'A' || bucketKey === 'SAM-A') { // CODEx: Map legacy speaker identifiers.
+    return EMBEDDING_BUCKET_KEYS.SAM_A; // CODEx: Normalize to SAM-A bucket.
+  }
+  if (bucketKey === 'B' || bucketKey === 'SAM-B') { // CODEx: Map legacy speaker identifiers.
+    return EMBEDDING_BUCKET_KEYS.SAM_B; // CODEx: Normalize to SAM-B bucket.
+  }
+  return EMBEDDING_BUCKET_KEYS.SHARED; // CODEx: Default to shared cache for unknown identifiers.
 } // CODEx
-// CODEx: Refresh DOM status text to reflect embedding availability.
+
+function getRuntimeEmbeddingBucket(bucketKey = EMBEDDING_BUCKET_KEYS.SHARED) { // CODEx: Access runtime cache state for a bucket.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Ensure consistent bucket key usage.
+  if (!embeddingRuntimeBuckets.has(normalized)) { // CODEx: Lazy-initialize bucket state.
+    embeddingRuntimeBuckets.set(normalized, { index: new Map(), order: [], footprint: 0 }); // CODEx: Seed map, eviction order, and footprint.
+  }
+  return embeddingRuntimeBuckets.get(normalized); // CODEx: Return cached state container.
+} // CODEx
+
+function ensureEmbeddingCacheManifest(bucketKey = EMBEDDING_BUCKET_KEYS.SHARED) { // CODEx: Lazy-load manifest for a bucket.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Normalize identifier.
+  if (embeddingBucketManifestLoaded.has(normalized)) { // CODEx: Skip reload when already hydrated.
+    return; // CODEx: Manifest already ready.
+  }
+  embeddingBucketManifestLoaded.add(normalized); // CODEx: Mark manifest as loaded (or attempted).
+  const directory = EMBEDDING_CACHE_DIRECTORIES[normalized]; // CODEx: Resolve bucket directory.
+  const manifestPath = `${directory}/manifest.json`; // CODEx: Derive manifest location for the bucket.
+  try { // CODEx: Load manifest content from disk.
+    ensureStandaloneDirectory(directory); // CODEx: Create directory when running in standalone shell.
+    const record = readStandaloneFile(manifestPath); // CODEx: Read persisted manifest payload.
+    if (record?.content) { // CODEx: Parse JSON content when present.
+      const parsed = JSON.parse(record.content); // CODEx: Interpret manifest JSON.
+      if (parsed && typeof parsed === 'object') { // CODEx: Validate structure before storing.
+        embeddingBucketManifests.set(normalized, { // CODEx: Cache manifest entries by bucket.
+          entries: Array.isArray(parsed.entries) ? parsed.entries : [], // CODEx: Normalize entry array.
+          totalBytes: Number.isFinite(parsed.totalBytes) ? parsed.totalBytes : 0 // CODEx: Normalize footprint.
+        });
+        return; // CODEx: Manifest loaded successfully.
+      }
+    }
+  } catch (error) { // CODEx: Ignore manifest load failures while logging diagnostics.
+    console.warn('Failed to load embedding cache manifest', { bucket: normalized, error }); // CODEx: Surface manifest load issues per bucket.
+  }
+  embeddingBucketManifests.set(normalized, { entries: [], totalBytes: 0 }); // CODEx: Seed empty manifest on failure.
+} // CODEx
+
+function getEmbeddingManifest(bucketKey = EMBEDDING_BUCKET_KEYS.SHARED) { // CODEx: Retrieve hydrated manifest for a bucket.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Normalize identifier for lookup.
+  ensureEmbeddingCacheManifest(normalized); // CODEx: Guarantee manifest is loaded from disk.
+  return embeddingBucketManifests.get(normalized) ?? { entries: [], totalBytes: 0 }; // CODEx: Provide manifest fallback when missing.
+} // CODEx
+
+function persistEmbeddingCacheManifest(bucketKey = EMBEDDING_BUCKET_KEYS.SHARED) { // CODEx: Write manifest metadata to disk.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Normalize identifier for persistence.
+  const manifest = getEmbeddingManifest(normalized); // CODEx: Retrieve manifest snapshot.
+  const directory = EMBEDDING_CACHE_DIRECTORIES[normalized]; // CODEx: Bucket directory on disk.
+  const manifestPath = `${directory}/manifest.json`; // CODEx: Derived manifest path.
+  try { // CODEx: Serialize manifest to JSON.
+    ensureStandaloneDirectory(directory); // CODEx: Ensure directory exists prior to writing.
+    const payload = JSON.stringify({ entries: manifest.entries, totalBytes: manifest.totalBytes }); // CODEx: Compose manifest payload.
+    const saved = writeStandaloneFile(manifestPath, payload); // CODEx: Attempt to write manifest to disk.
+    if (saved === false) { // CODEx: Skip when persistence unavailable.
+      return; // CODEx: Allow in-memory operation without disk support.
+    }
+  } catch (error) { // CODEx: Handle persistence issues gracefully.
+    console.warn('Failed to persist embedding cache manifest', { bucket: normalized, error }); // CODEx: Surface disk write failures.
+  }
+} // CODEx
+
+function getEmbeddingCacheBytes(bucketKey) { // CODEx: Report cache footprint per bucket or aggregate.
+  if (bucketKey) { // CODEx: Provide targeted bucket totals when requested.
+    const manifest = getEmbeddingManifest(bucketKey); // CODEx: Retrieve bucket manifest.
+    return Number.isFinite(manifest.totalBytes) ? manifest.totalBytes : 0; // CODEx: Safely return numeric footprint.
+  }
+  let total = 0; // CODEx: Aggregate totals across buckets.
+  for (const key of Object.values(EMBEDDING_BUCKET_KEYS)) { // CODEx: Iterate all known buckets.
+    total += getEmbeddingCacheBytes(key); // CODEx: Sum each bucket footprint.
+  }
+  return total; // CODEx: Provide combined footprint when no bucket specified.
+} // CODEx
+
+function formatEmbeddingCacheBreakdown() { // CODEx: Present cache footprint per bucket for UI status.
+  const shared = formatMegabytes(getEmbeddingCacheBytes(EMBEDDING_BUCKET_KEYS.SHARED)); // CODEx: Shared cache footprint label.
+  const aBytes = formatMegabytes(getEmbeddingCacheBytes(EMBEDDING_BUCKET_KEYS.SAM_A)); // CODEx: SAM-A cache footprint label.
+  const bBytes = formatMegabytes(getEmbeddingCacheBytes(EMBEDDING_BUCKET_KEYS.SAM_B)); // CODEx: SAM-B cache footprint label.
+  return `Shared ${shared} • SAM-A ${aBytes} • SAM-B ${bBytes}`; // CODEx: Consolidated status string for the drawer.
+} // CODEx
+
 function refreshEmbeddingStatusIndicator() { // CODEx: Update the memory drawer indicator for embedding availability.
   const indicator = elements.embeddingStatus; // CODEx: Reference the DOM node used for embedding status text.
   if (!indicator) { // CODEx: Exit early when the indicator has not been rendered.
@@ -918,7 +1016,7 @@ function refreshEmbeddingStatusIndicator() { // CODEx: Update the memory drawer 
     return; // CODEx: Skip additional status updates when disabled.
   } // CODEx
   const providerLabel = getActiveEmbeddingProviderLabel(); // CODEx: Gather current provider label.
-  const cacheLabel = formatMegabytes(getEmbeddingCacheBytes()); // CODEx: Summarize cache footprint in human-friendly units.
+  const cacheLabel = formatEmbeddingCacheBreakdown(); // CODEx: Summarize per-bucket cache footprint for diagnostics.
   if (embeddingServiceHealthy) { // CODEx: Show success when the embedding provider is responding.
     indicator.textContent = `Embedding Active ✓ (Provider: ${providerLabel}, Cache: ${cacheLabel})`; // CODEx: Display provider and cache footprint on success.
     return; // CODEx: Finish once success state is displayed.
@@ -926,148 +1024,134 @@ function refreshEmbeddingStatusIndicator() { // CODEx: Update the memory drawer 
   const reason = embeddingServiceReason ? ` (${embeddingServiceReason})` : ' (offline)'; // CODEx: Prepare contextual failure messaging.
   indicator.textContent = `Embedding Active ✗ (Provider: ${providerLabel}, Cache: ${cacheLabel})${reason}`; // CODEx: Combine failure message with provider context.
 } // CODEx
-// CODEx: Footprint estimation drives cache budgeting accuracy.
+
 function estimateEmbeddingBytes(vector) { // CODEx: Estimate bytes consumed by an embedding array.
   if (!Array.isArray(vector)) { // CODEx: Ignore malformed embedding payloads.
     return 0; // CODEx: Count no memory usage when vectors are invalid.
   } // CODEx
   return vector.length * 8; // CODEx: Assume double-precision floats for footprint approximation.
 } // CODEx
-// CODEx: Cache management ensures embeddings respect RAM disk constraints.
-function storeChunkEmbedding(key, vector) { // CODEx: Cache chunk embeddings while tracking memory usage.
-  const previous = chunkEmbeddingIndex.get(key); // CODEx: Retrieve prior embedding to adjust totals.
-  if (!chunkEmbeddingIndex.has(key)) { // CODEx: Track insertion order for new cache entries.
-    chunkEmbeddingOrder.push(key); // CODEx: Record key order for future evictions.
-  } // CODEx
-  if (Array.isArray(previous)) { // CODEx: Remove prior embedding weight from the footprint tally.
-    chunkEmbeddingFootprintBytes -= estimateEmbeddingBytes(previous); // CODEx: Subtract previous vector contribution.
-  } // CODEx
-  chunkEmbeddingIndex.set(key, vector); // CODEx: Persist the latest embedding vector in cache.
-  chunkEmbeddingFootprintBytes += estimateEmbeddingBytes(vector); // CODEx: Add new vector contribution to the footprint.
-  enforceChunkEmbeddingBudget(); // CODEx: Ensure the cache remains within the RAM budget.
-  persistEmbeddingVector(key, vector); // CODEx: Mirror embedding into disk-backed cache for offline reuse.
-} // CODEx
-// CODEx: Periodically trim embeddings to keep memory usage predictable.
-function enforceChunkEmbeddingBudget() { // CODEx: Trim cached embeddings when exceeding RAM disk capacity.
-  if (chunkEmbeddingFootprintBytes <= MAX_RAG_EMBEDDING_BYTES) { // CODEx: Leave cache untouched when within limits.
-    return; // CODEx: No trimming required under the limit.
-  } // CODEx
-  let removed = 0; // CODEx: Track how many embeddings are evicted.
-  while (chunkEmbeddingFootprintBytes > MAX_RAG_EMBEDDING_BYTES && chunkEmbeddingOrder.length) { // CODEx: Continue until usage is within the cap.
-    const oldestKey = chunkEmbeddingOrder.shift(); // CODEx: Pull the oldest embedding key for eviction.
-    const vector = chunkEmbeddingIndex.get(oldestKey); // CODEx: Look up the corresponding embedding payload.
-    if (!Array.isArray(vector)) { // CODEx: Skip keys already cleared or invalid.
-      continue; // CODEx: Proceed to the next queued key when data missing.
-    } // CODEx
-    chunkEmbeddingIndex.delete(oldestKey); // CODEx: Remove the stale embedding from cache.
-    chunkEmbeddingFootprintBytes -= estimateEmbeddingBytes(vector); // CODEx: Reduce tracked footprint after eviction.
-    removed += 1; // CODEx: Count the eviction for diagnostics.
-  } // CODEx
-  if (chunkEmbeddingFootprintBytes < 0) { // CODEx: Prevent negative totals after trimming.
-    chunkEmbeddingFootprintBytes = 0; // CODEx: Reset footprint to zero when underflow occurs.
-  } // CODEx
-  if (removed > 0) { // CODEx: Emit diagnostics when trimming happens.
-    console.debug('Embedding cache trimmed', { removed, remainingBytes: chunkEmbeddingFootprintBytes }); // CODEx: Log trimming metrics for debugging.
-  } // CODEx
-} // CODEx
-function ensureEmbeddingCacheManifest() { // CODEx: Lazy-load embedding manifest from disk.
-  if (embeddingCacheManifestLoaded) { // CODEx: Avoid repeated loading.
-    return; // CODEx: Manifest already initialized.
-  } // CODEx
-  embeddingCacheManifestLoaded = true; // CODEx: Mark initialization attempted.
-  try { // CODEx: Attempt to hydrate manifest from disk storage.
-    ensureStandaloneDirectory(EMBEDDING_CACHE_DIR); // CODEx: Create cache directory when possible.
-    const record = readStandaloneFile(EMBEDDING_CACHE_MANIFEST_PATH); // CODEx: Fetch persisted manifest payload.
-    if (record?.content) { // CODEx: Parse when content available.
-      const parsed = JSON.parse(record.content); // CODEx: Parse manifest JSON.
-      if (parsed && typeof parsed === 'object') { // CODEx: Validate object shape.
-        embeddingCacheManifest = {
-          entries: Array.isArray(parsed.entries) ? parsed.entries : [], // CODEx: Normalize entry array.
-          totalBytes: Number.isFinite(parsed.totalBytes) ? parsed.totalBytes : 0 // CODEx: Normalize total bytes.
-        }; // CODEx: Apply parsed structure.
-      }
-    }
-  } catch (error) { // CODEx: Manifest hydration failures should not break runtime.
-    console.warn('Failed to load embedding cache manifest', error); // CODEx: Surface manifest load error.
-    embeddingCacheManifest = { entries: [], totalBytes: 0 }; // CODEx: Reset manifest to defaults on failure.
+
+function storeChunkEmbedding(key, vector, bucketKey = EMBEDDING_BUCKET_KEYS.SHARED) { // CODEx: Cache chunk embeddings per bucket.
+  if (!Array.isArray(vector) || !vector.length) { // CODEx: Skip invalid vectors.
+    return; // CODEx: Avoid storing malformed embeddings.
   }
-}
-function persistEmbeddingCacheManifest() { // CODEx: Flush manifest metadata back to disk.
-  try { // CODEx: Serialize and write manifest payload.
-    const payload = JSON.stringify({ entries: embeddingCacheManifest.entries, totalBytes: embeddingCacheManifest.totalBytes }); // CODEx: Compose manifest JSON.
-    const saved = writeStandaloneFile(EMBEDDING_CACHE_MANIFEST_PATH, payload); // CODEx: Save manifest to disk when bridge available.
-    if (saved === false) { // CODEx: Skip warnings when environment lacks filesystem bridge.
-      return; // CODEx: Exit quietly when persistence unsupported.
-    }
-  } catch (error) { // CODEx: Gracefully handle write failures.
-    console.warn('Failed to persist embedding cache manifest', error); // CODEx: Emit warning but continue runtime.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Normalize bucket identifier.
+  const bucket = getRuntimeEmbeddingBucket(normalized); // CODEx: Access runtime state for the bucket.
+  const previous = bucket.index.get(key); // CODEx: Retrieve prior embedding for footprint adjustments.
+  if (!bucket.index.has(key)) { // CODEx: Track insertion order for new entries.
+    bucket.order.push({ key, bucket: normalized }); // CODEx: Record entry metadata for eviction.
   }
-}
-function getEmbeddingCachePath(key) { // CODEx: Map cache key to disk filename.
-  const hash = hashString(key || ''); // CODEx: Hash key for filesystem safety.
-  return `${EMBEDDING_CACHE_DIR}/${hash}.json`; // CODEx: Derive deterministic cache path.
-}
+  if (Array.isArray(previous)) { // CODEx: Remove prior footprint before writing new vector.
+    const previousBytes = estimateEmbeddingBytes(previous); // CODEx: Measure previous contribution.
+    bucket.footprint = Math.max(0, bucket.footprint - previousBytes); // CODEx: Update bucket footprint.
+    totalEmbeddingFootprintBytes = Math.max(0, totalEmbeddingFootprintBytes - previousBytes); // CODEx: Update aggregate footprint.
+  }
+  bucket.index.set(key, vector); // CODEx: Persist vector in-memory for the bucket.
+  const addedBytes = estimateEmbeddingBytes(vector); // CODEx: Measure new contribution.
+  bucket.footprint += addedBytes; // CODEx: Update bucket footprint.
+  totalEmbeddingFootprintBytes += addedBytes; // CODEx: Update aggregate footprint.
+  enforceChunkEmbeddingBudget(normalized); // CODEx: Ensure footprints remain within configured limits.
+  persistEmbeddingVector(normalized, key, vector); // CODEx: Mirror embedding into disk-backed cache per bucket.
+} // CODEx
+
+function enforceChunkEmbeddingBudget(bucketKey = EMBEDDING_BUCKET_KEYS.SHARED) { // CODEx: Trim cached embeddings when exceeding budgets.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Normalize identifier.
+  const bucket = getRuntimeEmbeddingBucket(normalized); // CODEx: Access bucket runtime state.
+  if (totalEmbeddingFootprintBytes <= MAX_RAG_EMBEDDING_BYTES) { // CODEx: Skip trimming when global footprint is safe.
+    return; // CODEx: No action required under limit.
+  }
+  let removed = 0; // CODEx: Track total evictions for logging.
+  while (totalEmbeddingFootprintBytes > MAX_RAG_EMBEDDING_BYTES && bucket.order.length) { // CODEx: Continue trimming until within limit.
+    const oldest = bucket.order.shift(); // CODEx: Pop oldest entry metadata.
+    const vector = bucket.index.get(oldest.key); // CODEx: Retrieve stored vector for eviction.
+    if (!Array.isArray(vector)) { // CODEx: Skip entries already cleared.
+      continue; // CODEx: Proceed to next candidate.
+    }
+    const bytes = estimateEmbeddingBytes(vector); // CODEx: Measure removed footprint.
+    bucket.index.delete(oldest.key); // CODEx: Remove from runtime cache.
+    bucket.footprint = Math.max(0, bucket.footprint - bytes); // CODEx: Adjust bucket footprint.
+    totalEmbeddingFootprintBytes = Math.max(0, totalEmbeddingFootprintBytes - bytes); // CODEx: Adjust aggregate footprint.
+    removed += 1; // CODEx: Increment eviction counter.
+  }
+  if (removed > 0) { // CODEx: Emit diagnostics when evictions occur.
+    console.debug('Embedding cache trimmed', { bucket: normalized, removed, remainingBytes: bucket.footprint }); // CODEx: Log trimming metrics.
+  }
+} // CODEx
+
+function getEmbeddingCachePath(bucketKey, entryKey) { // CODEx: Map cache key to disk filename per bucket.
+  const directory = EMBEDDING_CACHE_DIRECTORIES[normalizeEmbeddingBucket(bucketKey)]; // CODEx: Resolve directory for bucket.
+  const hash = hashString(entryKey || ''); // CODEx: Hash key for filesystem safety.
+  return `${directory}/${hash}.json`; // CODEx: Derive deterministic cache path.
+} // CODEx
+
 function updateManifestEntry(entry, bytes) { // CODEx: Update entry metadata with new byte counts.
   const now = Date.now(); // CODEx: Timestamp for LRU ordering.
   entry.bytes = bytes; // CODEx: Refresh entry footprint.
   entry.updatedAt = now; // CODEx: Track update timestamp.
   entry.lastAccess = now; // CODEx: Refresh access timestamp when writing.
-}
-function trimEmbeddingCacheManifest() { // CODEx: Evict least-recently-used entries beyond thresholds.
-  let total = getEmbeddingCacheBytes(); // CODEx: Start with current total footprint.
-  if (total <= EMBEDDING_CACHE_TRIM_THRESHOLD) { // CODEx: Skip trimming under 80% threshold.
+} // CODEx
+
+function trimEmbeddingCacheManifest(bucketKey = EMBEDDING_BUCKET_KEYS.SHARED) { // CODEx: Evict least-recently-used entries per bucket.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Normalize identifier.
+  const manifest = getEmbeddingManifest(normalized); // CODEx: Retrieve manifest for trimming.
+  const maxEntries = 10000; // CODEx: Upper bound on cached entries to avoid unbounded manifests.
+  if (manifest.totalBytes <= EMBEDDING_CACHE_TRIM_THRESHOLD && manifest.entries.length <= maxEntries) { // CODEx: Skip trimming when within byte and entry limits.
     return; // CODEx: Nothing to evict.
   }
-  const entries = embeddingCacheManifest.entries.slice().sort((a, b) => (a.lastAccess || 0) - (b.lastAccess || 0)); // CODEx: Sort ascending by last access.
-  for (const entry of entries) { // CODEx: Remove until total falls below threshold.
-    if (total <= EMBEDDING_CACHE_TRIM_THRESHOLD) { // CODEx: Stop trimming when target reached.
+  const sorted = manifest.entries.slice().sort((a, b) => (a.lastAccess || 0) - (b.lastAccess || 0)); // CODEx: Sort ascending by last access.
+  for (const entry of sorted) { // CODEx: Remove until total falls below threshold.
+    if (manifest.totalBytes <= EMBEDDING_CACHE_TRIM_THRESHOLD && manifest.entries.length <= maxEntries) { // CODEx: Stop when both limits satisfied.
       break; // CODEx: Exit loop once within budget.
     }
-    if (entry?.path) { // CODEx: Only attempt deletion when path known.
+    if (entry?.path) { // CODEx: Delete persisted vector when path known.
       deleteStandaloneFile(entry.path); // CODEx: Remove cached vector file.
     }
-    embeddingCacheManifest.entries = embeddingCacheManifest.entries.filter((candidate) => candidate.key !== entry.key); // CODEx: Remove entry from manifest.
+    manifest.entries = manifest.entries.filter((candidate) => candidate.key !== entry.key); // CODEx: Remove entry from manifest array.
     const bytes = Number.isFinite(entry?.bytes) ? entry.bytes : 0; // CODEx: Normalize byte count.
-    total -= bytes; // CODEx: Reduce tracked total.
+    manifest.totalBytes = Math.max(0, manifest.totalBytes - bytes); // CODEx: Adjust manifest footprint.
   }
-  embeddingCacheManifest.totalBytes = Math.max(0, total); // CODEx: Clamp total bytes to zero minimum.
-  persistEmbeddingCacheManifest(); // CODEx: Persist updated manifest after trimming.
-}
-function persistEmbeddingVector(key, vector) { // CODEx: Store embedding vector to disk cache.
-  ensureEmbeddingCacheManifest(); // CODEx: Guarantee manifest initialization.
+  persistEmbeddingCacheManifest(normalized); // CODEx: Persist manifest updates after trimming.
+} // CODEx
+
+function persistEmbeddingVector(bucketKey, entryKey, vector) { // CODEx: Store embedding vector to disk cache per bucket.
   if (!Array.isArray(vector) || !vector.length) { // CODEx: Skip invalid vectors.
     return; // CODEx: Do not persist malformed embeddings.
   }
-  try { // CODEx: Serialize vector payload.
-    ensureStandaloneDirectory(EMBEDDING_CACHE_DIR); // CODEx: Ensure directory exists before writing.
-    const path = getEmbeddingCachePath(key); // CODEx: Determine file path for key.
-    const payload = JSON.stringify({ key, vector }); // CODEx: Compose cache entry payload.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Normalize identifier for persistence.
+  const manifest = getEmbeddingManifest(normalized); // CODEx: Retrieve manifest snapshot.
+  try { // CODEx: Serialize vector payload for disk storage.
+    const directory = EMBEDDING_CACHE_DIRECTORIES[normalized]; // CODEx: Directory target for bucket.
+    ensureStandaloneDirectory(directory); // CODEx: Ensure directory exists before writing.
+    const path = getEmbeddingCachePath(normalized, entryKey); // CODEx: Determine file path for key.
+    const payload = JSON.stringify({ key: entryKey, vector }); // CODEx: Compose cache entry payload.
     const bytes = new TextEncoder().encode(payload).length; // CODEx: Measure serialized byte length.
     const saved = writeStandaloneFile(path, payload); // CODEx: Persist vector to disk.
     if (saved === false) { // CODEx: Abort caching when filesystem bridge is unavailable.
       return; // CODEx: Respect environments without disk persistence.
     }
-    const existingIndex = embeddingCacheManifest.entries.findIndex((entry) => entry.key === key); // CODEx: Locate prior entry.
-    if (existingIndex >= 0) { // CODEx: Update existing entry.
-      const existing = embeddingCacheManifest.entries[existingIndex]; // CODEx: Reference existing manifest entry.
+    const index = manifest.entries.findIndex((entry) => entry.key === entryKey); // CODEx: Locate prior entry.
+    if (index >= 0) { // CODEx: Update existing entry.
+      const existing = manifest.entries[index]; // CODEx: Reference existing manifest entry.
       const previousBytes = Number.isFinite(existing.bytes) ? existing.bytes : 0; // CODEx: Previous footprint for adjustments.
-      embeddingCacheManifest.totalBytes -= previousBytes; // CODEx: Remove previous byte contribution.
+      manifest.totalBytes = Math.max(0, manifest.totalBytes - previousBytes); // CODEx: Remove previous byte contribution.
       updateManifestEntry(existing, bytes); // CODEx: Refresh entry metadata.
       existing.path = path; // CODEx: Store path for reloading.
     } else { // CODEx: Create new manifest entry when absent.
-      const entry = { key, path, bytes, updatedAt: Date.now(), lastAccess: Date.now() }; // CODEx: Compose manifest entry.
-      embeddingCacheManifest.entries.push(entry); // CODEx: Append entry to manifest array.
+      manifest.entries.push({ key: entryKey, path, bytes, updatedAt: Date.now(), lastAccess: Date.now() }); // CODEx: Append manifest entry.
     }
-    embeddingCacheManifest.totalBytes += bytes; // CODEx: Add new byte contribution.
-    trimEmbeddingCacheManifest(); // CODEx: Enforce disk budget with LRU trimming.
-    persistEmbeddingCacheManifest(); // CODEx: Flush manifest updates to disk.
+    manifest.totalBytes += bytes; // CODEx: Add new byte contribution.
+    trimEmbeddingCacheManifest(normalized); // CODEx: Enforce disk budget with LRU trimming.
+    persistEmbeddingCacheManifest(normalized); // CODEx: Flush manifest updates to disk.
   } catch (error) { // CODEx: Handle serialization or IO issues gracefully.
-    console.warn('Failed to persist embedding vector', { key, error }); // CODEx: Warn when caching fails.
+    console.warn('Failed to persist embedding vector', { bucket: normalized, key: entryKey, error }); // CODEx: Warn when caching fails.
   }
-}
-function loadEmbeddingFromDisk(key) { // CODEx: Retrieve persisted vector for cache misses.
-  ensureEmbeddingCacheManifest(); // CODEx: Ensure manifest available for lookups.
-  const entry = embeddingCacheManifest.entries.find((candidate) => candidate.key === key); // CODEx: Locate manifest entry by key.
+} // CODEx
+
+function loadEmbeddingFromDisk(bucketKey, entryKey) { // CODEx: Retrieve persisted vector for cache misses.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Normalize identifier.
+  const manifest = getEmbeddingManifest(normalized); // CODEx: Retrieve manifest entries.
+  const entry = manifest.entries.find((candidate) => candidate.key === entryKey); // CODEx: Locate manifest entry by key.
   if (!entry || !entry.path) { // CODEx: Abort when entry missing.
     return null; // CODEx: Disk cache miss.
   }
@@ -1080,14 +1164,117 @@ function loadEmbeddingFromDisk(key) { // CODEx: Retrieve persisted vector for ca
     const vector = Array.isArray(parsed?.vector) ? parsed.vector : Array.isArray(parsed?.embedding) ? parsed.embedding : null; // CODEx: Accept legacy shapes.
     if (Array.isArray(vector) && vector.length) { // CODEx: Validate vector.
       entry.lastAccess = Date.now(); // CODEx: Refresh access timestamp on hit.
-      persistEmbeddingCacheManifest(); // CODEx: Persist updated access time for LRU ordering.
+      persistEmbeddingCacheManifest(normalized); // CODEx: Persist updated access time for LRU ordering.
       return vector; // CODEx: Return hydrated vector.
     }
   } catch (error) { // CODEx: Handle JSON parse errors gracefully.
-    console.warn('Failed to parse cached embedding vector', { key, error }); // CODEx: Emit parse warning.
+    console.warn('Failed to parse cached embedding vector', { bucket: normalized, key: entryKey, error }); // CODEx: Emit parse warning.
   }
   return null; // CODEx: Default to null when payload invalid.
 }
+
+function resolveCachedEmbedding(bucketKey, entryKey) { // CODEx: Fetch embedding from runtime cache or disk fallback.
+  const normalized = normalizeEmbeddingBucket(bucketKey); // CODEx: Normalize identifier for lookups.
+  const bucket = getRuntimeEmbeddingBucket(normalized); // CODEx: Access in-memory cache for the bucket.
+  const cached = bucket.index.get(entryKey); // CODEx: Attempt to read from runtime cache first.
+  if (Array.isArray(cached) && cached.length) { // CODEx: Return immediately when runtime cache hit.
+    return cached; // CODEx: Provide cached embedding without disk access.
+  }
+  return loadEmbeddingFromDisk(normalized, entryKey); // CODEx: Fallback to persisted embedding when runtime miss occurs.
+} // CODEx
+
+function resolveEmbeddingContextLength(model, override) { // CODEx: Derive context window based on model hints and user override.
+  const baseOverride = Number.isFinite(override) ? override : config.embeddingContextLength ?? defaultConfig.embeddingContextLength; // CODEx: Prefer configured window when numeric.
+  let hinted = 1024; // CODEx: Default context size when hints absent.
+  if (typeof model === 'string') { // CODEx: Inspect model identifier for context hints.
+    if (/4096/i.test(model)) { // CODEx: Detect 4k context models.
+      hinted = 4096;
+    } else if (/2048/i.test(model)) { // CODEx: Detect 2k context models.
+      hinted = 2048;
+    }
+  }
+  const candidate = Math.max(hinted, baseOverride || hinted); // CODEx: Choose the larger of hint or override.
+  return clampNumber(candidate, 512, 4096, 1024); // CODEx: Enforce 512–4096 bounds with 1024 fallback.
+} // CODEx
+
+function resolveEmbeddingChannel(options = {}) { // CODEx: Map speakers to embedding bucket, provider, and model.
+  const speaker = typeof options.speaker === 'string' ? options.speaker.toUpperCase() : ''; // CODEx: Normalize speaker identifier.
+  const inferredBucket = speaker === 'B' ? EMBEDDING_BUCKET_KEYS.SAM_B : speaker === 'A' ? EMBEDDING_BUCKET_KEYS.SAM_A : null; // CODEx: Map speaker to bucket.
+  const desiredBucket = normalizeEmbeddingBucket(options.bucketKey ?? inferredBucket ?? EMBEDDING_BUCKET_KEYS.SHARED); // CODEx: Resolve final bucket selection.
+  if (desiredBucket === EMBEDDING_BUCKET_KEYS.SAM_A) { // CODEx: SAM-A specific channel configuration.
+    const provider = config.agentAEmbeddingProvider || defaultConfig.agentAEmbeddingProvider; // CODEx: Prefer configured SAM-A provider.
+    const model = (config.agentAEmbeddingModel || defaultConfig.agentAEmbeddingModel).trim(); // CODEx: Normalize SAM-A model.
+    const contextLength = resolveEmbeddingContextLength(model, config.embeddingContextLength); // CODEx: Derive SAM-A context window.
+    return { bucket: desiredBucket, provider, model, contextLength, useDetection: false, speaker: 'A' }; // CODEx: Return SAM-A channel descriptor.
+  }
+  if (desiredBucket === EMBEDDING_BUCKET_KEYS.SAM_B) { // CODEx: SAM-B specific channel configuration.
+    const provider = config.agentBEmbeddingProvider || defaultConfig.agentBEmbeddingProvider; // CODEx: Prefer configured SAM-B provider.
+    const model = (config.agentBEmbeddingModel || defaultConfig.agentBEmbeddingModel).trim(); // CODEx: Normalize SAM-B model.
+    const contextLength = resolveEmbeddingContextLength(model, config.embeddingContextLength); // CODEx: Derive SAM-B context window.
+    return { bucket: desiredBucket, provider, model, contextLength, useDetection: false, speaker: 'B' }; // CODEx: Return SAM-B channel descriptor.
+  }
+  const model = (config.embeddingModel || defaultConfig.embeddingModel || 'text-embedding-3-large').trim(); // CODEx: Resolve shared embedding model.
+  const contextLength = resolveEmbeddingContextLength(model, config.embeddingContextLength); // CODEx: Derive shared context window.
+  return {
+    bucket: desiredBucket,
+    provider: config.embeddingProviderPreference || defaultConfig.embeddingProviderPreference, // CODEx: Shared provider preference.
+    model,
+    contextLength,
+    useDetection: true,
+    speaker: speaker || null
+  }; // CODEx: Shared embedding channel descriptor.
+} // CODEx
+
+async function warmEmbeddings() { // CODEx: Pre-initialize embedding channels to reduce first-turn latency.
+  if (!isEmbeddingRetrievalEnabled()) { // CODEx: Skip warmup when embeddings disabled.
+    return;
+  }
+  const warmTargets = [ // CODEx: Define arena-specific warmup targets.
+    {
+      name: 'Shared',
+      bucket: EMBEDDING_BUCKET_KEYS.SHARED,
+      speaker: null,
+      provider: config.embeddingProviderPreference || defaultConfig.embeddingProviderPreference,
+      model: (config.embeddingModel || defaultConfig.embeddingModel)
+    },
+    {
+      name: 'SAM-A',
+      bucket: EMBEDDING_BUCKET_KEYS.SAM_A,
+      speaker: 'A',
+      provider: config.agentAEmbeddingProvider || defaultConfig.agentAEmbeddingProvider,
+      model: config.agentAEmbeddingModel || defaultConfig.agentAEmbeddingModel
+    },
+    {
+      name: 'SAM-B',
+      bucket: EMBEDDING_BUCKET_KEYS.SAM_B,
+      speaker: 'B',
+      provider: config.agentBEmbeddingProvider || defaultConfig.agentBEmbeddingProvider,
+      model: config.agentBEmbeddingModel || defaultConfig.agentBEmbeddingModel
+    }
+  ];
+  const tasks = warmTargets.map(async (target) => { // CODEx: Batch warmup requests concurrently.
+    const start = getTimestampMs();
+    try {
+      console.log(`[Warmup] ${target.name} → ${target.provider}`); // CODEx: Emit warmup telemetry.
+      await generateTextEmbedding(`Warmup vector init (${target.model})`, { bucketKey: target.bucket, speaker: target.speaker }); // CODEx: Prime channel embeddings.
+      const duration = Math.round(Math.max(1, getTimestampMs() - start));
+      return { status: 'ok', name: target.name, duration };
+    } catch (error) {
+      console.warn(`[Warmup] ${target.name} failed`, error); // CODEx: Surface warmup failures but continue.
+      return { status: 'error', name: target.name, error: error?.message || String(error) };
+    }
+  });
+  const results = await Promise.allSettled(tasks); // CODEx: Await completion without aborting on errors.
+  const successes = results
+    .map((entry) => (entry.status === 'fulfilled' ? entry.value : entry.reason))
+    .filter((entry) => entry && entry.status === 'ok'); // CODEx: Collect successful warmups.
+  if (successes.length) {
+    const average = successes.reduce((sum, entry) => sum + entry.duration, 0) / successes.length; // CODEx: Compute average latency.
+    const rounded = Math.round(average);
+    console.log('[Perf] avg embed ms', rounded); // CODEx: Report warmup average to console telemetry.
+    console.log('[Perf] avg fetch ms', rounded); // CODEx: Mirror fetch timing metric for diagnostics.
+  }
+} // CODEx
 async function resolveActiveEmbeddingProvider(force = false) { // CODEx: Probe embedding provider based on preference and connectivity.
   const preference = config.embeddingProviderPreference ?? defaultConfig.embeddingProviderPreference; // CODEx: Read preference from config.
   embeddingProviderState.preference = preference; // CODEx: Track preference for status UI.
@@ -1246,6 +1433,11 @@ const elements = {
   embeddingEndpointInput: document.getElementById('embeddingEndpointInput'),
   embeddingApiKeyInput: document.getElementById('embeddingApiKeyInput'),
   embeddingProviderSelect: document.getElementById('embeddingProviderSelect'), // CODEx: Dropdown for provider selection.
+  embeddingContextLength: document.getElementById('embeddingContextLength'), // CODEx: Numeric input for embedding context window.
+  agentAEmbeddingProviderSelect: document.getElementById('agentAEmbeddingProvider'), // CODEx: SAM-A embedding provider select.
+  agentAEmbeddingModelInput: document.getElementById('agentAEmbeddingModel'), // CODEx: SAM-A embedding model input.
+  agentBEmbeddingProviderSelect: document.getElementById('agentBEmbeddingProvider'), // CODEx: SAM-B embedding provider select.
+  agentBEmbeddingModelInput: document.getElementById('agentBEmbeddingModel'), // CODEx: SAM-B embedding model input.
   openRouterPolicyField: document.getElementById('openRouterPolicyField'),
   openRouterPolicyInput: document.getElementById('openRouterPolicyInput'),
   systemPromptInput: document.getElementById('systemPromptInput'),
@@ -1334,6 +1526,7 @@ async function init() {
   bindEvents();
   ensureEmbeddingCacheManifest(); // CODEx: Hydrate embedding cache manifest before retrieval operations.
   await resolveActiveEmbeddingProvider(true); // CODEx: Probe embedding provider at startup for accurate status.
+  void warmEmbeddings(); // CODEx: Pre-warm embedding channels asynchronously.
   primeRamDiskCache();
   await ensurePhasePromptBaseline(); // CODEx: Confirm arena phase prompts are provisioned before debates begin.
   applyDebugSetting();
@@ -1470,6 +1663,36 @@ function loadConfig() {
     config.embeddingProviderPreference = allowedEmbeddingProviders.has(normalizedPreference)
       ? normalizedPreference
       : defaultConfig.embeddingProviderPreference; // CODEx: Default to auto when preference invalid.
+    config.embeddingContextLength = clampNumber(
+      config.embeddingContextLength ?? defaultConfig.embeddingContextLength,
+      512,
+      4096,
+      defaultConfig.embeddingContextLength
+    ); // CODEx: Clamp embedding context window between 512 and 4096 tokens.
+    const rawAgentAProvider = typeof config.agentAEmbeddingProvider === 'string'
+      ? config.agentAEmbeddingProvider.toLowerCase().trim()
+      : '';
+    const normalizedAgentAProvider = rawAgentAProvider === 'ollama'
+      ? EMBEDDING_PROVIDERS.OLLAMA_LOCAL
+      : rawAgentAProvider;
+    config.agentAEmbeddingProvider = allowedEmbeddingProviders.has(normalizedAgentAProvider)
+      ? normalizedAgentAProvider
+      : defaultConfig.agentAEmbeddingProvider; // CODEx: Default SAM-A embedding provider when invalid.
+    const rawAgentBProvider = typeof config.agentBEmbeddingProvider === 'string'
+      ? config.agentBEmbeddingProvider.toLowerCase().trim()
+      : '';
+    const normalizedAgentBProvider = rawAgentBProvider === 'ollama'
+      ? EMBEDDING_PROVIDERS.OLLAMA_LOCAL
+      : rawAgentBProvider;
+    config.agentBEmbeddingProvider = allowedEmbeddingProviders.has(normalizedAgentBProvider)
+      ? normalizedAgentBProvider
+      : defaultConfig.agentBEmbeddingProvider; // CODEx: Default SAM-B embedding provider when invalid.
+    config.agentAEmbeddingModel = typeof config.agentAEmbeddingModel === 'string' && config.agentAEmbeddingModel.trim()
+      ? config.agentAEmbeddingModel.trim()
+      : defaultConfig.agentAEmbeddingModel; // CODEx: Normalize SAM-A embedding model identifier.
+    config.agentBEmbeddingModel = typeof config.agentBEmbeddingModel === 'string' && config.agentBEmbeddingModel.trim()
+      ? config.agentBEmbeddingModel.trim()
+      : defaultConfig.agentBEmbeddingModel; // CODEx: Normalize SAM-B embedding model identifier.
     if (typeof config.dualTurnLimit !== 'number' || config.dualTurnLimit < 0) {
       config.dualTurnLimit = defaultConfig.dualTurnLimit;
     }
@@ -1843,6 +2066,21 @@ function updateConfigInputs() {
   }
   if (elements.embeddingProviderSelect) {
     elements.embeddingProviderSelect.value = config.embeddingProviderPreference ?? defaultConfig.embeddingProviderPreference; // CODEx: Reflect provider preference dropdown.
+  }
+  if (elements.embeddingContextLength) {
+    elements.embeddingContextLength.value = String(config.embeddingContextLength ?? defaultConfig.embeddingContextLength); // CODEx: Sync embedding context length input.
+  }
+  if (elements.agentAEmbeddingProviderSelect) {
+    elements.agentAEmbeddingProviderSelect.value = config.agentAEmbeddingProvider ?? defaultConfig.agentAEmbeddingProvider; // CODEx: Reflect SAM-A embedding provider.
+  }
+  if (elements.agentAEmbeddingModelInput) {
+    elements.agentAEmbeddingModelInput.value = config.agentAEmbeddingModel ?? defaultConfig.agentAEmbeddingModel; // CODEx: Sync SAM-A embedding model text.
+  }
+  if (elements.agentBEmbeddingProviderSelect) {
+    elements.agentBEmbeddingProviderSelect.value = config.agentBEmbeddingProvider ?? defaultConfig.agentBEmbeddingProvider; // CODEx: Reflect SAM-B embedding provider.
+  }
+  if (elements.agentBEmbeddingModelInput) {
+    elements.agentBEmbeddingModelInput.value = config.agentBEmbeddingModel ?? defaultConfig.agentBEmbeddingModel; // CODEx: Sync SAM-B embedding model text.
   }
   if (elements.openRouterPolicyInput) {
     elements.openRouterPolicyInput.value = config.openRouterPolicy ?? '';
@@ -2385,6 +2623,60 @@ function bindEvents() {
       config.embeddingProviderPreference = event.target.value; // CODEx: Persist provider preference selection.
       saveConfig(); // CODEx: Retain selection across sessions.
       void resolveActiveEmbeddingProvider(true); // CODEx: Re-probe provider immediately after preference change.
+    });
+  }
+
+  if (elements.embeddingContextLength) {
+    const applyContextLength = (value) => {
+      config.embeddingContextLength = clampNumber(value, 512, 4096, config.embeddingContextLength ?? defaultConfig.embeddingContextLength); // CODEx: Clamp context length input.
+      elements.embeddingContextLength.value = String(config.embeddingContextLength);
+      saveConfig();
+    };
+    addListener(elements.embeddingContextLength, 'change', (event) => {
+      applyContextLength(event.target.value);
+      clearCachedEmbeddings();
+      void warmEmbeddings(); // CODEx: Re-prime embeddings after context change.
+    });
+    addListener(elements.embeddingContextLength, 'input', (event) => {
+      applyContextLength(event.target.value);
+    });
+  }
+
+  if (elements.agentAEmbeddingProviderSelect) {
+    addListener(elements.agentAEmbeddingProviderSelect, 'change', (event) => {
+      config.agentAEmbeddingProvider = event.target.value;
+      saveConfig();
+      clearCachedEmbeddings();
+      void warmEmbeddings();
+    });
+  }
+
+  if (elements.agentAEmbeddingModelInput) {
+    addListener(elements.agentAEmbeddingModelInput, 'change', (event) => {
+      const value = event.target.value.trim();
+      config.agentAEmbeddingModel = value || defaultConfig.agentAEmbeddingModel;
+      saveConfig();
+      clearCachedEmbeddings();
+      void warmEmbeddings();
+    });
+  }
+
+  if (elements.agentBEmbeddingProviderSelect) {
+    addListener(elements.agentBEmbeddingProviderSelect, 'change', (event) => {
+      config.agentBEmbeddingProvider = event.target.value;
+      saveConfig();
+      clearCachedEmbeddings();
+      void warmEmbeddings();
+    });
+  }
+
+  if (elements.agentBEmbeddingModelInput) {
+    addListener(elements.agentBEmbeddingModelInput, 'change', (event) => {
+      const value = event.target.value.trim();
+      config.agentBEmbeddingModel = value || defaultConfig.agentBEmbeddingModel;
+      saveConfig();
+      clearCachedEmbeddings();
+      void warmEmbeddings();
     });
   }
 
@@ -3860,7 +4152,7 @@ function ingestRagRecords(records, seen = buildFloatingSeenSet()) {
       } else if (Array.isArray(message.embedding)) {
         messageEmbeddingCache.set(normalizedId, message.embedding);
       } else if (message.metadata?.embeddingKey) {
-        const cachedVector = chunkEmbeddingIndex.get(message.metadata.embeddingKey);
+        const cachedVector = resolveCachedEmbedding(EMBEDDING_BUCKET_KEYS.SHARED, message.metadata.embeddingKey); // CODEx: Pull shared chunk embedding when metadata links provided.
         if (Array.isArray(cachedVector)) {
           messageEmbeddingCache.set(normalizedId, cachedVector);
         }
@@ -4047,9 +4339,9 @@ async function loadChunkedRagRecords() {
         const key = `${canonical}#${index}`;
         const vector = Array.isArray(chunk.embedding)
           ? chunk.embedding
-          : chunkEmbeddingIndex.get(key) || null;
+          : resolveCachedEmbedding(EMBEDDING_BUCKET_KEYS.SHARED, key) || null; // CODEx: Rehydrate shared embeddings when RAM disk omits inline vectors.
         if (Array.isArray(vector)) {
-          storeChunkEmbedding(key, vector); // CODEx: Refresh cache footprint when hydrating from RAM disk.
+          storeChunkEmbedding(key, vector, EMBEDDING_BUCKET_KEYS.SHARED); // CODEx: Refresh shared cache footprint when hydrating from RAM disk.
         }
         return {
           id: `${originalPath}-chunk-${index}`,
@@ -6593,11 +6885,12 @@ async function promoteRelevantMemories() {
   addSystemMessage(`Promoted ${memories.length} memory snippet(s) into the floating context.`);
 }
 
-async function retrieveRelevantMemories(query, limit) {
+async function retrieveRelevantMemories(query, limit, options = {}) {
   const normalizedQuery = (query ?? '').trim();
   const tokens = tokenize(normalizedQuery);
   if (!tokens.length) return [];
   const retrievalStarted = getTimestampMs();
+  const channel = resolveEmbeddingChannel({ speaker: options.speaker, bucketKey: options.bucketKey }); // CODEx: Determine retrieval channel for embeddings.
 
   const candidates = new Map();
   for (const entry of floatingMemory) {
@@ -6630,7 +6923,7 @@ async function retrieveRelevantMemories(query, limit) {
   let useEmbeddings = isEmbeddingRetrievalEnabled() && embeddingServiceHealthy; // CODEx: Determine if vector search should run.
   let queryVector = null; // CODEx: Placeholder for query embedding when available.
   if (useEmbeddings) { // CODEx: Only compute embeddings when enabled and healthy.
-    queryVector = await generateQueryEmbedding(normalizedQuery, tokens); // CODEx: Derive query embedding via provider.
+    queryVector = await generateQueryEmbedding(normalizedQuery, tokens, { bucketKey: channel.bucket, speaker: channel.speaker }); // CODEx: Derive query embedding aligned with the active channel.
     if (!Array.isArray(queryVector) || !queryVector.length || !embeddingServiceHealthy) { // CODEx: Disable embeddings when unavailable.
       useEmbeddings = false; // CODEx: Fall back to lexical scoring if embeddings failed.
     } // CODEx
@@ -6641,8 +6934,8 @@ async function retrieveRelevantMemories(query, limit) {
     limit, // CODEx: Honor retrieval limit requested by caller.
     useEmbeddings, // CODEx: Toggle embedding math based on availability.
     queryVector, // CODEx: Provide precomputed query embedding when available.
-    ensureEmbedding: (entry) => ensureEntryEmbedding(entry), // CODEx: Resolve candidate embeddings lazily.
-    lexicalScorer: (entry) => cosineSimilarity(tokens, tokenize(entry.content)), // CODEx: Compute lexical overlap per entry.
+    ensureEmbedding: (entry) => ensureEntryEmbedding(entry, { bucketKey: channel.bucket }), // CODEx: Resolve candidate embeddings within the channel bucket.
+    lexicalScorer: (entry) => cosineSimilarity(tokens, tokenize(entry.content || '')), // CODEx: Compute lexical overlap per entry with null safety.
     similarity: cosineSimilarity, // CODEx: Apply unified cosine similarity for vector comparison.
     debugHook: (error, entry) => console.debug('Embedding match fallback', { error, id: entry.id }) // CODEx: Surface embedding failures for debugging.
   });
@@ -6697,7 +6990,7 @@ function cosineSimilarity(a, b) {
 }
 
 // CODEx: Generate or reuse embeddings for the active query text.
-async function generateQueryEmbedding(query, tokens) {
+async function generateQueryEmbedding(query, tokens, options = {}) {
   if (!isEmbeddingRetrievalEnabled()) {
     return null; // CODEx: Skip embedding generation when disabled by configuration.
   }
@@ -6705,7 +6998,7 @@ async function generateQueryEmbedding(query, tokens) {
     return null; // CODEx: Avoid embedding tiny prompts to conserve provider usage.
   }
   try {
-    return await generateTextEmbedding(query); // CODEx: Delegate to shared embedding resolver.
+    return await generateTextEmbedding(query, options); // CODEx: Delegate to channel-aware embedding resolver.
   } catch (error) {
     console.debug('Embedding query fallback engaged:', error); // CODEx: Surface provider failures for diagnostics.
     return null; // CODEx: Allow lexical scoring path to handle retrieval when embeddings fail.
@@ -6713,16 +7006,18 @@ async function generateQueryEmbedding(query, tokens) {
 }
 
 // CODEx: Ensure a message has an embedding cached for future retrieval.
-async function ensureEntryEmbedding(entry) {
-  const key = normalizeMessageId(entry.id ?? entry.timestamp ?? entry.content);
-  if (messageEmbeddingCache.has(key)) {
-    return messageEmbeddingCache.get(key);
+async function ensureEntryEmbedding(entry, options = {}) {
+  const bucketKey = normalizeEmbeddingBucket(options.bucketKey); // CODEx: Normalize bucket selection for retrieval context.
+  const baseId = normalizeMessageId(entry.id ?? entry.timestamp ?? entry.content); // CODEx: Stable identifier for caching.
+  const cacheKey = `${bucketKey}::${baseId}`; // CODEx: Namespaced cache key per bucket to avoid cross-talk.
+  if (messageEmbeddingCache.has(cacheKey)) { // CODEx: Reuse memoized embedding when present.
+    return messageEmbeddingCache.get(cacheKey); // CODEx: Return cached embedding vector.
   }
   if (entry?.metadata?.embeddingKey) { // CODEx: Attempt to reuse chunk embeddings by key.
     const chunkKey = entry.metadata.embeddingKey; // CODEx: Extract chunk cache identifier.
-    const cachedVector = chunkEmbeddingIndex.get(chunkKey) || loadEmbeddingFromDisk(chunkKey); // CODEx: Merge RAM and disk caches.
+    const cachedVector = resolveCachedEmbedding(bucketKey, chunkKey); // CODEx: Merge RAM and disk caches per bucket.
     if (Array.isArray(cachedVector) && cachedVector.length) { // CODEx: Validate recovered vector.
-      messageEmbeddingCache.set(key, cachedVector); // CODEx: Cache resolved vector for future lookups.
+      messageEmbeddingCache.set(cacheKey, cachedVector); // CODEx: Cache resolved vector for future lookups.
       return cachedVector; // CODEx: Return cached embedding without recomputation.
     }
   }
@@ -6731,16 +7026,16 @@ async function ensureEntryEmbedding(entry) {
     return null;
   }
   try {
-    const vector = await generateTextEmbedding(content);
+    const vector = await generateTextEmbedding(content, { bucketKey }); // CODEx: Generate embeddings scoped to the active bucket.
     if (vector) {
-      messageEmbeddingCache.set(key, vector);
+      messageEmbeddingCache.set(cacheKey, vector); // CODEx: Memoize under bucket-qualified key.
       return vector;
     }
   } catch (error) {
     console.debug('Message embedding fallback:', error);
   }
   const fallbackVector = lexicalEmbedding(content);
-  messageEmbeddingCache.set(key, fallbackVector);
+  messageEmbeddingCache.set(cacheKey, fallbackVector); // CODEx: Cache lexical vector for future lookups.
   return fallbackVector;
 }
 
@@ -6750,9 +7045,9 @@ async function generateTextEmbedding(text, options = {}) {
   if (!trimmed) {
     return null;
   }
-  const model = (config.embeddingModel || defaultConfig.embeddingModel || '').trim() || 'text-embedding-3-large';
-  const cacheKey = `${model}::${hashString(trimmed)}`;
-  if (embeddingCache.has(cacheKey)) {
+  const channel = resolveEmbeddingChannel(options); // CODEx: Determine provider, model, and bucket for this embedding request.
+  const cacheKey = `${channel.bucket}::${channel.model}::${hashString(trimmed)}`; // CODEx: Cache key scoped by bucket and model.
+  if (embeddingCache.has(cacheKey)) { // CODEx: Reuse cached embedding when available.
     return embeddingCache.get(cacheKey);
   }
   let vector = null;
@@ -6760,7 +7055,13 @@ async function generateTextEmbedding(text, options = {}) {
     vector = lexicalEmbedding(trimmed); // CODEx: Produce lexical vector immediately when embeddings disabled.
   } else {
     try {
-      vector = await requestEmbeddingFromProvider(trimmed, model, options); // CODEx: Request embedding from configured provider.
+      vector = await requestEmbeddingFromProvider(trimmed, channel.model, {
+        signal: options.signal,
+        providerOverride: channel.useDetection ? null : channel.provider,
+        baseUrlOverride: options.baseUrlOverride,
+        bucketKey: channel.bucket,
+        contextLength: channel.contextLength
+      }); // CODEx: Request embedding via the resolved channel.
       if (Array.isArray(vector) && vector.length) {
         setEmbeddingServiceHealth(true); // CODEx: Mark embedding service healthy on success.
       } else {
@@ -6865,8 +7166,13 @@ function deriveBaseUrl(endpoint) {
 }
 
 // CODEx: Request embeddings from either local or cloud providers with graceful fallback.
-async function requestEmbeddingFromProvider(text, model, { signal } = {}) {
-  const providerSnapshot = await resolveActiveEmbeddingProvider(false); // CODEx: Determine current provider context.
+async function requestEmbeddingFromProvider(text, model, options = {}) {
+  const {
+    signal,
+    providerOverride = null,
+    baseUrlOverride = '',
+    contextLength
+  } = options; // CODEx: Extend embedding requests with override metadata.
   const apiKey = (config.embeddingApiKey || config.apiKey || '').trim(); // CODEx: Prefer embedding-specific key.
   const policyHeader = (config.openRouterPolicy ?? '').trim(); // CODEx: Data policy header for OpenRouter.
   const embeddingEndpointOverride = (config.embeddingEndpoint ?? '').trim(); // CODEx: Use configured embedding endpoint when provided.
@@ -6889,6 +7195,12 @@ async function requestEmbeddingFromProvider(text, model, { signal } = {}) {
     return fetch(url, next); // CODEx: Delegate to native fetch.
   };
 
+  const overrideSnapshot = providerOverride
+    ? { active: providerOverride, baseUrl: baseUrlOverride || '' }
+    : null; // CODEx: Snapshot for explicit provider overrides.
+  const detectionSnapshot = overrideSnapshot ? null : await resolveActiveEmbeddingProvider(false); // CODEx: Probe environment only when overrides absent.
+  const providerSnapshot = overrideSnapshot ?? detectionSnapshot ?? { active: EMBEDDING_PROVIDERS.OPENAI, baseUrl: '' }; // CODEx: Use detection or fall back to remote defaults.
+
   async function invokeProvider(provider, baseUrl, endpoint) { // CODEx: Shared helper for provider invocation.
     return requestEmbeddingVector({
       provider,
@@ -6899,7 +7211,8 @@ async function requestEmbeddingFromProvider(text, model, { signal } = {}) {
       apiKey,
       signal,
       logger: console,
-      fetchImpl: fetchWithPolicy
+      fetchImpl: fetchWithPolicy,
+      contextLength
     });
   }
 
@@ -6907,7 +7220,7 @@ async function requestEmbeddingFromProvider(text, model, { signal } = {}) {
     const vector = await invokeProvider(
       providerSnapshot.active,
       providerSnapshot.baseUrl,
-      embeddingEndpointOverride
+      overrideSnapshot ? '' : embeddingEndpointOverride
     );
     setEmbeddingServiceHealth(true); // CODEx: Mark provider healthy on success.
     return vector; // CODEx: Return resolved embedding vector.
@@ -6921,9 +7234,11 @@ async function requestEmbeddingFromProvider(text, model, { signal } = {}) {
           '',
           remoteEndpoint
         );
-        embeddingProviderState.active = EMBEDDING_PROVIDERS.OPENAI; // CODEx: Promote remote provider after fallback.
-        embeddingProviderState.baseUrl = '';
-        embeddingProviderState.lastProbe = Date.now();
+        if (detectionSnapshot) { // CODEx: Promote remote provider only when detection provided snapshot.
+          embeddingProviderState.active = EMBEDDING_PROVIDERS.OPENAI; // CODEx: Promote remote provider after fallback.
+          embeddingProviderState.baseUrl = '';
+          embeddingProviderState.lastProbe = Date.now();
+        }
         setEmbeddingServiceHealth(true); // CODEx: Remote success restores healthy status.
         return vector;
       } catch (fallbackError) {
@@ -8883,7 +9198,7 @@ async function generateDualTurn(speaker, seed, options = {}) {
       ? Math.max(0, Math.min(2, config.retrievalCount || 2))
       : config.retrievalCount; // CODEx: Lighten RAG load under reasoning pressure.
     if (retrievalCap !== 0) {
-      retrievedMemories = await retrieveRelevantMemories(retrievalQuery, retrievalCap);
+      retrievedMemories = await retrieveRelevantMemories(retrievalQuery, retrievalCap, { speaker });
     }
     if (reasoningActive && retrievedMemories.length > 2) {
       retrievedMemories = retrievedMemories.slice(0, 2); // CODEx: Cap inserted cues when reasoning.

@@ -316,6 +316,40 @@
           <label for="embeddingApiKeyInput">Embedding API key</label>
           <input id="embeddingApiKeyInput" type="password" autocomplete="off" placeholder="Optional unless required by the service">
         </div>
+        <div class="field">
+          <label for="embeddingContextLength">Embedding context length</label> <!-- // CODEx: Context slider label -->
+          <input id="embeddingContextLength" type="number" min="512" max="4096" step="128" value="1024"> <!-- // CODEx: Numeric input for embedding context window -->
+          <p class="field-hint">Controls the token window sent to embedding models (512–4096). Defaults to 1024.</p> <!-- // CODEx: Context hint copy -->
+        </div>
+        <h3 class="side-card-subheading">Arena embedding channels</h3> <!-- // CODEx: Subheading for per-agent embeddings -->
+        <div class="field">
+          <label for="agentAEmbeddingProvider">SAM-A embedding provider</label> <!-- // CODEx: SAM-A provider label -->
+          <select id="agentAEmbeddingProvider"> <!-- // CODEx: SAM-A provider select -->
+            <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Default SAM-A provider option -->
+            <option value="lmstudio">LM Studio</option> <!-- // CODEx: Alternate local provider -->
+            <option value="openai">OpenAI / remote</option> <!-- // CODEx: Remote fallback -->
+            <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Cloud provider option -->
+          </select>
+          <p class="field-hint">SAM-A (Flowfield advocate) prefers fast local embeddings. Adjust if you host the vectors elsewhere.</p> <!-- // CODEx: SAM-A hint -->
+        </div>
+        <div class="field">
+          <label for="agentAEmbeddingModel">SAM-A embedding model</label> <!-- // CODEx: SAM-A model label -->
+          <input id="agentAEmbeddingModel" type="text" placeholder="mxbai-embed-large"> <!-- // CODEx: SAM-A model input -->
+        </div>
+        <div class="field">
+          <label for="agentBEmbeddingProvider">SAM-B embedding provider</label> <!-- // CODEx: SAM-B provider label -->
+          <select id="agentBEmbeddingProvider"> <!-- // CODEx: SAM-B provider select -->
+            <option value="lmstudio">LM Studio</option> <!-- // CODEx: Default SAM-B provider option -->
+            <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Alternate local provider -->
+            <option value="openai">OpenAI / remote</option> <!-- // CODEx: Remote fallback -->
+            <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Cloud provider option -->
+          </select>
+          <p class="field-hint">SAM-B (skeptic) defaults to LM Studio embeddings. Override for custom vector stores.</p> <!-- // CODEx: SAM-B hint -->
+        </div>
+        <div class="field">
+          <label for="agentBEmbeddingModel">SAM-B embedding model</label> <!-- // CODEx: SAM-B model label -->
+          <input id="agentBEmbeddingModel" type="text" placeholder="text-embedding-3-large"> <!-- // CODEx: SAM-B model input -->
+        </div>
         <div class="field" id="openRouterPolicyField">
           <label for="openRouterPolicyInput">OpenRouter data policy</label>
           <input id="openRouterPolicyInput" type="text" placeholder="e.g. default, opt-out, free">

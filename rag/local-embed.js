@@ -183,7 +183,8 @@ export async function requestEmbeddingVector(options = {}) { // CODEx: Retrieve 
     apiKey = '', // CODEx: Optional API key for remote providers.
     fetchImpl = fetch, // CODEx: Custom fetch injection.
     logger = console, // CODEx: Logging facility.
-    signal // CODEx: AbortSignal for cancellation.
+    signal, // CODEx: AbortSignal for cancellation.
+    contextLength // CODEx: Optional context window hint for providers supporting it.
   } = options; // CODEx: Close destructuring definition.
 
   if (typeof text !== 'string' || !text.trim()) { // CODEx: Validate input text.
@@ -210,6 +211,9 @@ export async function requestEmbeddingVector(options = {}) { // CODEx: Retrieve 
       logger.warn?.('[RAG] Unexpected endpoint → retrying with /v1/embeddings'); // CODEx: Surface correction log.
     } // CODEx
     const payload = { model, input: trimmed }; // CODEx: LM Studio embedding payload.
+    if (Number.isFinite(contextLength) && contextLength > 0) { // CODEx: Include context length hint when available.
+      payload.context_length = Math.round(contextLength);
+    }
     const response = await fetchImpl(target, { ...fetchOptions, body: JSON.stringify(payload) }); // CODEx: Execute LM Studio request.
     if (!response.ok) { // CODEx: Validate response status.
       throw new Error(`LM Studio embedding HTTP ${response.status}`); // CODEx: Propagate failure.
@@ -228,6 +232,9 @@ export async function requestEmbeddingVector(options = {}) { // CODEx: Retrieve 
     const normalizedBase = normalizeBaseUrl(endpointOverride || baseUrl || DEFAULT_OLLAMA_BASE); // CODEx: Derive Ollama base path.
     const primary = `${normalizedBase}/api/embed`; // CODEx: Primary Ollama embedding endpoint.
     const payload = { model, input: trimmed }; // CODEx: Ollama embed payload.
+    if (Number.isFinite(contextLength) && contextLength > 0) { // CODEx: Provide context hint via options.
+      payload.options = { ...(payload.options || {}), num_ctx: Math.round(contextLength) };
+    }
     const response = await fetchImpl(primary, { ...fetchOptions, body: JSON.stringify(payload) }); // CODEx: Execute Ollama request.
     if (!response.ok) { // CODEx: Handle errors.
       throw new Error(`Ollama embedding HTTP ${response.status}`); // CODEx: Propagate failure.
@@ -246,6 +253,9 @@ export async function requestEmbeddingVector(options = {}) { // CODEx: Retrieve 
     const normalizedBase = normalizeBaseUrl(endpointOverride || baseUrl || DEFAULT_OLLAMA_CLOUD_BASE); // CODEx: Derive Ollama cloud base path.
     const target = endpointOverride || `${normalizedBase}/v1/embeddings`; // CODEx: Default Ollama cloud embedding endpoint.
     const payload = { model, input: trimmed }; // CODEx: Ollama cloud payload mirrors OpenAI schema.
+    if (Number.isFinite(contextLength) && contextLength > 0) { // CODEx: Include context hint for cloud embeddings.
+      payload.context_length = Math.round(contextLength);
+    }
     const response = await fetchImpl(target, { ...fetchOptions, body: JSON.stringify(payload) }); // CODEx: Execute Ollama cloud request.
     if (!response.ok) { // CODEx: Validate response status for diagnostics.
       throw new Error(`Ollama cloud embedding HTTP ${response.status}`); // CODEx: Propagate failure upstream.
