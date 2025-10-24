@@ -1,4 +1,7 @@
 const MB = 1024 * 1024;
+const MIN_MEMORY_LIMIT_MB = 50;
+const MAX_MEMORY_LIMIT_MB = 200;
+const MEMORY_LIMIT_STEP_MB = 10;
 
 const DEFAULT_DUAL_SEED = 'Debate whether persistent memories make AI more helpful.';
 
@@ -49,7 +52,7 @@ const CUSTOM_BACKGROUND_OVERLAY =
   'linear-gradient(135deg, rgba(12, 16, 24, 0.52), rgba(28, 32, 46, 0.42))';
 
 const defaultConfig = {
-  memoryLimitMB: 500,
+  memoryLimitMB: 100,
   providerPreset: 'custom',
   retrievalCount: 0,
   autoInjectMemories: false,
@@ -710,6 +713,12 @@ function loadConfig() {
     if (!providerPresetMap.has(config.providerPreset)) {
       config.providerPreset = defaultConfig.providerPreset;
     }
+    config.memoryLimitMB = clampNumber(
+      config.memoryLimitMB ?? defaultConfig.memoryLimitMB,
+      MIN_MEMORY_LIMIT_MB,
+      MAX_MEMORY_LIMIT_MB,
+      defaultConfig.memoryLimitMB
+    );
     if (!config.agentAProviderPreset || (config.agentAProviderPreset !== 'inherit' && !providerPresetMap.has(config.agentAProviderPreset))) {
       config.agentAProviderPreset = defaultConfig.agentAProviderPreset;
     }
@@ -1027,7 +1036,12 @@ function saveConfig() {
 }
 
 function updateConfigInputs() {
-  elements.memorySlider.value = config.memoryLimitMB;
+  if (elements.memorySlider) {
+    elements.memorySlider.min = String(MIN_MEMORY_LIMIT_MB);
+    elements.memorySlider.max = String(MAX_MEMORY_LIMIT_MB);
+    elements.memorySlider.step = String(MEMORY_LIMIT_STEP_MB);
+    elements.memorySlider.value = config.memoryLimitMB;
+  }
   elements.memorySliderValue.innerHTML = `${config.memoryLimitMB}&nbsp;MB`;
   elements.retrievalCount.value = config.retrievalCount;
   if (elements.autoInjectMemories) {
@@ -1444,7 +1458,11 @@ function bindEvents() {
   addListener(elements.clearChatButton, 'click', clearChatWindow);
 
   addListener(elements.memorySlider, 'input', (event) => {
-    const value = Number.parseInt(event.target.value, 10);
+    const rawValue = Number.parseInt(event.target.value, 10);
+    const value = clampNumber(rawValue, MIN_MEMORY_LIMIT_MB, MAX_MEMORY_LIMIT_MB, config.memoryLimitMB);
+    if (String(value) !== event.target.value) {
+      event.target.value = String(value);
+    }
     config.memoryLimitMB = value;
     elements.memorySliderValue.innerHTML = `${value}&nbsp;MB`;
     saveConfig();

@@ -35,7 +35,7 @@
         <span id="modelStatus" class="status-pill status-pill--alert" role="status">Model A: Not connected</span>
         <span id="modelBStatus" class="status-pill status-pill--alert" role="status">Model B: Disabled</span>
         <span id="ragStatusFlag" class="status-pill status-pill--alert" role="status">RAG: Not loaded</span>
-        <span id="memoryStatus" class="status-pill">Floating memory: 0 / 500&nbsp;MB</span>
+        <span id="memoryStatus" class="status-pill">Floating memory: 0 / 100&nbsp;MB</span>
       </div>
       <div class="status-row status-row--actions">
         <span id="systemResourceStatus" class="status-note">Detecting system memory and GPU…</span>
@@ -117,8 +117,8 @@
   <aside id="optionsDrawer" class="side-panel" aria-labelledby="memory-heading" tabindex="-1" aria-hidden="true" inert>
       <section class="side-card">
         <h2 id="memory-heading">Memory &amp; Retrieval</h2>
-        <label class="slider-label" for="memorySlider">Floating memory budget <span id="memorySliderValue">500&nbsp;MB</span></label>
-        <input id="memorySlider" type="range" min="50" max="1024" step="50" value="500">
+        <label class="slider-label" for="memorySlider">Floating memory budget <span id="memorySliderValue">100&nbsp;MB</span></label>
+        <input id="memorySlider" type="range" min="50" max="200" step="10" value="100">
 
         <div class="field">
           <label for="retrievalCount">Memories per retrieval (0 = unlimited)</label>
