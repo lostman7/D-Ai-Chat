@@ -1,14 +1,18 @@
 {
-    "name": "ai-chat-app",
-    "version": "1.0.0",
-    "scripts": {
-      "dev": "vite",
-      "build": "vite build",
-      "lint": "node scripts/lint.js",
-      "replay": "node scripts/replay-phaser.js"
-    },
-    "dependencies": {},
-    "devDependencies": {
-      "vite": "^4.2.0"
-    }
+  "name": "ai-chat-app",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "node scripts/lint.cjs",
+    "replay": "node scripts/replay-phaser.cjs",
+    "standalone": "electron ./standalone.cjs",
+    "standalone:devtools": "STANDALONE_DEVTOOLS=1 electron ./standalone.cjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "vite": "^4.2.0",
+    "electron": "^31.0.0"
   }
+}
