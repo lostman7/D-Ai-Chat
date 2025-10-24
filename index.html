@@ -292,6 +292,16 @@
           <input id="apiKeyInput" type="password" autocomplete="off">
         </div>
         <div class="field">
+          <label for="embeddingProviderSelect">Embedding provider</label> <!-- // CODEx: Provider preference dropdown label -->
+          <select id="embeddingProviderSelect"> <!-- // CODEx: Embedding provider preference control -->
+            <option value="auto">Auto detect</option> <!-- // CODEx: Automatic provider detection option -->
+            <option value="openai">OpenAI / remote</option> <!-- // CODEx: Force remote embedding provider -->
+            <option value="lmstudio">LM Studio</option> <!-- // CODEx: Force LM Studio local embeddings -->
+            <option value="ollama">Ollama</option> <!-- // CODEx: Force Ollama local embeddings -->
+          </select>
+          <p class="field-hint">Auto probes LM Studio or Ollama before falling back to remote embeddings.</p> <!-- // CODEx: Provider hint copy -->
+        </div>
+        <div class="field">
           <label for="embeddingModelInput">Embedding model</label>
           <input id="embeddingModelInput" type="text" placeholder="text-embedding-3-large">
           <p class="field-hint">Controls vector retrieval quality. Leave blank to restore the default.</p>
