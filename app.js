@@ -42,6 +42,20 @@ const STATIC_RAG_MANIFESTS = [
 const SUPPORTED_RAG_TEXT_FORMATS = new Set(['txt', 'text', 'md', 'markdown']);
 const SUPPORTED_RAG_JSON_FORMATS = new Set(['json', 'jsonl']);
 const SUPPORTED_RAG_BINARY_FORMATS = new Set(['pdf']);
+const SUPPORTED_CHUNK_EXTENSIONS = new Set([
+  ...SUPPORTED_RAG_TEXT_FORMATS,
+  ...SUPPORTED_RAG_JSON_FORMATS,
+  ...SUPPORTED_RAG_BINARY_FORMATS
+]);
+const SUPPORTED_CHUNK_CONTENT_TYPES = [
+  'text/plain',
+  'text/markdown',
+  'text/x-markdown',
+  'application/json',
+  'application/ld+json',
+  'application/jsonlines',
+  'application/x-ndjson'
+];
 const PDFJS_CDN_BASE = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67';
 
 const storage = createPersistentStorage();
@@ -170,6 +184,50 @@ function storageClear() {
   }
 }
 
+function getFileExtension(path) {
+  if (typeof path !== 'string') {
+    return '';
+  }
+  const sanitized = path.split(/[?#]/)[0];
+  const lastSlash = sanitized.lastIndexOf('/');
+  const fileName = lastSlash >= 0 ? sanitized.slice(lastSlash + 1) : sanitized;
+  const dotIndex = fileName.lastIndexOf('.');
+  if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
+    return '';
+  }
+  return fileName.slice(dotIndex + 1).toLowerCase();
+}
+
+function isSupportedChunkExtension(extension) {
+  if (!extension) return false;
+  return SUPPORTED_CHUNK_EXTENSIONS.has(extension.toLowerCase());
+}
+
+function isSupportedChunkContentType(contentType) {
+  if (!contentType) return false;
+  const normalized = contentType.split(';')[0].trim().toLowerCase();
+  return SUPPORTED_CHUNK_CONTENT_TYPES.includes(normalized);
+}
+
+function isSupportedChunkablePath(path) {
+  return isSupportedChunkExtension(getFileExtension(path));
+}
+
+function isSupportedChunkableFile(path, contentType) {
+  if (isSupportedChunkablePath(path)) {
+    return true;
+  }
+  if (contentType && isSupportedChunkContentType(contentType)) {
+    return true;
+  }
+  return false;
+}
+
+function filterChunkablePaths(paths) {
+  if (!Array.isArray(paths)) return [];
+  return paths.filter((path) => isSupportedChunkablePath(path));
+}
+
 const DEFAULT_BACKGROUND =
   'radial-gradient(circle at top, rgba(77, 124, 255, 0.15), transparent 55%), ' +
   'radial-gradient(circle at bottom, rgba(60, 64, 198, 0.1), transparent 45%), ' +
@@ -199,7 +257,7 @@ const defaultConfig = {
   ttsVolume: 100,
   agentAName: 'SAM-A',
   agentAPrompt: 'You are SAM-A, an analytical AI researcher who values precision and structure.',
-  agentBEnabled: true,
+  agentBEnabled: false,
   agentBName: 'SAM-B',
   agentBPrompt: 'You are SAM-B, a creative explorer who loves bold ideas and storytelling.',
   agentAProviderPreset: 'inherit',
@@ -212,6 +270,7 @@ const defaultConfig = {
   agentBApiKey: '',
   dualAutoContinue: true,
   dualTurnLimit: 0,
+  dualTurnDelaySeconds: 30,
   dualSeed: DEFAULT_DUAL_SEED,
   reflexEnabled: true,
   reflexInterval: 8,
@@ -516,6 +575,8 @@ const activeDualConnections = {
 };
 let autoContinueTimer;
 let dualAutosaveTimer;
+let dualCountdownTimer;
+let dualCountdownDeadline = null;
 let audioContext;
 let lastTtsErrorAt = 0;
 let userEditedTtsServer = false;
@@ -685,6 +746,7 @@ const elements = {
   exportDualButton: document.getElementById('exportDualButton'),
   dualSeedInput: document.getElementById('dualSeedInput'),
   dualTurnLimit: document.getElementById('dualTurnLimit'),
+  dualTurnDelay: document.getElementById('dualTurnDelay'),
   dualAutoContinue: document.getElementById('dualAutoContinue'),
   reflexToggle: document.getElementById('reflexToggle'),
   reflexInterval: document.getElementById('reflexInterval'),
@@ -700,6 +762,7 @@ const elements = {
   agentAEndpoint: document.getElementById('agentAEndpoint'),
   agentAModel: document.getElementById('agentAModel'),
   agentAApiKey: document.getElementById('agentAApiKey'),
+  arenaPrimaryConfig: document.getElementById('arenaPrimaryConfig'),
   requestTimeout: document.getElementById('requestTimeout'),
   reasoningTimeout: document.getElementById('reasoningTimeout'),
   agentBProviderSelect: document.getElementById('agentBProviderSelect'),
@@ -877,6 +940,12 @@ function loadConfig() {
     if (typeof config.dualTurnLimit !== 'number' || config.dualTurnLimit < 0) {
       config.dualTurnLimit = defaultConfig.dualTurnLimit;
     }
+    config.dualTurnDelaySeconds = clampNumber(
+      config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds,
+      0,
+      600,
+      defaultConfig.dualTurnDelaySeconds
+    );
     const storedSeed = typeof config.dualSeed === 'string' ? config.dualSeed.trim() : '';
     config.dualSeed = storedSeed || DEFAULT_DUAL_SEED;
     const allowedBackgroundSources = new Set(['default', 'url', 'upload']);
@@ -1198,6 +1267,9 @@ function updateConfigInputs() {
   }
   const limitValue = config.dualTurnLimit > 0 ? String(config.dualTurnLimit) : '';
   elements.dualTurnLimit.value = limitValue;
+  if (elements.dualTurnDelay) {
+    elements.dualTurnDelay.value = String(config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds);
+  }
   elements.dualAutoContinue.checked = config.dualAutoContinue;
   if (elements.reflexToggle) {
     elements.reflexToggle.checked = Boolean(config.reflexEnabled);
@@ -1305,11 +1377,21 @@ function applyAgentBEnabledState() {
   if (elements.agentBEnabled) {
     elements.agentBEnabled.checked = enabled;
   }
+  if (elements.arenaPrimaryConfig) {
+    elements.arenaPrimaryConfig.hidden = !enabled;
+    elements.arenaPrimaryConfig.setAttribute('aria-hidden', String(!enabled));
+  }
   if (elements.agentBConfig) {
     elements.agentBConfig.hidden = !enabled;
     elements.agentBConfig.setAttribute('aria-hidden', String(!enabled));
   }
   const toggledFields = [
+    'agentAName',
+    'agentAPrompt',
+    'agentAProviderSelect',
+    'agentAEndpoint',
+    'agentAModel',
+    'agentAApiKey',
     'agentBProviderSelect',
     'agentBEndpoint',
     'agentBModel',
@@ -1322,13 +1404,17 @@ function applyAgentBEnabledState() {
     if (node) {
       if (!enabled) {
         node.disabled = true;
-      } else if (key === 'agentBProviderSelect' || key === 'agentBName' || key === 'agentBPrompt') {
+      } else {
         node.disabled = false;
       }
     }
   }
   if (!enabled && elements.agentBProviderNotes) {
     elements.agentBProviderNotes.textContent = 'Enable Model B to configure a separate connection.';
+  }
+  if (enabled) {
+    updateAgentConnectionInputs('A');
+    updateAgentConnectionInputs('B');
   }
   updateProcessState(
     'modelB',
@@ -1478,6 +1564,7 @@ function clearBackgroundImage() {
 
 function applyBackgroundFromConfig() {
   const body = document.body;
+  const root = document.documentElement;
   if (!body) return;
   const source = config.backgroundSource ?? 'default';
   let backgroundValue = DEFAULT_BACKGROUND;
@@ -1488,6 +1575,9 @@ function applyBackgroundFromConfig() {
   } else if (source === 'url' && config.backgroundUrl) {
     backgroundValue = `${CUSTOM_BACKGROUND_OVERLAY}, url(${config.backgroundUrl}), ${DEFAULT_BACKGROUND}`;
     hasCustom = true;
+  }
+  if (root) {
+    root.style.setProperty('--app-bg', backgroundValue);
   }
   body.style.setProperty('--app-bg', backgroundValue);
   body.dataset.hasCustomBg = hasCustom ? 'true' : 'false';
@@ -1849,6 +1939,18 @@ function bindEvents() {
   addListener(elements.dualAutoContinue, 'change', (event) => {
     config.dualAutoContinue = event.target.checked;
     saveConfig();
+    if (!config.dualAutoContinue) {
+      if (autoContinueTimer) {
+        clearTimeout(autoContinueTimer);
+        autoContinueTimer = undefined;
+      }
+      clearDualCountdownTimer();
+      if (isDualChatRunning && elements.dualStatus) {
+        elements.dualStatus.textContent = 'Auto-continue disabled. Use Step turn to advance.';
+      }
+    } else if (isDualChatRunning) {
+      scheduleNextDualTurn();
+    }
   });
 
   addListener(elements.reflexToggle, 'change', (event) => {
@@ -1891,6 +1993,21 @@ function bindEvents() {
     }
     elements.dualTurnLimit.value = config.dualTurnLimit > 0 ? String(config.dualTurnLimit) : '';
     saveConfig();
+  });
+
+  addListener(elements.dualTurnDelay, 'change', (event) => {
+    const parsed = Number.parseInt(event.target.value, 10);
+    config.dualTurnDelaySeconds = clampNumber(
+      Number.isNaN(parsed) ? defaultConfig.dualTurnDelaySeconds : parsed,
+      0,
+      600,
+      defaultConfig.dualTurnDelaySeconds
+    );
+    elements.dualTurnDelay.value = String(config.dualTurnDelaySeconds);
+    saveConfig();
+    if (config.dualAutoContinue && isDualChatRunning && !modelAInFlight && !modelBInFlight) {
+      scheduleNextDualTurn();
+    }
   });
 
   addListener(elements.agentAName, 'input', (event) => {
@@ -3220,7 +3337,7 @@ async function loadChunkedRagRecords() {
       .map((entry) => (entry && entry.path ? toChunkedPath(resolveRagPath('rag/', entry.path)) : null))
       .filter(Boolean);
 
-    const candidatePaths = dedupePaths([...manifestChunkedPaths, ...chunkedListing]);
+    const candidatePaths = filterChunkablePaths(dedupePaths([...manifestChunkedPaths, ...chunkedListing]));
 
     for (const chunkedPath of candidatePaths) {
       try {
@@ -3264,7 +3381,7 @@ async function loadChunkedRagRecords() {
     for (const { path, data } of listRamDiskChunkedEntries()) {
       const originalPath = typeof data?.originalPath === 'string' ? data.originalPath : fromChunkedPath(path);
       const canonical = canonicalizeOriginalPath(originalPath || path);
-      if (!originalPath || seen.has(canonical)) {
+      if (!originalPath || seen.has(canonical) || !isSupportedChunkablePath(originalPath)) {
         continue;
       }
       const chunkList = Array.isArray(data?.chunks) ? data.chunks : [];
@@ -3658,7 +3775,7 @@ function listRamDiskChunkedEntries() {
   for (const key of keys) {
     const path = key.slice(RAM_DISK_CHUNK_PREFIX.length);
     const data = readRamDiskChunk(path);
-    if (data) {
+    if (data && isSupportedChunkablePath(path)) {
       entries.push({ path, data });
     }
   }
@@ -3671,7 +3788,7 @@ function listRamDiskUnchunkedEntries() {
   for (const key of keys) {
     const path = key.slice(RAM_DISK_UNCHUNKED_PREFIX.length);
     const content = readRamDiskUnchunked(path);
-    if (content !== null) {
+    if (content !== null && isSupportedChunkablePath(path)) {
       entries.push({ path, content });
     }
   }
@@ -3820,6 +3937,9 @@ async function detectUnchunkedFile(originalPath, manifestSize = 0) {
       const response = await fetch(path);
       if (response.ok) {
         const contentType = response.headers.get('content-type') || '';
+        if (!isSupportedChunkableFile(originalPath, contentType)) {
+          continue;
+        }
         const text = await response.text();
         cacheUnchunkedInRam(candidatePaths, text);
         const sizeHeader = Number.parseInt(response.headers.get('content-length') || '', 10);
@@ -3839,6 +3959,9 @@ async function detectUnchunkedFile(originalPath, manifestSize = 0) {
   }
   const ramContent = readRamDiskUnchunked(candidatePaths);
   if (ramContent !== null) {
+    if (!isSupportedChunkableFile(originalPath, null)) {
+      return null;
+    }
     return {
       path: toUnchunkedPath(originalPath),
       originalPath,
@@ -4011,7 +4134,7 @@ async function scanForChunkableFiles() {
       .map((entry) => (entry && entry.path ? resolveRagPath('rag/', entry.path) : null))
       .filter(Boolean);
 
-    const candidatePaths = dedupePaths([...manifestPaths, ...unchunkedListing]);
+    const candidatePaths = filterChunkablePaths(dedupePaths([...manifestPaths, ...unchunkedListing]));
 
     for (const candidate of candidatePaths) {
       const canonicalCandidate = canonicalizeOriginalPath(candidate);
@@ -4053,6 +4176,9 @@ async function scanForChunkableFiles() {
         if (seenChunked.has(descriptorKey) || seenUnchunked.has(descriptorKey)) {
           continue;
         }
+        if (!isSupportedChunkablePath(descriptor.originalPath || descriptor.path)) {
+          continue;
+        }
         chunkerState.unchunkedFiles.push(descriptor);
         seenUnchunked.add(descriptorKey);
         const locationLabel = descriptor.source === 'ram' ? 'RAM disk' : 'workspace';
@@ -4065,7 +4191,7 @@ async function scanForChunkableFiles() {
     for (const { path, data } of listRamDiskChunkedEntries()) {
       const originalPath = typeof data?.originalPath === 'string' ? data.originalPath : fromChunkedPath(path);
       const canonical = canonicalizeOriginalPath(originalPath || path);
-      if (!originalPath || seenChunked.has(canonical)) {
+      if (!originalPath || seenChunked.has(canonical) || !isSupportedChunkablePath(originalPath)) {
         continue;
       }
       const chunks = Array.isArray(data?.chunks) ? data.chunks : [];
@@ -4086,7 +4212,7 @@ async function scanForChunkableFiles() {
 
     for (const { path, content } of listRamDiskUnchunkedEntries()) {
       const canonical = canonicalizeOriginalPath(path);
-      if (!path || seenChunked.has(canonical) || seenUnchunked.has(canonical)) {
+      if (!path || seenChunked.has(canonical) || seenUnchunked.has(canonical) || !isSupportedChunkablePath(path)) {
         continue;
       }
       const descriptor = {
@@ -4139,6 +4265,10 @@ async function chunkAllFiles() {
       try {
         const originalPath = file.originalPath || file.path;
         const displayPath = originalPath || file.path;
+        if (!isSupportedChunkablePath(originalPath || '')) {
+          addSystemMessage(`Skipping ${displayPath}: unsupported file type for chunking.`);
+          continue;
+        }
         addSystemMessage(`Chunking ${displayPath}...`);
         const chunks = await chunkFile(file, chunkerState.chunkSize, chunkerState.chunkOverlap);
         if (Array.isArray(chunks) && chunks.length > 0) {
@@ -6133,6 +6263,7 @@ async function startDualChat() {
   activeDualSeed = seed;
   rotateRagSession(MODE_ARENA);
   resetDualChat();
+  clearDualCountdownTimer();
   activeDualConnections.A = agentAConnection;
   activeDualConnections.B = agentBConnection;
   isDualChatRunning = true;
@@ -6187,6 +6318,7 @@ function stopDualChat() {
     clearTimeout(autoContinueTimer);
     autoContinueTimer = undefined;
   }
+  clearDualCountdownTimer();
   stopDualAutosaveTimer();
   activeDualConnections.A = null;
   activeDualConnections.B = null;
@@ -6225,10 +6357,41 @@ async function advanceDualTurn() {
     stopDualChat();
     return;
   }
+  if (autoContinueTimer) {
+    clearTimeout(autoContinueTimer);
+    autoContinueTimer = undefined;
+  }
+  clearDualCountdownTimer();
   await generateDualTurn(nextDualSpeaker);
   if (config.dualAutoContinue) {
     scheduleNextDualTurn();
   }
+}
+
+function clearDualCountdownTimer() {
+  if (dualCountdownTimer) {
+    clearInterval(dualCountdownTimer);
+    dualCountdownTimer = undefined;
+  }
+  dualCountdownDeadline = null;
+}
+
+function updateDualCountdownStatus() {
+  if (!elements.dualStatus) return;
+  if (!isDualChatRunning || dualCountdownDeadline === null) {
+    if (isDualChatRunning) {
+      elements.dualStatus.textContent = 'Dual chat running…';
+    }
+    return;
+  }
+  const remainingMs = dualCountdownDeadline - Date.now();
+  if (remainingMs <= 0) {
+    elements.dualStatus.textContent = 'Dual chat running…';
+    clearDualCountdownTimer();
+    return;
+  }
+  const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  elements.dualStatus.textContent = `Next turn in ${seconds}s…`;
 }
 
 function scheduleNextDualTurn() {
@@ -6238,9 +6401,33 @@ function scheduleNextDualTurn() {
     stopDualChat();
     return;
   }
+  clearTimeout(autoContinueTimer);
+  clearDualCountdownTimer();
+  const delaySeconds = clampNumber(
+    config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds,
+    0,
+    600,
+    defaultConfig.dualTurnDelaySeconds
+  );
+  const delayMs = Math.max(0, Math.round(delaySeconds * 1000));
+  if (delayMs === 0) {
+    elements.dualStatus.textContent = 'Dual chat running…';
+    autoContinueTimer = setTimeout(() => {
+      autoContinueTimer = undefined;
+      void advanceDualTurn();
+    }, 0);
+    return;
+  }
+  dualCountdownDeadline = Date.now() + delayMs;
+  updateDualCountdownStatus();
+  dualCountdownTimer = setInterval(() => {
+    updateDualCountdownStatus();
+  }, 1000);
   autoContinueTimer = setTimeout(() => {
+    autoContinueTimer = undefined;
+    clearDualCountdownTimer();
     void advanceDualTurn();
-  }, 2000);
+  }, delayMs);
 }
 
 function startDualAutosaveTimer() {
@@ -6413,6 +6600,10 @@ async function generateDualTurn(speaker, seed, options = {}) {
   const partnerName = getAgentDisplayName(partner);
   const persona = getAgentPersona(speaker);
   const connection = activeDualConnections[speaker] ?? getAgentConnection(speaker);
+  clearDualCountdownTimer();
+  if (elements.dualStatus) {
+    elements.dualStatus.textContent = `${speakerName} is thinking…`;
+  }
   if (!connection.endpoint || !connection.model) {
     addSystemMessage(`${speakerName} lost its connection details. Stop and reconfigure before resuming the arena.`);
     stopDualChat();

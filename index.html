@@ -293,35 +293,37 @@
 
         <h3 class="side-card-subheading">Model B (arena partner)</h3>
         <label class="toggle">
-          <input id="agentBEnabled" type="checkbox" checked>
+          <input id="agentBEnabled" type="checkbox">
           <span>Enable Model B for dual debates</span>
         </label>
-        <div class="field">
-          <label for="agentAName">Model A display name</label>
-          <input id="agentAName" type="text" placeholder="SAM-A">
-        </div>
-        <div class="field">
-          <label for="agentAPrompt">Model A arena persona</label>
-          <textarea id="agentAPrompt" rows="3" placeholder="You are SAM-A, an analytical thinker."></textarea>
-        </div>
-        <div class="field">
-          <label for="agentAProviderSelect">Model A preset override</label>
-          <select id="agentAProviderSelect">
-            <option value="inherit">Share Model A settings</option>
-          </select>
-          <p id="agentAProviderNotes" class="field-hint" role="note"></p>
-        </div>
-        <div class="field">
-          <label for="agentAEndpoint">Model A override endpoint</label>
-          <input id="agentAEndpoint" type="url" placeholder="http://localhost:1234/v1/chat/completions">
-        </div>
-        <div class="field">
-          <label for="agentAModel">Model A override name</label>
-          <input id="agentAModel" type="text" placeholder="lmstudio-community/TinyLlama-1.1B-Chat-v1.0">
-        </div>
-        <div class="field">
-          <label for="agentAApiKey">Model A override key</label>
-          <input id="agentAApiKey" type="password" autocomplete="off" placeholder="Optional unless required by the service">
+        <div id="arenaPrimaryConfig" class="arena-primary-config" hidden aria-hidden="true">
+          <div class="field">
+            <label for="agentAName">Model A display name</label>
+            <input id="agentAName" type="text" placeholder="SAM-A">
+          </div>
+          <div class="field">
+            <label for="agentAPrompt">Model A arena persona</label>
+            <textarea id="agentAPrompt" rows="3" placeholder="You are SAM-A, an analytical thinker."></textarea>
+          </div>
+          <div class="field">
+            <label for="agentAProviderSelect">Model A preset override</label>
+            <select id="agentAProviderSelect">
+              <option value="inherit">Share Model A settings</option>
+            </select>
+            <p id="agentAProviderNotes" class="field-hint" role="note"></p>
+          </div>
+          <div class="field">
+            <label for="agentAEndpoint">Model A override endpoint</label>
+            <input id="agentAEndpoint" type="url" placeholder="http://localhost:1234/v1/chat/completions">
+          </div>
+          <div class="field">
+            <label for="agentAModel">Model A override name</label>
+            <input id="agentAModel" type="text" placeholder="lmstudio-community/TinyLlama-1.1B-Chat-v1.0">
+          </div>
+          <div class="field">
+            <label for="agentAApiKey">Model A override key</label>
+            <input id="agentAApiKey" type="password" autocomplete="off" placeholder="Optional unless required by the service">
+          </div>
         </div>
 
         <div class="field field--inline">
@@ -333,7 +335,7 @@
           <input id="reasoningTimeout" type="number" min="30" max="900" value="120">
           <p class="field-hint">Used whenever a model or preset signals extended thinking time.</p>
         </div>
-        <div id="agentBConfig" class="agent-b-config">
+        <div id="agentBConfig" class="agent-b-config" hidden aria-hidden="true">
           <div class="field">
             <label for="agentBName">Model B display name</label>
             <input id="agentBName" type="text" placeholder="SAM-B">
@@ -366,6 +368,11 @@
         <div class="field field--inline">
           <label for="dualTurnLimit">Max turns (0 = unlimited)</label>
           <input id="dualTurnLimit" type="number" min="0" max="50" value="0" placeholder="0">
+        </div>
+        <div class="field field--inline">
+          <label for="dualTurnDelay">Dual turn delay (seconds)</label>
+          <input id="dualTurnDelay" type="number" min="0" max="600" value="30" placeholder="30">
+          <p class="field-hint">Wait this long before auto-starting the partner&apos;s next turn.</p>
         </div>
         <label class="toggle">
           <input id="dualAutoContinue" type="checkbox" checked>
