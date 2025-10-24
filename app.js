@@ -44,6 +44,132 @@ const SUPPORTED_RAG_JSON_FORMATS = new Set(['json', 'jsonl']);
 const SUPPORTED_RAG_BINARY_FORMATS = new Set(['pdf']);
 const PDFJS_CDN_BASE = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67';
 
+const storage = createPersistentStorage();
+
+function createPersistentStorage() {
+  if (typeof window !== 'undefined' && window.standaloneStore) {
+    const bridge = window.standaloneStore;
+    return {
+      getItem(key) {
+        return bridge.getItem(key);
+      },
+      setItem(key, value) {
+        bridge.setItem(key, value);
+      },
+      removeItem(key) {
+        bridge.removeItem(key);
+      },
+      keys() {
+        try {
+          const result = bridge.keys();
+          return Array.isArray(result) ? result : [];
+        } catch (error) {
+          console.warn('Failed to list standalone storage keys:', error);
+          return [];
+        }
+      },
+      clear() {
+        bridge.clear();
+      }
+    };
+  }
+
+  if (typeof window !== 'undefined' && window.localStorage) {
+    return {
+      getItem(key) {
+        return window.localStorage.getItem(key);
+      },
+      setItem(key, value) {
+        window.localStorage.setItem(key, value);
+      },
+      removeItem(key) {
+        window.localStorage.removeItem(key);
+      },
+      keys() {
+        return Object.keys(window.localStorage);
+      },
+      clear() {
+        window.localStorage.clear();
+      }
+    };
+  }
+
+  const memory = new Map();
+  return {
+    getItem(key) {
+      return memory.has(key) ? memory.get(key) : null;
+    },
+    setItem(key, value) {
+      memory.set(key, String(value));
+    },
+    removeItem(key) {
+      memory.delete(key);
+    },
+    keys() {
+      return Array.from(memory.keys());
+    },
+    clear() {
+      memory.clear();
+    }
+  };
+}
+
+function storageGetItem(key) {
+  try {
+    return storage.getItem(key);
+  } catch (error) {
+    console.warn('Failed to read storage key', key, error);
+    return null;
+  }
+}
+
+function storageSetItem(key, value) {
+  try {
+    storage.setItem(key, String(value));
+  } catch (error) {
+    console.warn('Failed to persist storage key', key, error);
+  }
+}
+
+function storageRemoveItem(key) {
+  try {
+    storage.removeItem(key);
+  } catch (error) {
+    console.warn('Failed to remove storage key', key, error);
+  }
+}
+
+function storageKeys() {
+  try {
+    const keys = storage.keys?.();
+    if (Array.isArray(keys)) {
+      return keys;
+    }
+    if (typeof storage.length === 'number' && typeof storage.key === 'function') {
+      const result = [];
+      for (let index = 0; index < storage.length; index += 1) {
+        const key = storage.key(index);
+        if (key) {
+          result.push(key);
+        }
+      }
+      return result;
+    }
+    return [];
+  } catch (error) {
+    console.warn('Failed to enumerate storage keys:', error);
+    return [];
+  }
+}
+
+function storageClear() {
+  try {
+    storage.clear();
+  } catch (error) {
+    console.warn('Failed to clear storage:', error);
+  }
+}
+
 const DEFAULT_BACKGROUND =
   'radial-gradient(circle at top, rgba(77, 124, 255, 0.15), transparent 55%), ' +
   'radial-gradient(circle at bottom, rgba(60, 64, 198, 0.1), transparent 45%), ' +
@@ -452,7 +578,7 @@ function persistManifestToStorage(descriptor, manifest) {
   if (!manifest) return;
   try {
     const key = getManifestStorageKey(descriptor);
-    window.localStorage.setItem(key, JSON.stringify(manifest));
+    storageSetItem(key, JSON.stringify(manifest));
   } catch (error) {
     console.warn('Failed to persist manifest to RAM disk storage:', error);
   }
@@ -461,7 +587,7 @@ function persistManifestToStorage(descriptor, manifest) {
 function readManifestFromStorage(descriptor) {
   try {
     const key = getManifestStorageKey(descriptor);
-    const stored = window.localStorage.getItem(key);
+    const stored = storageGetItem(key);
     if (!stored) return null;
     const parsed = JSON.parse(stored);
     cacheManifestInRam(descriptor, parsed);
@@ -706,7 +832,7 @@ function setActiveMode(mode) {
 
 function loadConfig() {
   try {
-    const stored = window.localStorage.getItem('sam-config');
+    const stored = storageGetItem('sam-config');
     if (stored) {
       config = { ...config, ...JSON.parse(stored) };
     }
@@ -801,7 +927,7 @@ function loadConfig() {
 
 function loadPinnedMessages() {
   try {
-    const stored = window.localStorage.getItem(PINNED_STORAGE_KEY);
+    const stored = storageGetItem(PINNED_STORAGE_KEY);
     if (!stored) {
       pinnedMessageIds = new Set();
       return;
@@ -818,7 +944,7 @@ function loadPinnedMessages() {
 
 function loadRetrievalMetrics() {
   try {
-    const stored = window.localStorage.getItem(RETRIEVAL_STORAGE_KEY);
+    const stored = storageGetItem(RETRIEVAL_STORAGE_KEY);
     if (!stored) {
       retrievalMetrics = {
         A: { total: 0, lastCount: 0, lastAt: null },
@@ -859,7 +985,7 @@ function persistRetrievalMetrics() {
       A: retrievalMetrics.A,
       B: retrievalMetrics.B
     };
-    window.localStorage.setItem(RETRIEVAL_STORAGE_KEY, JSON.stringify(payload));
+    storageSetItem(RETRIEVAL_STORAGE_KEY, JSON.stringify(payload));
   } catch (error) {
     console.error('Failed to persist retrieval metrics:', error);
   }
@@ -911,10 +1037,10 @@ function createRagSessionId(mode) {
 
 function ensureRagSessionId(mode) {
   const key = getRagSessionKey(mode);
-  let sessionId = window.localStorage.getItem(key);
+  let sessionId = storageGetItem(key);
   if (!sessionId) {
     sessionId = createRagSessionId(mode);
-    window.localStorage.setItem(key, sessionId);
+    storageSetItem(key, sessionId);
   }
   if (mode === MODE_CHAT) {
     activeChatSessionId = sessionId;
@@ -927,7 +1053,7 @@ function ensureRagSessionId(mode) {
 function rotateRagSession(mode) {
   const key = getRagSessionKey(mode);
   const sessionId = createRagSessionId(mode);
-  window.localStorage.setItem(key, sessionId);
+  storageSetItem(key, sessionId);
   if (mode === MODE_CHAT) {
     activeChatSessionId = sessionId;
     chatCheckpointBuffer = [];
@@ -1032,7 +1158,7 @@ function getAgentPersona(agent) {
 }
 
 function saveConfig() {
-  window.localStorage.setItem('sam-config', JSON.stringify(config));
+  storageSetItem('sam-config', JSON.stringify(config));
 }
 
 function updateConfigInputs() {
@@ -3440,7 +3566,7 @@ function clearUnchunkedRamEntries(paths) {
     if (!path) continue;
     ramDiskCache.unchunked.delete(path);
     try {
-      window.localStorage.removeItem(`${RAM_DISK_UNCHUNKED_PREFIX}${path}`);
+      storageRemoveItem(`${RAM_DISK_UNCHUNKED_PREFIX}${path}`);
     } catch (error) {
       console.debug(`Failed to remove cached unchunked entry for ${path}:`, error);
     }
@@ -3455,7 +3581,7 @@ function cacheArchiveInRam(path, payload) {
 function persistArchiveToStorage(path, payload) {
   if (!path || !payload) return;
   try {
-    window.localStorage.setItem(`${RAM_DISK_ARCHIVE_PREFIX}${path}`, JSON.stringify(payload));
+    storageSetItem(`${RAM_DISK_ARCHIVE_PREFIX}${path}`, JSON.stringify(payload));
   } catch (error) {
     console.warn(`Failed to persist archive ${path} to RAM disk storage:`, error);
   }
@@ -3467,12 +3593,12 @@ function listRamDiskArchiveEntries() {
     results.set(path, { path, data });
   }
   const prefixLength = RAM_DISK_ARCHIVE_PREFIX.length;
-  for (const key of Object.keys(window.localStorage)) {
+  for (const key of storageKeys()) {
     if (!key.startsWith(RAM_DISK_ARCHIVE_PREFIX)) continue;
     const path = key.slice(prefixLength);
     if (!path || results.has(path)) continue;
     try {
-      const stored = window.localStorage.getItem(key);
+      const stored = storageGetItem(key);
       if (!stored) continue;
       const parsed = JSON.parse(stored);
       if (!parsed) continue;
@@ -3493,7 +3619,7 @@ function readRamDiskChunk(paths) {
     }
   }
   for (const path of candidates) {
-    const stored = window.localStorage.getItem(`${RAM_DISK_CHUNK_PREFIX}${path}`);
+    const stored = storageGetItem(`${RAM_DISK_CHUNK_PREFIX}${path}`);
     if (!stored) continue;
     try {
       const data = JSON.parse(stored);
@@ -3517,7 +3643,7 @@ function readRamDiskUnchunked(paths) {
     }
   }
   for (const path of candidates) {
-    const stored = window.localStorage.getItem(`${RAM_DISK_UNCHUNKED_PREFIX}${path}`);
+    const stored = storageGetItem(`${RAM_DISK_UNCHUNKED_PREFIX}${path}`);
     if (stored !== null && stored !== undefined) {
       cacheUnchunkedInRam(candidates, stored);
       return stored;
@@ -3528,7 +3654,7 @@ function readRamDiskUnchunked(paths) {
 
 function listRamDiskChunkedEntries() {
   const entries = [];
-  const keys = Object.keys(window.localStorage).filter((key) => key.startsWith(RAM_DISK_CHUNK_PREFIX));
+  const keys = storageKeys().filter((key) => key.startsWith(RAM_DISK_CHUNK_PREFIX));
   for (const key of keys) {
     const path = key.slice(RAM_DISK_CHUNK_PREFIX.length);
     const data = readRamDiskChunk(path);
@@ -3541,7 +3667,7 @@ function listRamDiskChunkedEntries() {
 
 function listRamDiskUnchunkedEntries() {
   const entries = [];
-  const keys = Object.keys(window.localStorage).filter((key) => key.startsWith(RAM_DISK_UNCHUNKED_PREFIX));
+  const keys = storageKeys().filter((key) => key.startsWith(RAM_DISK_UNCHUNKED_PREFIX));
   for (const key of keys) {
     const path = key.slice(RAM_DISK_UNCHUNKED_PREFIX.length);
     const content = readRamDiskUnchunked(path);
@@ -3554,11 +3680,11 @@ function listRamDiskUnchunkedEntries() {
 
 function primeRamDiskCache() {
   try {
-    const keys = Object.keys(window.localStorage);
+    const keys = storageKeys();
     for (const key of keys) {
       if (key.startsWith(RAM_DISK_CHUNK_PREFIX)) {
         const path = key.slice(RAM_DISK_CHUNK_PREFIX.length);
-        const stored = window.localStorage.getItem(key);
+        const stored = storageGetItem(key);
         if (!stored) continue;
         try {
           const data = JSON.parse(stored);
@@ -3568,7 +3694,7 @@ function primeRamDiskCache() {
         }
       } else if (key.startsWith(RAM_DISK_UNCHUNKED_PREFIX)) {
         const path = key.slice(RAM_DISK_UNCHUNKED_PREFIX.length);
-        const stored = window.localStorage.getItem(key);
+        const stored = storageGetItem(key);
         if (stored !== null && stored !== undefined) {
           cacheUnchunkedInRam([path], stored);
         }
@@ -4176,7 +4302,7 @@ async function saveChunkedFileToFS(path, data) {
   } catch (error) {
     console.error('Error saving chunked file to FS:', error);
     try {
-      window.localStorage.setItem(`${RAM_DISK_CHUNK_PREFIX}${path}`, JSON.stringify(payloadForCache));
+      storageSetItem(`${RAM_DISK_CHUNK_PREFIX}${path}`, JSON.stringify(payloadForCache));
       cacheChunkedInRam([path, data?.originalPath], payloadForCache);
       console.log(`Fallback: Saved chunked file to localStorage: ${RAM_DISK_CHUNK_PREFIX}${path}`);
     } catch (storageError) {
@@ -4212,7 +4338,7 @@ async function moveToUnchunkedFS(fromPath, originalPath) {
       for (const target of candidatePaths) {
         if (!target) continue;
         try {
-          window.localStorage.setItem(`${RAM_DISK_UNCHUNKED_PREFIX}${target}`, cached);
+          storageSetItem(`${RAM_DISK_UNCHUNKED_PREFIX}${target}`, cached);
         } catch (storageError) {
           console.warn(`Failed to persist unchunked fallback for ${target}:`, storageError);
         }
@@ -4256,7 +4382,7 @@ async function moveToUnchunkedFS(fromPath, originalPath) {
       for (const target of candidatePaths) {
         if (!target) continue;
         try {
-          window.localStorage.setItem(`${RAM_DISK_UNCHUNKED_PREFIX}${target}`, content);
+          storageSetItem(`${RAM_DISK_UNCHUNKED_PREFIX}${target}`, content);
         } catch (storageError) {
           console.warn(`Failed to persist unchunked file to localStorage (${target}):`, storageError);
         }
@@ -4276,10 +4402,10 @@ function clearAllChunks() {
     addSystemMessage('🗑️ Clearing all chunked and unchunked files...');
 
     // Clear localStorage entries
-    const keys = Object.keys(window.localStorage).filter(
+    const keys = storageKeys().filter(
       (key) => key.startsWith(RAM_DISK_CHUNK_PREFIX) || key.startsWith(RAM_DISK_UNCHUNKED_PREFIX)
     );
-    keys.forEach(key => window.localStorage.removeItem(key));
+    keys.forEach(key => storageRemoveItem(key));
 
     // Try to delete files from file system
     const deletePromises = [];
@@ -5125,7 +5251,7 @@ function moveEntryToArchive(entry, { silent = false } = {}) {
 
 function persistPinnedMessages() {
   try {
-    window.localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify(Array.from(pinnedMessageIds)));
+    storageSetItem(PINNED_STORAGE_KEY, JSON.stringify(Array.from(pinnedMessageIds)));
   } catch (error) {
     console.error('Failed to persist pinned messages:', error);
   }

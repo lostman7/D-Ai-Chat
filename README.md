@@ -4,13 +4,13 @@ SAM is a browser-based chat workspace that layers a floating working memory, lon
 
 ## Key Features
 
-- **Memory governance** – Choose a floating-memory budget (50&nbsp;MB – 1&nbsp;GB). When the live buffer overflows, messages are archived to IndexedDB automatically and annotated in the transcript.
+- **Memory governance** – Choose a floating-memory budget (50&nbsp;MB – 200&nbsp;MB). When the live buffer overflows, messages are archived to IndexedDB automatically and annotated in the transcript.
 - **Floating memory workbench** – Inspect what’s currently “on the desk,” pin critical turns so they never get trimmed, manually archive unneeded messages, reload RAG archives on demand, and watch the live counters for recovered snapshots, total footprint, retrieval activity, and the most recent autosave.
 - **Sliding options drawer** – Use the edge handle (‹/›) to pull the configuration hub into view, set memory budgets, swap model providers, and paste API keys without scrolling back to the top of a long transcript.
 - **Global status dock** – A floating header keeps Model A/Model B readiness, floating-memory usage, system RAM/GPU notes, diagnostics, and mode toggles within reach no matter how long the transcript grows.
 - **Workspace chooser** – Land on a lightweight launcher that lets you decide between human chat and the dual-agent arena before any UI loads.
 - **Retrieval-augmented prompting** – Pull relevant memories back into context with a click. A cosine-similarity search runs across both floating and archived logs to assemble reference snippets for the next request.
-- **Configurable model bridge** – Wire up Model A for the main chat and optionally enable a distinct Model B for the arena. Each can inherit curated presets (LM Studio, Ollama, OpenRouter, OpenAI, Groq, Together, Mistral, Perplexity, Fireworks, DeepSeek, xAI, Anthropic, Google) or point at your own endpoint, and everything persists in `localStorage`.
+- **Configurable model bridge** – Wire up Model A for the main chat and optionally enable a distinct Model B for the arena. Each can inherit curated presets (LM Studio, Ollama, OpenRouter, OpenAI, Groq, Together, Mistral, Perplexity, Fireworks, DeepSeek, xAI, Anthropic, Google) or point at your own endpoint, and everything persists in the local storage layer (browser `localStorage` or the standalone shell’s disk-backed store).
 - **Speech in / speech out** – Dictate messages with the built-in browser speech-recognition API (Chrome/WebKit) and auto-speak assistant replies with a curated TTS pipeline (browser voices, Piper, Coqui XTTS, Bark, or ElevenLabs).
 - **AMD-friendly voice presets** – Pick from community-rated speech engines that run well on AMD hardware, set server/voice credentials, and use the **Test voice** button to confirm playback.
 - **Dual-agent arena** – Spin up two personas, prefill the persistent-memory debate seed (or add your own), route each model through different providers if you like, and watch turn-badged exchanges roll just like a normal chat while the SAMs trade unlimited volleys (or step through one at a time).
@@ -54,6 +54,17 @@ The check runs a Node.js syntax verification on `app.js` and ensures the UI cont
 ### Production Preview
 
 You can also double-click `index.html` and run the app straight from disk. Voice input may require `https:` depending on the browser.
+
+### Standalone desktop shell
+
+Prefer an app-like shell that keeps its own storage separate from your browser? Install dependencies and launch the Electron wrapper:
+
+```bash
+npm install
+npm run standalone
+```
+
+The shell loads the local `index.html`, exposes the same UI, and persists configuration/chunk data inside Electron’s `userData` directory. Set `STANDALONE_DEVTOOLS=1` when running the script if you want the developer tools to pop automatically.
 
 ## Using SAM
 
@@ -115,11 +126,11 @@ Pick the ONNX runtime that matches your platform (ROCm for Linux/AMD GPUs, Direc
 - **Floating memory** – Maintained in JavaScript with an approximate byte budget.
 - **Long-term memory** – All turns are persisted in the browser’s IndexedDB (`chatDatabase.messages`). Archived messages are labelled in the UI and remain searchable.
 - **RAG snapshots** – Chat and arena transcripts are mirrored into IndexedDB (`chatDatabase.rag-logs`), every 30-message chunk is checkpointed with a timestamped record, and the arena auto-saves its running debate every two minutes so the retrieval layer and the `rag/` workspace always have fresh logs. On load SAM hydrates the floating buffer with those archived slices before you even send the first prompt, and you can tap **Load RAG archives** in the drawer at any time to pull the latest snapshots and any manifest-listed files under `rag/` (watch the new header pill flip to "RAG: Loaded" when synchronization completes).
-- **Configuration** – Saved in `localStorage` under the `sam-config` key.
-- **Pinned turns** – Stored in `localStorage` under `sam-pinned-messages` so your curated floating context survives reloads.
+- **Configuration** – Saved in persistent storage under the `sam-config` key (browser `localStorage` or the standalone shell’s store).
+- **Pinned turns** – Stored alongside configuration data under `sam-pinned-messages` so your curated floating context survives reloads.
 - **Run logs** – Captured in IndexedDB (`chatDatabase.sam-logs`) and exportable from **Debug & Logs**; downloads land in the repository’s `logs/` folder by default.
 
-> ⚠️ All data stays in your browser. Clearing site data or switching browsers will reset the memories unless you export them first.
+> ⚠️ All data stays on your machine. In the browser, clearing site data or switching browsers resets memories unless you export them first. The standalone shell keeps its state in Electron’s `userData` directory.
 
 See [`rag/README.md`](rag/README.md) for tips on inspecting and reusing the automatically captured RAG bundles.
 
