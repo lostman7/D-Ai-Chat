@@ -1,6 +1,13 @@
 const MB = 1024 * 1024;
+const MIN_MEMORY_LIMIT_MB = 50;
+const MAX_MEMORY_LIMIT_MB = 200;
+const MEMORY_LIMIT_STEP_MB = 10;
 
 const DEFAULT_DUAL_SEED = 'Debate whether persistent memories make AI more helpful.';
+// CODEx: Embedding defaults used for vector-based retrieval fallbacks.
+const EMBEDDING_DEFAULT_DIMENSIONS = 1536;
+const EMBEDDING_HASH_BUCKETS = 512;
+const EMBEDDING_MIN_QUERY_LENGTH = 12;
 
 const MODE_CHOOSER = 'chooser';
 const MODE_CHAT = 'chat';
@@ -16,18 +23,309 @@ const LOG_STORE_NAME = 'sam-logs';
 const LOG_STATUS_TIMEOUT = 4500;
 const LOG_EXPORT_PREFIX = 'sam-log';
 const RETRIEVAL_STORAGE_KEY = 'sam-retrieval-metrics';
+const REFLEX_HISTORY_STORE = 'reflex-history';
 const DEFAULT_CONTEXT_LIMIT = 131072;
 const MAX_CONTEXT_LIMIT = 262144;
 const RAG_ORIGIN_TOKENS = ['rag', 'archive', 'checkpoint', 'long-term'];
 
 const STATIC_RAG_MANIFESTS = [
-  { url: 'rag/manifest.json', basePath: 'rag/', defaultMode: MODE_CHAT, label: 'primary RAG files' },
-  { url: 'rag/archives/manifest.json', basePath: 'rag/archives/', defaultMode: MODE_ARENA, label: 'RAG archives' }
+  {
+    url: 'rag/manifest.json',
+    basePath: 'rag/',
+    defaultMode: MODE_CHAT,
+    label: 'primary RAG files',
+    ramKey: 'rag-manifest'
+  },
+  {
+    url: 'rag/archives/manifest.json',
+    basePath: 'rag/archives/',
+    defaultMode: MODE_ARENA,
+    label: 'RAG archives',
+    ramKey: 'rag-archives-manifest'
+  }
 ];
 const SUPPORTED_RAG_TEXT_FORMATS = new Set(['txt', 'text', 'md', 'markdown']);
 const SUPPORTED_RAG_JSON_FORMATS = new Set(['json', 'jsonl']);
 const SUPPORTED_RAG_BINARY_FORMATS = new Set(['pdf']);
+const SUPPORTED_CHUNK_EXTENSIONS = new Set([
+  ...SUPPORTED_RAG_TEXT_FORMATS,
+  ...SUPPORTED_RAG_JSON_FORMATS,
+  ...SUPPORTED_RAG_BINARY_FORMATS
+]);
+const SUPPORTED_CHUNK_CONTENT_TYPES = [
+  'text/plain',
+  'text/markdown',
+  'text/x-markdown',
+  'application/json',
+  'application/ld+json',
+  'application/jsonlines',
+  'application/x-ndjson'
+];
 const PDFJS_CDN_BASE = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.2.67';
+
+const storage = createPersistentStorage();
+
+function createPersistentStorage() {
+  if (typeof window !== 'undefined' && window.standaloneStore) {
+    const bridge = window.standaloneStore;
+    return {
+      getItem(key) {
+        return bridge.getItem(key);
+      },
+      setItem(key, value) {
+        bridge.setItem(key, value);
+      },
+      removeItem(key) {
+        bridge.removeItem(key);
+      },
+      keys() {
+        try {
+          const result = bridge.keys();
+          return Array.isArray(result) ? result : [];
+        } catch (error) {
+          console.warn('Failed to list standalone storage keys:', error);
+          return [];
+        }
+      },
+      clear() {
+        bridge.clear();
+      }
+    };
+  }
+
+  if (typeof window !== 'undefined' && window.localStorage) {
+    return {
+      getItem(key) {
+        return window.localStorage.getItem(key);
+      },
+      setItem(key, value) {
+        window.localStorage.setItem(key, value);
+      },
+      removeItem(key) {
+        window.localStorage.removeItem(key);
+      },
+      keys() {
+        return Object.keys(window.localStorage);
+      },
+      clear() {
+        window.localStorage.clear();
+      }
+    };
+  }
+
+  const memory = new Map();
+  return {
+    getItem(key) {
+      return memory.has(key) ? memory.get(key) : null;
+    },
+    setItem(key, value) {
+      memory.set(key, String(value));
+    },
+    removeItem(key) {
+      memory.delete(key);
+    },
+    keys() {
+      return Array.from(memory.keys());
+    },
+    clear() {
+      memory.clear();
+    }
+  };
+}
+
+function storageGetItem(key) {
+  try {
+    return storage.getItem(key);
+  } catch (error) {
+    console.warn('Failed to read storage key', key, error);
+    return null;
+  }
+}
+
+function storageSetItem(key, value) {
+  try {
+    storage.setItem(key, String(value));
+  } catch (error) {
+    console.warn('Failed to persist storage key', key, error);
+  }
+}
+
+function storageRemoveItem(key) {
+  try {
+    storage.removeItem(key);
+  } catch (error) {
+    console.warn('Failed to remove storage key', key, error);
+  }
+}
+
+function storageKeys() {
+  try {
+    const keys = storage.keys?.();
+    if (Array.isArray(keys)) {
+      return keys;
+    }
+    if (typeof storage.length === 'number' && typeof storage.key === 'function') {
+      const result = [];
+      for (let index = 0; index < storage.length; index += 1) {
+        const key = storage.key(index);
+        if (key) {
+          result.push(key);
+        }
+      }
+      return result;
+    }
+    return [];
+  } catch (error) {
+    console.warn('Failed to enumerate storage keys:', error);
+    return [];
+  }
+}
+
+function storageClear() {
+  try {
+    storage.clear();
+  } catch (error) {
+    console.warn('Failed to clear storage:', error);
+  }
+}
+
+function getDirectoryPath(path) {
+  if (typeof path !== 'string') {
+    return '';
+  }
+  const sanitized = path.split(/[?#]/)[0];
+  const lastSlash = sanitized.lastIndexOf('/');
+  return lastSlash > 0 ? sanitized.slice(0, lastSlash) : '';
+}
+
+function getFileExtension(path) {
+  if (typeof path !== 'string') {
+    return '';
+  }
+  const sanitized = path.split(/[?#]/)[0];
+  const lastSlash = sanitized.lastIndexOf('/');
+  const fileName = lastSlash >= 0 ? sanitized.slice(lastSlash + 1) : sanitized;
+  const dotIndex = fileName.lastIndexOf('.');
+  if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
+    return '';
+  }
+  return fileName.slice(dotIndex + 1).toLowerCase();
+}
+
+function inferContentTypeFromPath(path) {
+  const extension = getFileExtension(path);
+  if (SUPPORTED_RAG_JSON_FORMATS.has(extension)) {
+    return 'application/json';
+  }
+  if (SUPPORTED_RAG_BINARY_FORMATS.has(extension)) {
+    return 'application/pdf';
+  }
+  return 'text/plain';
+}
+
+function getStandaloneFs() {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  return window.standaloneFs ?? null;
+}
+
+function ensureStandaloneDirectory(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.ensureDir) return false;
+  try {
+    return bridge.ensureDir(path) !== false;
+  } catch (error) {
+    console.warn('Failed to ensure standalone directory', path, error);
+    return false;
+  }
+}
+
+function listStandaloneDirectory(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.listDirectory) return null;
+  try {
+    const entries = bridge.listDirectory(path);
+    return Array.isArray(entries) ? entries : null;
+  } catch (error) {
+    console.warn('Failed to list standalone directory', path, error);
+    return null;
+  }
+}
+
+function readStandaloneFile(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.readFile) return null;
+  try {
+    const result = bridge.readFile(path);
+    if (!result) return null;
+    if (typeof result === 'string') {
+      return { content: result, contentType: inferContentTypeFromPath(path) };
+    }
+    if (typeof result === 'object' && typeof result.content === 'string') {
+      return {
+        content: result.content,
+        contentType: result.contentType || inferContentTypeFromPath(path)
+      };
+    }
+  } catch (error) {
+    console.warn('Failed to read standalone file', path, error);
+  }
+  return null;
+}
+
+function writeStandaloneFile(path, content, options = {}) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.writeFile) return false;
+  try {
+    const payload = typeof content === 'string' ? content : String(content);
+    return bridge.writeFile(path, payload, options) !== false;
+  } catch (error) {
+    console.warn('Failed to write standalone file', path, error);
+    return false;
+  }
+}
+
+function deleteStandaloneFile(path) {
+  const bridge = getStandaloneFs();
+  if (!bridge?.deleteFile) return false;
+  try {
+    return bridge.deleteFile(path) !== false;
+  } catch (error) {
+    console.warn('Failed to delete standalone file', path, error);
+    return false;
+  }
+}
+
+function isSupportedChunkExtension(extension) {
+  if (!extension) return false;
+  return SUPPORTED_CHUNK_EXTENSIONS.has(extension.toLowerCase());
+}
+
+function isSupportedChunkContentType(contentType) {
+  if (!contentType) return false;
+  const normalized = contentType.split(';')[0].trim().toLowerCase();
+  return SUPPORTED_CHUNK_CONTENT_TYPES.includes(normalized);
+}
+
+function isSupportedChunkablePath(path) {
+  return isSupportedChunkExtension(getFileExtension(path));
+}
+
+function isSupportedChunkableFile(path, contentType) {
+  if (isSupportedChunkablePath(path)) {
+    return true;
+  }
+  if (contentType && isSupportedChunkContentType(contentType)) {
+    return true;
+  }
+  return false;
+}
+
+function filterChunkablePaths(paths) {
+  if (!Array.isArray(paths)) return [];
+  return paths.filter((path) => isSupportedChunkablePath(path));
+}
 
 const DEFAULT_BACKGROUND =
   'radial-gradient(circle at top, rgba(77, 124, 255, 0.15), transparent 55%), ' +
@@ -37,16 +335,24 @@ const CUSTOM_BACKGROUND_OVERLAY =
   'linear-gradient(135deg, rgba(12, 16, 24, 0.52), rgba(28, 32, 46, 0.42))';
 
 const defaultConfig = {
-  memoryLimitMB: 500,
+  memoryLimitMB: 100,
   providerPreset: 'custom',
   retrievalCount: 0,
+  reasoningModeEnabled: false,
+  autoInjectMemories: false,
+  requestTimeoutSeconds: 30,
+  reasoningTimeoutSeconds: 300,
   contextTurns: 12,
   endpoint: 'http://localhost:1234/v1/chat/completions',
   model: 'lmstudio-community/Meta-Llama-3-8B-Instruct',
   apiKey: '',
+  openRouterPolicy: '',
   systemPrompt: 'You are SAM, a helpful memory-augmented assistant who reflects on long-term memories when they are relevant.',
   temperature: 0.7,
-  maxResponseTokens: 512,
+  maxResponseTokens: 4500,
+  embeddingModel: 'text-embedding-3-large',
+  embeddingEndpoint: '',
+  embeddingApiKey: '',
   autoSpeak: false,
   ttsPreset: 'browser',
   ttsServerUrl: '',
@@ -55,32 +361,63 @@ const defaultConfig = {
   ttsVolume: 100,
   agentAName: 'SAM-A',
   agentAPrompt: 'You are SAM-A, an analytical AI researcher who values precision and structure.',
-  agentBEnabled: true,
+  agentBEnabled: false,
   agentBName: 'SAM-B',
   agentBPrompt: 'You are SAM-B, a creative explorer who loves bold ideas and storytelling.',
-  agentAProviderPreset: 'inherit',
-  agentAEndpoint: '',
-  agentAModel: '',
-  agentAApiKey: '',
   agentBProviderPreset: 'inherit',
   agentBEndpoint: '',
   agentBModel: '',
   agentBApiKey: '',
   dualAutoContinue: true,
   dualTurnLimit: 0,
+  dualTurnDelaySeconds: 15,
   dualSeed: DEFAULT_DUAL_SEED,
   reflexEnabled: true,
   reflexInterval: 8,
-  entropyWindow: 6,
+  entropyWindow: 5,
   backgroundSource: 'default',
   backgroundImage: '',
   backgroundUrl: '',
   debugEnabled: false
 };
 
+const phases = [
+  { id: 1, title: 'Flow Dynamics', prompt: 'phase1.txt' },
+  { id: 2, title: 'Collapse Engine', prompt: 'phase2.txt' },
+  { id: 3, title: 'Entanglement Node', prompt: 'phase3.txt' }
+];
+
+const PHASE_PROMPT_DIR = 'rag/phase-prompts/';
+const WATCHDOG_MESSAGE_SOURCE = 'sam-standalone-watchdog';
+const WATCHDOG_MESSAGE_TYPE = 'check-arena-memory';
+const WATCHDOG_PRESSURE_THRESHOLD = 0.8;
+const WATCHDOG_ARCHIVE_PERCENT = 0.1;
+const ENTROPY_LOOP_THRESHOLD = 0.8;
+const ENTROPY_EXPLORE_THRESHOLD = 0.3;
+const LOOP_DELAY_SCALE = 0.6;
+const EXPLORE_DELAY_SCALE = 1.4;
+const MIN_DYNAMIC_DELAY_SECONDS = 5;
+const MAX_DYNAMIC_DELAY_SECONDS = 120;
+
 const TEST_TTS_PHRASE = 'This is SAM performing a voice check with persistent memory engaged.';
 const TTS_ERROR_COOLDOWN = 15000;
 const PINNED_STORAGE_KEY = 'sam-pinned-messages';
+const RAM_DISK_CHUNK_PREFIX = 'sam-chunked-';
+const RAM_DISK_UNCHUNKED_PREFIX = 'sam-unchunked-';
+const RAM_DISK_ARCHIVE_PREFIX = 'sam-archive-';
+const RAM_DISK_MANIFEST_PREFIX = 'sam-manifest-';
+const REASONING_MODEL_HINTS = [
+  'reason',
+  'cogito',
+  'sonar',
+  'think',
+  'deepseek-r1',
+  'deepseek_reasoner',
+  'reasoner',
+  'o1',
+  'o3'
+];
+const REASONING_MODEL_REGEX = /reason|think|deep|cogito|solver|analyze/i;
 
 const providerPresets = [
   {
@@ -357,6 +694,8 @@ const activeDualConnections = {
 };
 let autoContinueTimer;
 let dualAutosaveTimer;
+let dualCountdownTimer;
+let dualCountdownDeadline = null;
 let audioContext;
 let lastTtsErrorAt = 0;
 let userEditedTtsServer = false;
@@ -372,6 +711,7 @@ let reflexInFlight = false;
 let lastReflexSummaryAt = null;
 let reflexSummaryCount = 0;
 let currentEntropyScore = 0;
+let lastEntropyState = 'calibrating';
 let deviceMemoryEstimate;
 let gpuRendererInfo;
 let logEntries = [];
@@ -390,8 +730,118 @@ let ragTelemetry = {
   staticFiles: 0,
   staticBytes: 0,
   staticErrors: [],
-  loaded: false
+  loaded: false,
+  lastRetrievalMs: 0
 };
+const ramDiskCache = {
+  chunked: new Map(),
+  unchunked: new Map(),
+  archives: new Map(),
+  manifests: new Map()
+};
+// CODEx: In-memory embedding caches maintain fast retrieval across chat and RAG stores.
+const embeddingCache = new Map();
+const messageEmbeddingCache = new Map();
+const chunkEmbeddingIndex = new Map();
+
+// CODEx: High-resolution clock helper for latency tracking.
+function getTimestampMs() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+// CODEx: Model call metrics inform diagnostics and timeout reporting.
+const modelCallMetrics = {
+  totalMs: 0,
+  count: 0,
+  reasoningTimeouts: 0
+};
+
+// CODEx: Reset embedding caches when the embedding model or endpoint changes.
+function clearCachedEmbeddings() {
+  embeddingCache.clear();
+  messageEmbeddingCache.clear();
+  chunkEmbeddingIndex.clear();
+}
+
+// CODEx: Detect reasoning-focused checkpoints to adjust timeouts and context.
+function isReasoningModelId(modelId, preset) {
+  if (preset?.anthropicFormat) {
+    return true;
+  }
+  const normalized = typeof modelId === 'string' ? modelId.toLowerCase() : '';
+  if (!normalized) {
+    return false;
+  }
+  if (REASONING_MODEL_REGEX.test(normalized)) {
+    return true;
+  }
+  return REASONING_MODEL_HINTS.some((hint) => normalized.includes(hint));
+}
+
+// CODEx: Determine whether reasoning safeguards should be active for the current request.
+function isReasoningModeActive(overrides = {}) {
+  if (overrides.reasoningMode === true) {
+    return true;
+  }
+  if (overrides.reasoningMode === false) {
+    return false;
+  }
+  if (config.reasoningModeEnabled) {
+    return true;
+  }
+  const preset = providerPresetMap.get(overrides.providerPreset ?? config.providerPreset);
+  const model = overrides.model ?? overrides.modelId ?? config.model;
+  return isReasoningModelId(model, preset);
+}
+const phasePromptCache = new Map();
+let activePhaseIndex = 0;
+let activePhaseId = null;
+let pendingPhaseAdvance = false;
+let lastReflexSynthesisSignature = null;
+let lastWatchdogArchiveAt = 0;
+
+function getManifestStorageKey(descriptor) {
+  if (!descriptor) return `${RAM_DISK_MANIFEST_PREFIX}default`;
+  const base = descriptor.ramKey || descriptor.url || 'manifest';
+  return `${RAM_DISK_MANIFEST_PREFIX}${base}`;
+}
+
+function cacheManifestInRam(descriptor, manifest) {
+  if (!descriptor?.url || !manifest) return;
+  ramDiskCache.manifests.set(descriptor.url, manifest);
+}
+
+function readManifestFromRam(descriptor) {
+  if (!descriptor?.url) return null;
+  return ramDiskCache.manifests.get(descriptor.url) || null;
+}
+
+function persistManifestToStorage(descriptor, manifest) {
+  if (!manifest) return;
+  try {
+    const key = getManifestStorageKey(descriptor);
+    storageSetItem(key, JSON.stringify(manifest));
+  } catch (error) {
+    console.warn('Failed to persist manifest to RAM disk storage:', error);
+  }
+}
+
+function readManifestFromStorage(descriptor) {
+  try {
+    const key = getManifestStorageKey(descriptor);
+    const stored = storageGetItem(key);
+    if (!stored) return null;
+    const parsed = JSON.parse(stored);
+    cacheManifestInRam(descriptor, parsed);
+    return parsed;
+  } catch (error) {
+    console.warn('Failed to read manifest from RAM disk storage:', error);
+    return null;
+  }
+}
 let chunkerState = {
   chunkSize: 500,
   chunkOverlap: 50,
@@ -445,6 +895,8 @@ const elements = {
   memorySlider: document.getElementById('memorySlider'),
   memorySliderValue: document.getElementById('memorySliderValue'),
   retrievalCount: document.getElementById('retrievalCount'),
+  reasoningModeToggle: document.getElementById('reasoningModeToggle'),
+  autoInjectMemories: document.getElementById('autoInjectMemories'),
   contextTurns: document.getElementById('contextTurns'),
   exportButton: document.getElementById('exportMemoryButton'),
   floatingMemoryList: document.getElementById('floatingMemoryList'),
@@ -453,9 +905,12 @@ const elements = {
   ragMemoryCount: document.getElementById('ragMemoryCount'),
   ragSnapshotCount: document.getElementById('ragSnapshotCount'),
   ragFootprint: document.getElementById('ragFootprint'),
+  ragCompressionRatio: document.getElementById('ragCompressionRatio'),
   ragImportStatus: document.getElementById('ragImportStatus'),
   refreshFloatingButton: document.getElementById('refreshFloatingButton'),
   loadRagButton: document.getElementById('loadRagButton'),
+  loadChunkDataButton: document.getElementById('loadChunkDataButton'),
+  saveChatArchiveButton: document.getElementById('saveChatArchiveButton'),
   archiveUnpinnedButton: document.getElementById('archiveUnpinnedButton'),
   modelARetrievals: document.getElementById('modelARetrievals'),
   modelBRetrievals: document.getElementById('modelBRetrievals'),
@@ -464,6 +919,11 @@ const elements = {
   providerNotes: document.getElementById('providerNotes'),
   modelInput: document.getElementById('modelInput'),
   apiKeyInput: document.getElementById('apiKeyInput'),
+  embeddingModelInput: document.getElementById('embeddingModelInput'),
+  embeddingEndpointInput: document.getElementById('embeddingEndpointInput'),
+  embeddingApiKeyInput: document.getElementById('embeddingApiKeyInput'),
+  openRouterPolicyField: document.getElementById('openRouterPolicyField'),
+  openRouterPolicyInput: document.getElementById('openRouterPolicyInput'),
   systemPromptInput: document.getElementById('systemPromptInput'),
   temperatureInput: document.getElementById('temperatureInput'),
   maxTokensInput: document.getElementById('maxTokensInput'),
@@ -477,6 +937,7 @@ const elements = {
   exportDualButton: document.getElementById('exportDualButton'),
   dualSeedInput: document.getElementById('dualSeedInput'),
   dualTurnLimit: document.getElementById('dualTurnLimit'),
+  dualTurnDelay: document.getElementById('dualTurnDelay'),
   dualAutoContinue: document.getElementById('dualAutoContinue'),
   reflexToggle: document.getElementById('reflexToggle'),
   reflexInterval: document.getElementById('reflexInterval'),
@@ -484,14 +945,10 @@ const elements = {
   triggerReflexButton: document.getElementById('triggerReflexButton'),
   reflexStatusText: document.getElementById('reflexStatusText'),
   agentAName: document.getElementById('agentAName'),
-  agentAPrompt: document.getElementById('agentAPrompt'),
   agentBName: document.getElementById('agentBName'),
   agentBPrompt: document.getElementById('agentBPrompt'),
-  agentAProviderSelect: document.getElementById('agentAProviderSelect'),
-  agentAProviderNotes: document.getElementById('agentAProviderNotes'),
-  agentAEndpoint: document.getElementById('agentAEndpoint'),
-  agentAModel: document.getElementById('agentAModel'),
-  agentAApiKey: document.getElementById('agentAApiKey'),
+  requestTimeout: document.getElementById('requestTimeout'),
+  reasoningTimeout: document.getElementById('reasoningTimeout'),
   agentBProviderSelect: document.getElementById('agentBProviderSelect'),
   agentBProviderNotes: document.getElementById('agentBProviderNotes'),
   agentBEndpoint: document.getElementById('agentBEndpoint'),
@@ -551,6 +1008,7 @@ async function init() {
   populateArenaProviderSelects();
   populateTtsControls();
   bindEvents();
+  primeRamDiskCache();
   applyDebugSetting();
   updateConfigInputs();
   updateSpeakToggle();
@@ -575,6 +1033,7 @@ async function init() {
   updateChunkerStatus();
   addSystemMessage('SAM is ready. Configure Model A to enable live responses and arena debates.');
   setActiveMode(MODE_CHOOSER);
+  window.addEventListener('message', handleStandaloneWatchdogMessage);
   window.addEventListener('beforeunload', () => {
     void recordLog('shutdown', 'Browser session closed.', { level: 'info', silent: true });
   });
@@ -621,25 +1080,29 @@ function setActiveMode(mode) {
 
 function loadConfig() {
   try {
-    const stored = window.localStorage.getItem('sam-config');
+    const stored = storageGetItem('sam-config');
     if (stored) {
       config = { ...config, ...JSON.parse(stored) };
     }
     if (!providerPresetMap.has(config.providerPreset)) {
       config.providerPreset = defaultConfig.providerPreset;
     }
-    if (!config.agentAProviderPreset || (config.agentAProviderPreset !== 'inherit' && !providerPresetMap.has(config.agentAProviderPreset))) {
-      config.agentAProviderPreset = defaultConfig.agentAProviderPreset;
-    }
+    config.memoryLimitMB = clampNumber(
+      config.memoryLimitMB ?? defaultConfig.memoryLimitMB,
+      MIN_MEMORY_LIMIT_MB,
+      MAX_MEMORY_LIMIT_MB,
+      defaultConfig.memoryLimitMB
+    );
     if (!config.agentBProviderPreset || (config.agentBProviderPreset !== 'inherit' && !providerPresetMap.has(config.agentBProviderPreset))) {
       config.agentBProviderPreset = defaultConfig.agentBProviderPreset;
     }
     if (typeof config.agentBEnabled !== 'boolean') {
       config.agentBEnabled = defaultConfig.agentBEnabled;
     }
-    config.agentAEndpoint = config.agentAEndpoint ?? '';
-    config.agentAModel = config.agentAModel ?? '';
-    config.agentAApiKey = config.agentAApiKey ?? '';
+    delete config.agentAProviderPreset;
+    delete config.agentAEndpoint;
+    delete config.agentAModel;
+    delete config.agentAApiKey;
     config.agentBEndpoint = config.agentBEndpoint ?? '';
     config.agentBModel = config.agentBModel ?? '';
     config.agentBApiKey = config.agentBApiKey ?? '';
@@ -657,9 +1120,27 @@ function loadConfig() {
       defaultConfig.maxResponseTokens
     );
     config.maxResponseTokens = Math.round(clampedMaxTokens);
+    config.reasoningModeEnabled = Boolean(config.reasoningModeEnabled);
+    if (!config.embeddingModel || typeof config.embeddingModel !== 'string') {
+      config.embeddingModel = defaultConfig.embeddingModel;
+    } else {
+      config.embeddingModel = config.embeddingModel.trim();
+    }
+    config.embeddingEndpoint = typeof config.embeddingEndpoint === 'string'
+      ? config.embeddingEndpoint.trim()
+      : '';
+    config.embeddingApiKey = typeof config.embeddingApiKey === 'string'
+      ? config.embeddingApiKey.trim()
+      : '';
     if (typeof config.dualTurnLimit !== 'number' || config.dualTurnLimit < 0) {
       config.dualTurnLimit = defaultConfig.dualTurnLimit;
     }
+    config.dualTurnDelaySeconds = clampNumber(
+      config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds,
+      0,
+      600,
+      defaultConfig.dualTurnDelaySeconds
+    );
     const storedSeed = typeof config.dualSeed === 'string' ? config.dualSeed.trim() : '';
     config.dualSeed = storedSeed || DEFAULT_DUAL_SEED;
     const allowedBackgroundSources = new Set(['default', 'url', 'upload']);
@@ -684,10 +1165,26 @@ function loadConfig() {
     );
     config.entropyWindow = clampNumber(
       config.entropyWindow ?? defaultConfig.entropyWindow,
-      2,
-      50,
+      1,
+      25,
       defaultConfig.entropyWindow
     );
+    config.requestTimeoutSeconds = clampNumber(
+      config.requestTimeoutSeconds ?? defaultConfig.requestTimeoutSeconds,
+      5,
+      600,
+      defaultConfig.requestTimeoutSeconds
+    );
+    const reasoningFallback = Math.max(defaultConfig.reasoningTimeoutSeconds, config.requestTimeoutSeconds);
+    config.reasoningTimeoutSeconds = clampNumber(
+      config.reasoningTimeoutSeconds ?? reasoningFallback,
+      15,
+      900,
+      reasoningFallback
+    );
+    config.reasoningTimeoutSeconds = Math.max(config.reasoningTimeoutSeconds, config.requestTimeoutSeconds);
+    config.autoInjectMemories = Boolean(config.autoInjectMemories);
+    config.openRouterPolicy = (config.openRouterPolicy ?? '').trim();
   } catch (error) {
     console.error('Failed to load config:', error);
   }
@@ -695,7 +1192,7 @@ function loadConfig() {
 
 function loadPinnedMessages() {
   try {
-    const stored = window.localStorage.getItem(PINNED_STORAGE_KEY);
+    const stored = storageGetItem(PINNED_STORAGE_KEY);
     if (!stored) {
       pinnedMessageIds = new Set();
       return;
@@ -712,7 +1209,7 @@ function loadPinnedMessages() {
 
 function loadRetrievalMetrics() {
   try {
-    const stored = window.localStorage.getItem(RETRIEVAL_STORAGE_KEY);
+    const stored = storageGetItem(RETRIEVAL_STORAGE_KEY);
     if (!stored) {
       retrievalMetrics = {
         A: { total: 0, lastCount: 0, lastAt: null },
@@ -753,7 +1250,7 @@ function persistRetrievalMetrics() {
       A: retrievalMetrics.A,
       B: retrievalMetrics.B
     };
-    window.localStorage.setItem(RETRIEVAL_STORAGE_KEY, JSON.stringify(payload));
+    storageSetItem(RETRIEVAL_STORAGE_KEY, JSON.stringify(payload));
   } catch (error) {
     console.error('Failed to persist retrieval metrics:', error);
   }
@@ -805,10 +1302,10 @@ function createRagSessionId(mode) {
 
 function ensureRagSessionId(mode) {
   const key = getRagSessionKey(mode);
-  let sessionId = window.localStorage.getItem(key);
+  let sessionId = storageGetItem(key);
   if (!sessionId) {
     sessionId = createRagSessionId(mode);
-    window.localStorage.setItem(key, sessionId);
+    storageSetItem(key, sessionId);
   }
   if (mode === MODE_CHAT) {
     activeChatSessionId = sessionId;
@@ -821,7 +1318,7 @@ function ensureRagSessionId(mode) {
 function rotateRagSession(mode) {
   const key = getRagSessionKey(mode);
   const sessionId = createRagSessionId(mode);
-  window.localStorage.setItem(key, sessionId);
+  storageSetItem(key, sessionId);
   if (mode === MODE_CHAT) {
     activeChatSessionId = sessionId;
     chatCheckpointBuffer = [];
@@ -854,7 +1351,6 @@ function populateProviderSelect() {
 }
 
 function populateArenaProviderSelects() {
-  populateProviderOptions(elements.agentAProviderSelect, { includeInherit: true });
   populateProviderOptions(elements.agentBProviderSelect, { includeInherit: true });
 }
 
@@ -882,14 +1378,37 @@ function updateProviderNotes() {
   if (preset.requiresKey) {
     parts.push('API key required. Paste it below before saving.');
   }
+  if (preset.id === 'openrouter') {
+    parts.push('Set the data policy below to match your OpenRouter privacy settings.');
+  }
   elements.providerNotes.textContent = parts.filter(Boolean).join(' ');
 }
 
+function applyOpenRouterPolicyVisibility() {
+  const field = elements.openRouterPolicyField;
+  const input = elements.openRouterPolicyInput;
+  if (!field) return;
+  const primaryPreset = config.providerPreset ?? 'custom';
+  const arenaPreset = config.agentBProviderPreset ?? 'inherit';
+  const effectiveArenaPreset = arenaPreset === 'inherit' ? primaryPreset : arenaPreset;
+  const isOpenRouter = primaryPreset === 'openrouter' || effectiveArenaPreset === 'openrouter';
+  field.hidden = !isOpenRouter;
+  field.setAttribute('aria-hidden', String(!isOpenRouter));
+  if (input) {
+    input.disabled = !isOpenRouter;
+  }
+}
+
 function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
-  const prefix = agent === 'A' ? 'agentA' : 'agentB';
+  if (agent === 'A') {
+    return;
+  }
+
+  const prefix = 'agentB';
   if (!presetId || presetId === 'inherit') {
     config[`${prefix}ProviderPreset`] = 'inherit';
     updateAgentConnectionInputs(agent);
+    applyOpenRouterPolicyVisibility();
     saveConfig();
     updateModelConnectionStatus();
     if (!silent) {
@@ -907,6 +1426,7 @@ function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
     config[`${prefix}Model`] = preset.model;
   }
   updateAgentConnectionInputs(agent);
+  applyOpenRouterPolicyVisibility();
   saveConfig();
   updateModelConnectionStatus();
   if (!silent && preset.id !== 'custom') {
@@ -917,22 +1437,51 @@ function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
 }
 
 function getAgentDisplayName(agent) {
-  return agent === 'A' ? config.agentAName || 'SAM-A' : config.agentBName || 'SAM-B';
+  if (agent === 'A') {
+    return config.agentAName || 'SAM-A';
+  }
+  if (agent === 'B') {
+    return config.agentBName || 'SAM-B';
+  }
+  if (agent === 'system') {
+    return 'System';
+  }
+  if (typeof agent === 'string' && agent.trim()) {
+    return agent;
+  }
+  return 'System';
 }
 
 function getAgentPersona(agent) {
-  const raw = agent === 'A' ? config.agentAPrompt : config.agentBPrompt;
-  return raw?.trim() ?? '';
+  if (agent === 'A') {
+    const primary = config.agentAPrompt?.trim();
+    if (primary) {
+      return primary;
+    }
+    return config.systemPrompt?.trim() ?? '';
+  }
+  return config.agentBPrompt?.trim() ?? '';
 }
 
 function saveConfig() {
-  window.localStorage.setItem('sam-config', JSON.stringify(config));
+  storageSetItem('sam-config', JSON.stringify(config));
 }
 
 function updateConfigInputs() {
-  elements.memorySlider.value = config.memoryLimitMB;
+  if (elements.memorySlider) {
+    elements.memorySlider.min = String(MIN_MEMORY_LIMIT_MB);
+    elements.memorySlider.max = String(MAX_MEMORY_LIMIT_MB);
+    elements.memorySlider.step = String(MEMORY_LIMIT_STEP_MB);
+    elements.memorySlider.value = config.memoryLimitMB;
+  }
   elements.memorySliderValue.innerHTML = `${config.memoryLimitMB}&nbsp;MB`;
   elements.retrievalCount.value = config.retrievalCount;
+  if (elements.autoInjectMemories) {
+    elements.autoInjectMemories.checked = Boolean(config.autoInjectMemories);
+  }
+  if (elements.reasoningModeToggle) {
+    elements.reasoningModeToggle.checked = Boolean(config.reasoningModeEnabled);
+  }
   elements.contextTurns.value = config.contextTurns;
   if (elements.providerSelect) {
     elements.providerSelect.value = config.providerPreset ?? defaultConfig.providerPreset;
@@ -940,18 +1489,38 @@ function updateConfigInputs() {
   elements.endpointInput.value = config.endpoint;
   elements.modelInput.value = config.model;
   elements.apiKeyInput.value = config.apiKey;
+  if (elements.embeddingModelInput) {
+    elements.embeddingModelInput.value = config.embeddingModel ?? defaultConfig.embeddingModel;
+  }
+  if (elements.embeddingEndpointInput) {
+    elements.embeddingEndpointInput.value = config.embeddingEndpoint ?? '';
+  }
+  if (elements.embeddingApiKeyInput) {
+    elements.embeddingApiKeyInput.value = config.embeddingApiKey ?? '';
+  }
+  if (elements.openRouterPolicyInput) {
+    elements.openRouterPolicyInput.value = config.openRouterPolicy ?? '';
+  }
+  if (elements.requestTimeout) {
+    elements.requestTimeout.value = config.requestTimeoutSeconds;
+  }
+  if (elements.reasoningTimeout) {
+    elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+  }
   elements.systemPromptInput.value = config.systemPrompt;
   elements.temperatureInput.value = config.temperature;
   if (elements.maxTokensInput) {
     updateMaxTokensCeiling();
   }
-  updateAgentConnectionInputs('A');
   updateAgentConnectionInputs('B');
   if (elements.dualSeedInput) {
     elements.dualSeedInput.value = config.dualSeed ?? DEFAULT_DUAL_SEED;
   }
   const limitValue = config.dualTurnLimit > 0 ? String(config.dualTurnLimit) : '';
   elements.dualTurnLimit.value = limitValue;
+  if (elements.dualTurnDelay) {
+    elements.dualTurnDelay.value = String(config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds);
+  }
   elements.dualAutoContinue.checked = config.dualAutoContinue;
   if (elements.reflexToggle) {
     elements.reflexToggle.checked = Boolean(config.reflexEnabled);
@@ -964,7 +1533,6 @@ function updateConfigInputs() {
   }
   applyAgentBEnabledState();
   elements.agentAName.value = config.agentAName;
-  elements.agentAPrompt.value = config.agentAPrompt;
   elements.agentBName.value = config.agentBName;
   elements.agentBPrompt.value = config.agentBPrompt;
   if (elements.ttsPresetSelect) {
@@ -986,6 +1554,7 @@ function updateConfigInputs() {
     elements.debugToggle.checked = Boolean(config.debugEnabled);
   }
   updateProviderNotes();
+  applyOpenRouterPolicyVisibility();
   updateTtsPresetDetails();
   updateTtsVolumeLabel();
   if (elements.backgroundUrlInput) {
@@ -996,11 +1565,16 @@ function updateConfigInputs() {
 }
 
 function updateAgentConnectionInputs(agent) {
-  const prefix = agent === 'A' ? 'agentA' : 'agentB';
-  const providerSelect = elements[`${prefix}ProviderSelect`];
-  const endpointInput = elements[`${prefix}Endpoint`];
-  const modelInput = elements[`${prefix}Model`];
-  const apiKeyInput = elements[`${prefix}ApiKey`];
+  if (agent === 'A') {
+    updateArenaProviderNotes('A', getAgentConnection('A'));
+    return;
+  }
+
+  const prefix = 'agentB';
+  const providerSelect = elements.agentBProviderSelect;
+  const endpointInput = elements.agentBEndpoint;
+  const modelInput = elements.agentBModel;
+  const apiKeyInput = elements.agentBApiKey;
   const providerKey = config[`${prefix}ProviderPreset`] ?? 'inherit';
   const connection = getAgentConnection(agent);
 
@@ -1008,7 +1582,7 @@ function updateAgentConnectionInputs(agent) {
     providerSelect.value = providerKey;
   }
 
-  if (agent === 'B' && !config.agentBEnabled) {
+  if (!config.agentBEnabled) {
     if (providerSelect) providerSelect.disabled = true;
     if (endpointInput) endpointInput.disabled = true;
     if (modelInput) modelInput.disabled = true;
@@ -1076,13 +1650,16 @@ function applyAgentBEnabledState() {
     if (node) {
       if (!enabled) {
         node.disabled = true;
-      } else if (key === 'agentBProviderSelect' || key === 'agentBName' || key === 'agentBPrompt') {
+      } else {
         node.disabled = false;
       }
     }
   }
   if (!enabled && elements.agentBProviderNotes) {
     elements.agentBProviderNotes.textContent = 'Enable Model B to configure a separate connection.';
+  }
+  if (enabled) {
+    updateAgentConnectionInputs('B');
   }
   updateProcessState(
     'modelB',
@@ -1093,14 +1670,12 @@ function applyAgentBEnabledState() {
 }
 
 function updateArenaProviderNotes(agent, connection = getAgentConnection(agent)) {
-  const notesElement = agent === 'A' ? elements.agentAProviderNotes : elements.agentBProviderNotes;
+  if (agent === 'A') return;
+  const notesElement = elements.agentBProviderNotes;
   if (!notesElement) return;
   if (connection.inherits) {
     const baseLabel = connection.providerLabel || 'Custom';
-    notesElement.textContent =
-      agent === 'A'
-        ? `Using the primary Model A connection (${baseLabel}).`
-        : `Sharing Model A settings (${baseLabel}).`;
+    notesElement.textContent = `Sharing Model A settings (${baseLabel}).`;
     return;
   }
   const parts = [connection.providerLabel];
@@ -1114,23 +1689,34 @@ function updateArenaProviderNotes(agent, connection = getAgentConnection(agent))
 }
 
 function getAgentConnection(agent) {
-  const prefix = agent === 'A' ? 'agentA' : 'agentB';
-  const agentPresetId = config[`${prefix}ProviderPreset`] ?? 'inherit';
-  const inherits = agentPresetId === 'inherit';
   const basePreset = providerPresetMap.get(config.providerPreset) ?? providerPresetMap.get('custom');
+
+  if (agent === 'A') {
+    return {
+      endpoint: config.endpoint,
+      model: config.model,
+      apiKey: config.apiKey,
+      temperature: config.temperature,
+      maxTokens: config.maxResponseTokens,
+      providerPreset: basePreset?.id ?? 'custom',
+      providerLabel: basePreset ? `${basePreset.label} (main)` : 'Custom',
+      presetDescription: basePreset?.description ?? '',
+      requiresKey: Boolean(basePreset?.requiresKey),
+      inherits: false,
+      agentPresetId: basePreset?.id ?? 'custom',
+      openRouterPolicy: config.openRouterPolicy
+    };
+  }
+
+  const agentPresetId = config.agentBProviderPreset ?? 'inherit';
+  const inherits = agentPresetId === 'inherit';
   const preset = inherits
     ? basePreset
     : providerPresetMap.get(agentPresetId) ?? providerPresetMap.get('custom');
 
-  const endpoint = inherits
-    ? config.endpoint
-    : config[`${prefix}Endpoint`] || preset?.endpoint || '';
-  const model = inherits
-    ? config.model
-    : config[`${prefix}Model`] || preset?.model || '';
-  const apiKey = inherits
-    ? config.apiKey
-    : config[`${prefix}ApiKey`] || '';
+  const endpoint = inherits ? config.endpoint : config.agentBEndpoint || preset?.endpoint || '';
+  const model = inherits ? config.model : config.agentBModel || preset?.model || '';
+  const apiKey = inherits ? config.apiKey : config.agentBApiKey || '';
 
   return {
     endpoint,
@@ -1143,7 +1729,8 @@ function getAgentConnection(agent) {
     presetDescription: preset?.description ?? '',
     requiresKey: Boolean(preset?.requiresKey),
     inherits,
-    agentPresetId
+    agentPresetId,
+    openRouterPolicy: config.openRouterPolicy
   };
 }
 
@@ -1232,6 +1819,7 @@ function clearBackgroundImage() {
 
 function applyBackgroundFromConfig() {
   const body = document.body;
+  const root = document.documentElement;
   if (!body) return;
   const source = config.backgroundSource ?? 'default';
   let backgroundValue = DEFAULT_BACKGROUND;
@@ -1242,6 +1830,9 @@ function applyBackgroundFromConfig() {
   } else if (source === 'url' && config.backgroundUrl) {
     backgroundValue = `${CUSTOM_BACKGROUND_OVERLAY}, url(${config.backgroundUrl}), ${DEFAULT_BACKGROUND}`;
     hasCustom = true;
+  }
+  if (root) {
+    root.style.setProperty('--app-bg', backgroundValue);
   }
   body.style.setProperty('--app-bg', backgroundValue);
   body.dataset.hasCustomBg = hasCustom ? 'true' : 'false';
@@ -1338,7 +1929,11 @@ function bindEvents() {
   addListener(elements.clearChatButton, 'click', clearChatWindow);
 
   addListener(elements.memorySlider, 'input', (event) => {
-    const value = Number.parseInt(event.target.value, 10);
+    const rawValue = Number.parseInt(event.target.value, 10);
+    const value = clampNumber(rawValue, MIN_MEMORY_LIMIT_MB, MAX_MEMORY_LIMIT_MB, config.memoryLimitMB);
+    if (String(value) !== event.target.value) {
+      event.target.value = String(value);
+    }
     config.memoryLimitMB = value;
     elements.memorySliderValue.innerHTML = `${value}&nbsp;MB`;
     saveConfig();
@@ -1356,6 +1951,18 @@ function bindEvents() {
     saveConfig();
   });
 
+  addListener(elements.reasoningModeToggle, 'change', (event) => {
+    config.reasoningModeEnabled = event.target.checked;
+    saveConfig();
+    updateMemoryStatus();
+  });
+
+  addListener(elements.autoInjectMemories, 'change', (event) => {
+    config.autoInjectMemories = event.target.checked;
+    saveConfig();
+    updateRagStatusDisplay();
+  });
+
   addListener(elements.contextTurns, 'change', (event) => {
     config.contextTurns = clampNumber(event.target.value, 2, 40, config.contextTurns);
     elements.contextTurns.value = config.contextTurns;
@@ -1364,10 +1971,6 @@ function bindEvents() {
 
   addListener(elements.providerSelect, 'change', (event) => {
     applyProviderPreset(event.target.value, { silent: false });
-  });
-
-  addListener(elements.agentAProviderSelect, 'change', (event) => {
-    applyArenaProviderPreset('A', event.target.value);
   });
 
   addListener(elements.agentBProviderSelect, 'change', (event) => {
@@ -1384,34 +1987,89 @@ function bindEvents() {
 
   addListener(elements.endpointInput, 'input', (event) => {
     config.endpoint = event.target.value.trim();
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
   });
 
   addListener(elements.modelInput, 'input', (event) => {
     config.model = event.target.value.trim();
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
   });
 
   addListener(elements.apiKeyInput, 'input', (event) => {
     config.apiKey = event.target.value;
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
   });
 
-  addListener(elements.agentAEndpoint, 'input', (event) => {
-    config.agentAEndpoint = event.target.value.trim();
+  if (elements.embeddingModelInput) {
+    addListener(elements.embeddingModelInput, 'change', (event) => {
+      config.embeddingModel = event.target.value.trim() || defaultConfig.embeddingModel;
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
+  if (elements.embeddingEndpointInput) {
+    addListener(elements.embeddingEndpointInput, 'input', (event) => {
+      config.embeddingEndpoint = event.target.value.trim();
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
+  if (elements.embeddingApiKeyInput) {
+    addListener(elements.embeddingApiKeyInput, 'input', (event) => {
+      config.embeddingApiKey = event.target.value.trim();
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
+  if (elements.openRouterPolicyInput) {
+    addListener(elements.openRouterPolicyInput, 'input', (event) => {
+      config.openRouterPolicy = event.target.value.trim();
+      saveConfig();
+    });
+  }
+
+  addListener(elements.requestTimeout, 'change', (event) => {
+    config.requestTimeoutSeconds = clampNumber(event.target.value, 5, 600, config.requestTimeoutSeconds);
+    elements.requestTimeout.value = config.requestTimeoutSeconds;
+    if (config.reasoningTimeoutSeconds < config.requestTimeoutSeconds) {
+      config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
+      if (elements.reasoningTimeout) {
+        elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+      }
+    }
     saveConfig();
   });
 
-  addListener(elements.agentAModel, 'input', (event) => {
-    config.agentAModel = event.target.value.trim();
+  addListener(elements.requestTimeout, 'input', (event) => {
+    config.requestTimeoutSeconds = clampNumber(event.target.value, 5, 600, config.requestTimeoutSeconds);
+    elements.requestTimeout.value = config.requestTimeoutSeconds;
+    if (config.reasoningTimeoutSeconds < config.requestTimeoutSeconds) {
+      config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
+      if (elements.reasoningTimeout) {
+        elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+      }
+    }
     saveConfig();
   });
 
-  addListener(elements.agentAApiKey, 'input', (event) => {
-    config.agentAApiKey = event.target.value;
+  addListener(elements.reasoningTimeout, 'change', (event) => {
+    config.reasoningTimeoutSeconds = clampNumber(event.target.value, 15, 900, config.reasoningTimeoutSeconds);
+    if (config.reasoningTimeoutSeconds < config.requestTimeoutSeconds) {
+      config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
+    }
+    elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+    saveConfig();
+  });
+
+  addListener(elements.reasoningTimeout, 'input', (event) => {
+    config.reasoningTimeoutSeconds = clampNumber(event.target.value, 15, 900, config.reasoningTimeoutSeconds);
+    if (config.reasoningTimeoutSeconds < config.requestTimeoutSeconds) {
+      config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
+    }
+    elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
     saveConfig();
   });
 
@@ -1516,6 +2174,14 @@ function bindEvents() {
     void manualRagReload();
   });
 
+  addListener(elements.loadChunkDataButton, 'click', () => {
+    void manualChunkReload();
+  });
+
+  addListener(elements.saveChatArchiveButton, 'click', () => {
+    void saveChatTranscriptToArchive();
+  });
+
   addListener(elements.archiveUnpinnedButton, 'click', () => {
     archiveUnpinnedFloatingMemory();
   });
@@ -1543,6 +2209,18 @@ function bindEvents() {
   addListener(elements.dualAutoContinue, 'change', (event) => {
     config.dualAutoContinue = event.target.checked;
     saveConfig();
+    if (!config.dualAutoContinue) {
+      if (autoContinueTimer) {
+        clearTimeout(autoContinueTimer);
+        autoContinueTimer = undefined;
+      }
+      clearDualCountdownTimer();
+      if (isDualChatRunning && elements.dualStatus) {
+        elements.dualStatus.textContent = 'Auto-continue disabled. Use Step turn to advance.';
+      }
+    } else if (isDualChatRunning) {
+      scheduleNextDualTurn();
+    }
   });
 
   addListener(elements.reflexToggle, 'change', (event) => {
@@ -1560,7 +2238,7 @@ function bindEvents() {
 
   addListener(elements.entropyWindow, 'change', (event) => {
     const value = Number.parseInt(event.target.value, 10);
-    config.entropyWindow = clampNumber(value, 2, 50, defaultConfig.entropyWindow);
+    config.entropyWindow = clampNumber(value, 1, 25, defaultConfig.entropyWindow);
     event.target.value = String(config.entropyWindow);
     saveConfig();
     updateEntropyMeter();
@@ -1587,13 +2265,23 @@ function bindEvents() {
     saveConfig();
   });
 
-  addListener(elements.agentAName, 'input', (event) => {
-    config.agentAName = event.target.value.trim();
+  addListener(elements.dualTurnDelay, 'change', (event) => {
+    const parsed = Number.parseInt(event.target.value, 10);
+    config.dualTurnDelaySeconds = clampNumber(
+      Number.isNaN(parsed) ? defaultConfig.dualTurnDelaySeconds : parsed,
+      0,
+      600,
+      defaultConfig.dualTurnDelaySeconds
+    );
+    elements.dualTurnDelay.value = String(config.dualTurnDelaySeconds);
     saveConfig();
+    if (config.dualAutoContinue && isDualChatRunning && !modelAInFlight && !modelBInFlight) {
+      scheduleNextDualTurn();
+    }
   });
 
-  addListener(elements.agentAPrompt, 'input', (event) => {
-    config.agentAPrompt = event.target.value;
+  addListener(elements.agentAName, 'input', (event) => {
+    config.agentAName = event.target.value.trim();
     saveConfig();
   });
 
@@ -1690,6 +2378,11 @@ function bindEvents() {
   addListener(elements.chunkSizeInput, 'change', (event) => {
     chunkerState.chunkSize = clampNumber(event.target.value, 100, 2000, 500);
     event.target.value = String(chunkerState.chunkSize);
+    const adaptiveOverlap = Math.max(0, Math.round(chunkerState.chunkSize * 0.15));
+    chunkerState.chunkOverlap = adaptiveOverlap;
+    if (elements.chunkOverlapInput) {
+      elements.chunkOverlapInput.value = String(adaptiveOverlap);
+    }
   });
 
   addListener(elements.chunkOverlapInput, 'change', (event) => {
@@ -2059,6 +2752,9 @@ async function initDatabase() {
       if (!database.objectStoreNames.contains(LOG_STORE_NAME)) {
         database.createObjectStore(LOG_STORE_NAME, { keyPath: 'id' });
       }
+      if (!database.objectStoreNames.contains(REFLEX_HISTORY_STORE)) {
+        database.createObjectStore(REFLEX_HISTORY_STORE, { keyPath: 'id', autoIncrement: true });
+      }
     };
 
     request.onsuccess = (event) => {
@@ -2381,23 +3077,53 @@ async function fetchStaticRagRecords() {
     }
   }
 
+  const archiveEntries = listRamDiskArchiveEntries();
+  for (const { path, data } of archiveEntries) {
+    if (!path || !data) continue;
+    const entry = data.entry || {};
+    const content = typeof data.content === 'string' ? data.content : '';
+    const mode = entry.mode || MODE_CHAT;
+    const origin = entry.origin || 'rag-archive';
+    const role = entry.role || 'archive';
+    const label = entry.label || path.replace(/^rag\//, '');
+    const recordSlug = slugify(entry.id || path) || `archive-${Date.now()}`;
+    const recordId = entry.id || `ram-archive-${recordSlug}`;
+    const timestamp = normalizeTimestamp(entry.timestamp ?? data.savedAt ?? Date.now());
+    const message = {
+      id: `${recordId}-entry`,
+      role,
+      content,
+      timestamp,
+      origin,
+      mode,
+      pinned: Boolean(entry.pinned)
+    };
+    const bytes = content ? new Blob([content]).size : estimateMessagesSize([message]);
+    records.push({ id: recordId, label, mode, origin, messages: [message], bytes });
+    filesLoaded += 1;
+    bytesLoaded += bytes;
+  }
+
   return { records, filesLoaded, bytesLoaded, errors };
 }
 
 async function fetchRagManifest(descriptor) {
+  if (!descriptor?.url) return null;
   try {
     const response = await fetch(descriptor.url, { cache: 'no-store' });
-    if (!response.ok) {
-      if (response.status !== 404) {
-        console.warn(`RAG manifest ${descriptor.url} returned ${response.status}`);
-      }
-      return null;
+    if (response.ok) {
+      const manifest = await response.json();
+      cacheManifestInRam(descriptor, manifest);
+      persistManifestToStorage(descriptor, manifest);
+      return manifest;
     }
-    return await response.json();
+    if (response.status !== 404) {
+      console.warn(`RAG manifest ${descriptor.url} returned ${response.status}`);
+    }
   } catch (error) {
     console.warn('Unable to fetch RAG manifest', descriptor.url, error);
-    return null;
   }
+  return readManifestFromRam(descriptor) || readManifestFromStorage(descriptor);
 }
 
 function normalizeRagManifestEntries(manifest) {
@@ -2711,6 +3437,9 @@ function coerceExternalMessage(raw, defaults = {}) {
   if (raw.metadata && !message.metadata) {
     message.metadata = raw.metadata;
   }
+  if (Array.isArray(raw.embedding)) {
+    message.embedding = raw.embedding;
+  }
   return message;
 }
 
@@ -2724,9 +3453,65 @@ function slugify(value) {
     .replace(/^-+|-+$/g, '');
 }
 
+function buildFloatingSeenSet() {
+  const seen = new Set();
+  for (const item of floatingMemory) {
+    const id = normalizeMessageId(item.id ?? item.timestamp);
+    if (id) {
+      seen.add(id);
+    }
+  }
+  return seen;
+}
+
+function ingestRagRecords(records, seen = buildFloatingSeenSet()) {
+  let added = 0;
+  if (!Array.isArray(records)) {
+    return { added, seen };
+  }
+  for (const record of records) {
+    if (!record || !Array.isArray(record.messages)) continue;
+    for (const message of record.messages) {
+      const entry = coerceExternalMessage(message, {
+        baseId: record.id,
+        role: message.role || record.role || (record.mode === MODE_ARENA ? 'arena' : 'memory'),
+        origin: message.origin || record.origin || 'rag-indexed',
+        mode: message.mode || record.mode || MODE_CHAT,
+        pinned: message.pinned,
+        timestamp: message.timestamp
+      });
+      if (!entry || !entry.content) continue;
+      const normalizedId = normalizeMessageId(entry.id ?? entry.timestamp);
+      if (seen.has(normalizedId)) continue;
+      if (entry.pinned) {
+        pinnedMessageIds.add(normalizedId);
+      }
+      if (Array.isArray(entry.embedding)) {
+        messageEmbeddingCache.set(normalizedId, entry.embedding);
+        delete entry.embedding;
+      } else if (Array.isArray(message.embedding)) {
+        messageEmbeddingCache.set(normalizedId, message.embedding);
+      } else if (message.metadata?.embeddingKey) {
+        const cachedVector = chunkEmbeddingIndex.get(message.metadata.embeddingKey);
+        if (Array.isArray(cachedVector)) {
+          messageEmbeddingCache.set(normalizedId, cachedVector);
+        }
+      }
+      floatingMemory.push(entry);
+      seen.add(normalizedId);
+      added += 1;
+    }
+  }
+  if (added > 0) {
+    trimFloatingMemory();
+    persistPinnedMessages();
+  }
+  return { added, seen };
+}
+
 async function hydrateFloatingMemoryFromRag() {
   try {
-    const seen = new Set(floatingMemory.map((item) => normalizeMessageId(item.id ?? item.timestamp)));
+    const seen = buildFloatingSeenSet();
     const [indexedRecords, staticBundle, chunkedRecords] = await Promise.all([
       db
         ? getAllRagRecords().catch((error) => {
@@ -2781,34 +3566,7 @@ async function hydrateFloatingMemoryFromRag() {
       return;
     }
 
-    let added = 0;
-    for (const record of combinedRecords) {
-      if (!record || !Array.isArray(record.messages)) continue;
-      for (const message of record.messages) {
-        const entry = coerceExternalMessage(message, {
-          baseId: record.id,
-          role: message.role || record.role || (record.mode === MODE_ARENA ? 'arena' : 'memory'),
-          origin: message.origin || record.origin || 'rag-indexed',
-          mode: message.mode || record.mode || MODE_CHAT,
-          pinned: message.pinned,
-          timestamp: message.timestamp
-        });
-        if (!entry || !entry.content) continue;
-        const normalizedId = normalizeMessageId(entry.id ?? entry.timestamp);
-        if (seen.has(normalizedId)) continue;
-        if (entry.pinned) {
-          pinnedMessageIds.add(normalizedId);
-        }
-        floatingMemory.push(entry);
-        seen.add(normalizedId);
-        added += 1;
-      }
-    }
-
-    if (added > 0) {
-      trimFloatingMemory();
-      persistPinnedMessages();
-    }
+    const { added } = ingestRagRecords(combinedRecords, seen);
 
     ragTelemetry.lastLoad = Date.now();
     ragTelemetry.lastLoadCount = added;
@@ -2850,86 +3608,103 @@ async function hydrateFloatingMemoryFromRag() {
 async function loadChunkedRagRecords() {
   const records = [];
   try {
-    // First, try to load from actual file system in rag/chunked/
-    try {
-      const manifestResponse = await fetch('rag/manifest.json');
-      if (manifestResponse.ok) {
-        const manifest = await manifestResponse.json();
-        const files = manifest.files || [];
+    const seen = new Set();
 
-        for (const fileEntry of files) {
-          const chunkedPath = `rag/chunked/${fileEntry.path}`;
-          try {
-            const chunkedResponse = await fetch(chunkedPath);
-            if (chunkedResponse.ok) {
-              const data = await chunkedResponse.json();
-              if (data && Array.isArray(data.chunks) && data.chunks.length > 0) {
-                const messages = data.chunks.map((chunk, index) => ({
-                  id: `${data.originalPath}-chunk-${index}`,
-                  role: 'archive',
-                  content: chunk.content,
-                  timestamp: Date.now() + index, // Ensure unique timestamps
-                  origin: 'rag-chunked',
-                  mode: MODE_CHAT,
-                  pinned: false
-                }));
+    const [manifest, chunkedListing] = await Promise.all([
+      fetchRagManifest(STATIC_RAG_MANIFESTS[0]).catch((error) => {
+        console.warn('Could not load RAG manifest for chunked files:', error);
+        void recordLog('error', `Could not load RAG manifest for chunked files: ${error.message}`, { level: 'error' });
+        return null;
+      }),
+      listRagDirectoryEntries('rag/chunked/')
+    ]);
 
-                records.push({
-                  id: data.originalPath,
-                  label: `Chunked: ${data.originalPath}`,
-                  mode: MODE_CHAT,
-                  origin: 'rag-chunked',
-                  messages: messages,
-                  bytes: estimateMessagesSize(messages)
-                });
-                addSystemMessage(`✓ Loaded chunked file: ${fileEntry.path} (${data.chunks.length} chunks)`);
-              }
-            }
-          } catch (fileError) {
-            console.warn(`Could not load chunked file ${chunkedPath}:`, fileError);
-            void recordLog('error', `Could not load chunked file ${chunkedPath}: ${fileError.message}`, { level: 'error' });
-          }
+    const manifestEntries = normalizeRagManifestEntries(manifest);
+    const manifestChunkedPaths = manifestEntries
+      .map((entry) => (entry && entry.path ? toChunkedPath(resolveRagPath('rag/', entry.path)) : null))
+      .filter(Boolean);
+
+    const candidatePaths = filterChunkablePaths(dedupePaths([...manifestChunkedPaths, ...chunkedListing]));
+
+    for (const chunkedPath of candidatePaths) {
+      try {
+        const result = await loadChunkedFileData(chunkedPath, fromChunkedPath(chunkedPath));
+        const chunkList = result?.data?.chunks;
+        if (!Array.isArray(chunkList) || chunkList.length === 0) {
+          continue;
         }
+        const originalPath = result?.data?.originalPath || fromChunkedPath(chunkedPath);
+        const canonical = canonicalizeOriginalPath(originalPath || chunkedPath);
+        if (seen.has(canonical)) {
+          continue;
+        }
+        const messages = chunkList.map((chunk, index) => ({
+          id: `${originalPath}-chunk-${index}`,
+          role: 'archive',
+          content: chunk.content,
+          timestamp: Date.now() + index,
+          origin: 'rag-chunked',
+          mode: MODE_CHAT,
+          pinned: false
+        }));
+        const labelSuffix = result.source === 'ram' ? ' (RAM disk)' : '';
+        records.push({
+          id: originalPath,
+          label: `Chunked: ${originalPath}${labelSuffix}`,
+          mode: MODE_CHAT,
+          origin: 'rag-chunked',
+          messages,
+          bytes: estimateMessagesSize(messages)
+        });
+        seen.add(canonical);
+        const locationLabel = result.source === 'ram' ? 'RAM disk' : 'workspace';
+        addSystemMessage(`✓ Loaded chunked file: ${originalPath.replace(/^rag\//, '')} (${chunkList.length} chunks, ${locationLabel})`);
+      } catch (fileError) {
+        console.warn(`Could not load chunked file ${chunkedPath}:`, fileError);
+        void recordLog('error', `Could not load chunked file ${chunkedPath}: ${fileError.message}`, { level: 'error' });
       }
-    } catch (manifestError) {
-      console.warn('Could not load RAG manifest for chunked files:', manifestError);
-      void recordLog('error', `Could not load RAG manifest for chunked files: ${manifestError.message}`, { level: 'error' });
     }
 
-    // Fallback: load from localStorage
-    const keys = Object.keys(window.localStorage).filter(key => key.startsWith('sam-chunked-'));
-
-    for (const key of keys) {
-      try {
-        const data = JSON.parse(window.localStorage.getItem(key));
-        if (data && Array.isArray(data.chunks) && data.chunks.length > 0) {
-          // Skip if we already loaded this from file system
-          const alreadyLoaded = records.some(record => record.id === data.originalPath);
-          if (alreadyLoaded) continue;
-
-          const messages = data.chunks.map((chunk, index) => ({
-            id: `${data.originalPath}-chunk-${index}`,
-            role: 'archive',
-            content: chunk.content,
-            timestamp: Date.now() + index, // Ensure unique timestamps
-            origin: 'rag-chunked',
-            mode: MODE_CHAT,
-            pinned: false
-          }));
-
-          records.push({
-            id: data.originalPath,
-            label: `Chunked: ${data.originalPath} (localStorage)`,
-            mode: MODE_CHAT,
-            origin: 'rag-chunked',
-            messages: messages,
-            bytes: estimateMessagesSize(messages)
-          });
-        }
-      } catch (error) {
-        console.warn(`Failed to load chunked record ${key}:`, error);
-        void recordLog('error', `Failed to load chunked record ${key}: ${error.message}`, { level: 'error' });
+    for (const { path, data } of listRamDiskChunkedEntries()) {
+      const originalPath = typeof data?.originalPath === 'string' ? data.originalPath : fromChunkedPath(path);
+      const canonical = canonicalizeOriginalPath(originalPath || path);
+      if (!originalPath || seen.has(canonical) || !isSupportedChunkablePath(originalPath)) {
+        continue;
       }
+      const chunkList = Array.isArray(data?.chunks) ? data.chunks : [];
+      if (!chunkList.length) {
+        continue;
+      }
+      const messages = chunkList.map((chunk, index) => {
+        const key = `${canonical}#${index}`;
+        const vector = Array.isArray(chunk.embedding)
+          ? chunk.embedding
+          : chunkEmbeddingIndex.get(key) || null;
+        if (Array.isArray(vector)) {
+          chunkEmbeddingIndex.set(key, vector);
+        }
+        return {
+          id: `${originalPath}-chunk-${index}`,
+          role: 'archive',
+          content: chunk.content,
+          timestamp: Date.now() + index,
+          origin: 'rag-chunked',
+          mode: MODE_CHAT,
+          pinned: false,
+          embedding: vector,
+          metadata: { embeddingKey: key }
+        };
+      });
+
+      records.push({
+        id: originalPath,
+        label: `Chunked: ${originalPath} (RAM disk)`,
+        mode: MODE_CHAT,
+        origin: 'rag-chunked',
+        messages,
+        bytes: estimateMessagesSize(messages)
+      });
+      seen.add(canonical);
     }
   } catch (error) {
     console.error('Error loading chunked RAG records:', error);
@@ -2954,6 +3729,701 @@ async function manualRagReload() {
   }
 }
 
+async function manualChunkReload() {
+  try {
+    const seen = buildFloatingSeenSet();
+    const chunkedRecords = await loadChunkedRagRecords();
+    if (!Array.isArray(chunkedRecords) || chunkedRecords.length === 0) {
+      addSystemMessage('No chunked files found to load into floating memory.');
+      return;
+    }
+    const priorRagCount = countRagMemories();
+    const { added } = ingestRagRecords(chunkedRecords, seen);
+    const totalBytes = chunkedRecords.reduce((total, record) => total + (record.bytes || 0), 0);
+    ragTelemetry.lastLoad = Date.now();
+    ragTelemetry.lastLoadCount = added;
+    ragTelemetry.lastLoadRecords = chunkedRecords.length;
+    ragTelemetry.lastLoadBytes = totalBytes;
+    ragTelemetry.staticFiles = 0;
+    ragTelemetry.staticBytes = 0;
+    ragTelemetry.staticErrors = [];
+    if (chunkedRecords.length > 0) {
+      ragTelemetry.loaded = true;
+    }
+    renderFloatingMemoryWorkbench();
+    updateMemoryStatus();
+    updateRagStatusDisplay();
+
+    if (added > 0) {
+      const memoryLabel = added === 1 ? 'memory snippet' : 'memory snippets';
+      const fileLabel = chunkedRecords.length === 1 ? 'chunked file' : 'chunked files';
+      addSystemMessage(`Loaded ${added} ${memoryLabel} from ${chunkedRecords.length} ${fileLabel} into floating memory.`);
+    } else if (priorRagCount === countRagMemories()) {
+      addSystemMessage('Chunked files were already present in floating memory.');
+    } else {
+      addSystemMessage('Checked chunked files. No new memories were added.');
+    }
+  } catch (error) {
+    console.error('Failed to load chunked memories', error);
+    addSystemMessage('Failed to load chunked memories. Check the debug console for details.');
+    void recordLog('error', `Failed to load chunked memories: ${error.message}`, { level: 'error' });
+  }
+}
+
+async function saveChatTranscriptToArchive() {
+  try {
+    const messages = await getAllMessages();
+    if (!Array.isArray(messages) || messages.length === 0) {
+      addSystemMessage('No chat messages available to archive yet.');
+      return;
+    }
+
+    const sorted = [...messages].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    const markdown = formatChatTranscriptMarkdown(sorted);
+    const now = new Date();
+    const iso = now.toISOString();
+    const slug = iso.replace(/[:.]/g, '-');
+    const fileName = `chat-${slug}.md`;
+    const archivePath = `rag/archives/${fileName}`;
+    const label = `Chat ${iso.slice(0, 16).replace('T', ' ')}`;
+    const manifestEntry = {
+      id: `chat-${slug}`,
+      label,
+      path: fileName,
+      mode: MODE_CHAT,
+      role: 'archive',
+      format: 'md',
+      timestamp: iso
+    };
+    const archivePayload = {
+      content: markdown,
+      entry: manifestEntry,
+      savedAt: iso,
+      messageCount: sorted.length
+    };
+
+    cacheArchiveInRam(archivePath, archivePayload);
+
+    let saveLocation = 'workspace';
+    try {
+      const response = await fetch(archivePath, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'text/markdown' },
+        body: markdown
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+    } catch (error) {
+      saveLocation = 'ram';
+      persistArchiveToStorage(archivePath, archivePayload);
+      console.warn('Failed to write chat archive to disk, using RAM disk fallback:', error);
+    }
+
+    const manifestLocation = await upsertArchiveManifest(manifestEntry);
+    if (manifestLocation === 'ram') {
+      saveLocation = 'ram';
+    }
+
+    ragTelemetry.lastSave = Date.now();
+    ragTelemetry.lastSaveMode = MODE_CHAT;
+    ragTelemetry.loaded = true;
+    updateRagStatusDisplay();
+
+    const locationLabel = saveLocation === 'ram' ? 'RAM disk' : 'workspace';
+    addSystemMessage(`Saved chat transcript to ${archivePath} (${locationLabel}).`);
+  } catch (error) {
+    console.error('Failed to save chat transcript', error);
+    addSystemMessage(`Failed to save chat transcript: ${error.message}`);
+    void recordLog('error', `Failed to save chat transcript: ${error.message}`, { level: 'error' });
+  }
+}
+
+function formatChatTranscriptMarkdown(messages) {
+  const lines = ['# Chat transcript', '', `Saved ${new Date().toLocaleString()}`, ''];
+  for (const message of messages) {
+    const timestamp = new Date(normalizeTimestamp(message.timestamp ?? Date.now())).toISOString();
+    const role = (message.role || 'unknown').toUpperCase();
+    const turn = message.turnNumber ? ` (turn ${message.turnNumber})` : '';
+    lines.push(`## ${role}${turn}`);
+    lines.push(`*${timestamp}*`);
+    lines.push('');
+    lines.push(message.content || '');
+    lines.push('');
+  }
+  return lines.join('\n').trim();
+}
+
+async function upsertArchiveManifest(entry) {
+  if (!entry) return 'unknown';
+  const descriptor = STATIC_RAG_MANIFESTS.find((item) => item.url === 'rag/archives/manifest.json');
+  if (!descriptor) return 'unknown';
+  const existing = (await fetchRagManifest(descriptor)) || { entries: [] };
+  const currentEntries = normalizeRagManifestEntries(existing);
+  const nextEntries = currentEntries.filter((item) => {
+    if (!item) return false;
+    const itemPath = item.path || item.file || item.source;
+    if (itemPath && itemPath === entry.path) {
+      return false;
+    }
+    if (item.id && item.id === entry.id) {
+      return false;
+    }
+    return true;
+  });
+  nextEntries.push(entry);
+  const payload = { entries: nextEntries };
+  cacheManifestInRam(descriptor, payload);
+
+  try {
+    const response = await fetch(descriptor.url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload, null, 2)
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return 'workspace';
+  } catch (error) {
+    console.warn('Failed to update archive manifest on disk:', error);
+    persistManifestToStorage(descriptor, payload);
+    return 'ram';
+  }
+}
+
+function toChunkedPath(originalPath) {
+  if (typeof originalPath !== 'string' || !originalPath) {
+    return '';
+  }
+  const normalized = originalPath.replace(/\\/g, '/');
+  if (normalized.startsWith('rag/chunked/')) {
+    return normalized;
+  }
+  if (normalized.startsWith('rag/unchunked/')) {
+    return `rag/chunked/${normalized.slice('rag/unchunked/'.length)}`;
+  }
+  if (normalized.startsWith('rag/')) {
+    return `rag/chunked/${normalized.slice('rag/'.length)}`;
+  }
+  return `rag/chunked/${normalized.replace(/^\//, '')}`;
+}
+
+function fromChunkedPath(chunkedPath) {
+  if (typeof chunkedPath !== 'string' || !chunkedPath) {
+    return '';
+  }
+  const normalized = chunkedPath.replace(/\\/g, '/');
+  if (normalized.startsWith('rag/chunked/')) {
+    return `rag/unchunked/${normalized.slice('rag/chunked/'.length)}`;
+  }
+  return normalized;
+}
+
+function toUnchunkedPath(originalPath) {
+  if (typeof originalPath !== 'string' || !originalPath) {
+    return '';
+  }
+  const normalized = originalPath.replace(/\\/g, '/');
+  if (normalized.startsWith('rag/unchunked/')) {
+    return normalized;
+  }
+  if (normalized.startsWith('rag/chunked/')) {
+    return `rag/unchunked/${normalized.slice('rag/chunked/'.length)}`;
+  }
+  if (normalized.startsWith('rag/')) {
+    return `rag/unchunked/${normalized.slice('rag/'.length)}`;
+  }
+  return `rag/unchunked/${normalized.replace(/^\//, '')}`;
+}
+
+function canonicalizeOriginalPath(path) {
+  if (typeof path !== 'string' || !path) {
+    return '';
+  }
+  return toUnchunkedPath(path);
+}
+
+function dedupePaths(paths) {
+  return Array.from(new Set((Array.isArray(paths) ? paths : [paths]).filter(Boolean)));
+}
+
+function cacheChunkedInRam(paths, data) {
+  if (!data) return;
+  const targets = new Set(dedupePaths(paths));
+  if (data && typeof data.originalPath === 'string') {
+    targets.add(data.originalPath);
+    targets.add(toChunkedPath(data.originalPath));
+  }
+  if (data && typeof data.chunkedPath === 'string') {
+    targets.add(data.chunkedPath);
+  }
+  for (const path of targets) {
+    if (path) {
+      ramDiskCache.chunked.set(path, data);
+    }
+  }
+}
+
+function cacheUnchunkedInRam(paths, content) {
+  if (typeof content !== 'string') return;
+  const targets = dedupePaths(paths);
+  for (const path of targets) {
+    if (path) {
+      ramDiskCache.unchunked.set(path, content);
+    }
+  }
+}
+
+function clearUnchunkedRamEntries(paths) {
+  const targets = dedupePaths(paths);
+  for (const path of targets) {
+    if (!path) continue;
+    ramDiskCache.unchunked.delete(path);
+    try {
+      storageRemoveItem(`${RAM_DISK_UNCHUNKED_PREFIX}${path}`);
+    } catch (error) {
+      console.debug(`Failed to remove cached unchunked entry for ${path}:`, error);
+    }
+  }
+}
+
+function cacheArchiveInRam(path, payload) {
+  if (!path || !payload) return;
+  ramDiskCache.archives.set(path, payload);
+}
+
+function persistArchiveToStorage(path, payload) {
+  if (!path || !payload) return;
+  try {
+    storageSetItem(`${RAM_DISK_ARCHIVE_PREFIX}${path}`, JSON.stringify(payload));
+  } catch (error) {
+    console.warn(`Failed to persist archive ${path} to RAM disk storage:`, error);
+  }
+}
+
+function listRamDiskArchiveEntries() {
+  const results = new Map();
+  for (const [path, data] of ramDiskCache.archives.entries()) {
+    results.set(path, { path, data });
+  }
+  const prefixLength = RAM_DISK_ARCHIVE_PREFIX.length;
+  for (const key of storageKeys()) {
+    if (!key.startsWith(RAM_DISK_ARCHIVE_PREFIX)) continue;
+    const path = key.slice(prefixLength);
+    if (!path || results.has(path)) continue;
+    try {
+      const stored = storageGetItem(key);
+      if (!stored) continue;
+      const parsed = JSON.parse(stored);
+      if (!parsed) continue;
+      ramDiskCache.archives.set(path, parsed);
+      results.set(path, { path, data: parsed });
+    } catch (error) {
+      console.warn(`Failed to read archived transcript from RAM disk (${key}):`, error);
+    }
+  }
+  return Array.from(results.values());
+}
+
+function readRamDiskChunk(paths) {
+  const candidates = dedupePaths(paths);
+  for (const path of candidates) {
+    if (ramDiskCache.chunked.has(path)) {
+      return ramDiskCache.chunked.get(path);
+    }
+  }
+  for (const path of candidates) {
+    const stored = storageGetItem(`${RAM_DISK_CHUNK_PREFIX}${path}`);
+    if (!stored) continue;
+    try {
+      const data = JSON.parse(stored);
+      if (typeof data.chunkedPath !== 'string') {
+        data.chunkedPath = path;
+      }
+      cacheChunkedInRam(candidates, data);
+      return data;
+    } catch (error) {
+      console.warn(`Failed to parse RAM disk chunk for ${path}:`, error);
+    }
+  }
+  return null;
+}
+
+function readRamDiskUnchunked(paths) {
+  const candidates = dedupePaths(paths);
+  for (const path of candidates) {
+    if (ramDiskCache.unchunked.has(path)) {
+      return ramDiskCache.unchunked.get(path);
+    }
+  }
+  for (const path of candidates) {
+    const stored = storageGetItem(`${RAM_DISK_UNCHUNKED_PREFIX}${path}`);
+    if (stored !== null && stored !== undefined) {
+      cacheUnchunkedInRam(candidates, stored);
+      return stored;
+    }
+  }
+  return null;
+}
+
+function listRamDiskChunkedEntries() {
+  const entries = [];
+  const keys = storageKeys().filter((key) => key.startsWith(RAM_DISK_CHUNK_PREFIX));
+  for (const key of keys) {
+    const path = key.slice(RAM_DISK_CHUNK_PREFIX.length);
+    const data = readRamDiskChunk(path);
+    if (data && isSupportedChunkablePath(path)) {
+      entries.push({ path, data });
+    }
+  }
+  return entries;
+}
+
+function listRamDiskUnchunkedEntries() {
+  const entries = [];
+  const keys = storageKeys().filter((key) => key.startsWith(RAM_DISK_UNCHUNKED_PREFIX));
+  for (const key of keys) {
+    const path = key.slice(RAM_DISK_UNCHUNKED_PREFIX.length);
+    const content = readRamDiskUnchunked(path);
+    if (content !== null && isSupportedChunkablePath(path)) {
+      entries.push({ path, content });
+    }
+  }
+  return entries;
+}
+
+function primeRamDiskCache() {
+  try {
+    const keys = storageKeys();
+    for (const key of keys) {
+      if (key.startsWith(RAM_DISK_CHUNK_PREFIX)) {
+        const path = key.slice(RAM_DISK_CHUNK_PREFIX.length);
+        const stored = storageGetItem(key);
+        if (!stored) continue;
+        try {
+          const data = JSON.parse(stored);
+          cacheChunkedInRam([path], data);
+        } catch (error) {
+          console.warn(`Failed to parse cached chunked entry ${path}:`, error);
+        }
+      } else if (key.startsWith(RAM_DISK_UNCHUNKED_PREFIX)) {
+        const path = key.slice(RAM_DISK_UNCHUNKED_PREFIX.length);
+        const stored = storageGetItem(key);
+        if (stored !== null && stored !== undefined) {
+          cacheUnchunkedInRam([path], stored);
+        }
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to prime RAM disk cache:', error);
+  }
+}
+
+function normalizeRagData(data) {
+  if (data == null) {
+    return '';
+  }
+  if (typeof data === 'string') {
+    return data;
+  }
+  if (Array.isArray(data)) {
+    return data.map((item) => normalizeRagData(item)).join('\n');
+  }
+  if (typeof data === 'object') {
+    if (typeof data.content === 'string') {
+      return data.content;
+    }
+    return JSON.stringify(data);
+  }
+  return String(data);
+}
+
+function normalizeRagString(raw) {
+  if (typeof raw !== 'string') {
+    return normalizeRagData(raw);
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return '';
+  }
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return normalizeRagData(parsed);
+    } catch (error) {
+      const lines = trimmed.split(/\r?\n/);
+      const parsedLines = [];
+      let parsedCount = 0;
+      for (const line of lines) {
+        const candidate = line.trim();
+        if (!candidate) continue;
+        if (candidate.startsWith('{') || candidate.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(candidate);
+            parsedLines.push(normalizeRagData(parsed));
+            parsedCount += 1;
+            continue;
+          } catch (lineError) {
+            // fall through to keep the original line
+          }
+        }
+        parsedLines.push(line);
+      }
+      if (parsedCount > 0) {
+        return parsedLines.join('\n');
+      }
+    }
+  }
+  return raw;
+}
+
+async function loadChunkedFileData(chunkedPath, originalPath) {
+  const candidates = dedupePaths([chunkedPath, originalPath]);
+  const cached = readRamDiskChunk(candidates);
+  if (cached) {
+    return { data: cached, source: 'ram' };
+  }
+  for (const path of candidates) {
+    const fsResult = readStandaloneFile(path);
+    if (fsResult) {
+      try {
+        const payload = JSON.parse(fsResult.content);
+        const normalized = { ...payload, chunkedPath: path };
+        hydrateChunkEmbeddingIndex(normalized);
+        cacheChunkedInRam(candidates, normalized);
+        return { data: normalized, source: 'filesystem' };
+      } catch (error) {
+        console.debug(`Failed to parse chunked file ${path} from filesystem:`, error);
+      }
+    }
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        const payload = await response.json();
+        const normalized = { ...payload, chunkedPath: path };
+        hydrateChunkEmbeddingIndex(normalized);
+        cacheChunkedInRam(candidates, normalized);
+        return { data: normalized, source: 'filesystem' };
+      }
+    } catch (error) {
+      console.debug(`Failed to load chunked file ${path}:`, error);
+    }
+  }
+  return null;
+}
+
+async function loadRagFileContent(paths) {
+  const candidates = dedupePaths(paths);
+  for (const path of candidates) {
+    const fsResult = readStandaloneFile(path);
+    if (fsResult) {
+      const { content, contentType } = fsResult;
+      if (contentType === 'application/pdf') {
+        // Defer to fetch/pdf.js pipeline for binary sources.
+      } else if (contentType && contentType.includes('json')) {
+        try {
+          const parsed = JSON.parse(content);
+          const raw = typeof parsed === 'string' ? parsed : JSON.stringify(parsed);
+          cacheUnchunkedInRam(candidates, raw);
+          return { content: normalizeRagData(parsed), source: 'filesystem', contentType: 'application/json' };
+        } catch (error) {
+          cacheUnchunkedInRam(candidates, content);
+          return { content, source: 'filesystem', contentType: 'application/json' };
+        }
+      } else {
+        cacheUnchunkedInRam(candidates, content);
+        return { content, source: 'filesystem', contentType: contentType || 'text/plain' };
+      }
+    }
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await response.json();
+          const raw = typeof data === 'string' ? data : JSON.stringify(data);
+          cacheUnchunkedInRam(candidates, raw);
+          return { content: normalizeRagData(data), source: 'filesystem', contentType };
+        }
+        const text = await response.text();
+        cacheUnchunkedInRam(candidates, text);
+        return { content: text, source: 'filesystem', contentType: contentType || 'text/plain' };
+      }
+    } catch (error) {
+      console.debug(`Failed to fetch ${path} for chunking`, error);
+    }
+  }
+  const ramContent = readRamDiskUnchunked(candidates);
+  if (ramContent !== null) {
+    return { content: normalizeRagString(ramContent), source: 'ram', contentType: 'text/plain' };
+  }
+  return null;
+}
+
+async function detectUnchunkedFile(originalPath, manifestSize = 0) {
+  const candidatePaths = dedupePaths([toUnchunkedPath(originalPath), originalPath]);
+  for (const path of candidatePaths) {
+    const fsResult = readStandaloneFile(path);
+    if (fsResult) {
+      const { content, contentType } = fsResult;
+      if (!isSupportedChunkableFile(originalPath, contentType)) {
+        continue;
+      }
+      cacheUnchunkedInRam(candidatePaths, content);
+      const computedSize = manifestSize || content.length;
+      return {
+        path,
+        originalPath,
+        size: computedSize,
+        source: 'workspace',
+        ramContent: content,
+        contentType: contentType || inferContentTypeFromPath(originalPath)
+      };
+    }
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (!isSupportedChunkableFile(originalPath, contentType)) {
+          continue;
+        }
+        const text = await response.text();
+        cacheUnchunkedInRam(candidatePaths, text);
+        const sizeHeader = Number.parseInt(response.headers.get('content-length') || '', 10);
+        const computedSize = Number.isFinite(sizeHeader) ? sizeHeader : manifestSize || text.length;
+        return {
+          path,
+          originalPath,
+          size: computedSize,
+          source: 'workspace',
+          ramContent: text,
+          contentType
+        };
+      }
+    } catch (error) {
+      console.debug(`Failed to inspect ${path}:`, error);
+    }
+  }
+  const ramContent = readRamDiskUnchunked(candidatePaths);
+  if (ramContent !== null) {
+    if (!isSupportedChunkableFile(originalPath, null)) {
+      return null;
+    }
+    return {
+      path: toUnchunkedPath(originalPath),
+      originalPath,
+      size: manifestSize || ramContent.length,
+      source: 'ram',
+      ramContent
+    };
+  }
+  return null;
+}
+
+async function listRagDirectoryEntries(directory) {
+  const normalizedDir = directory.endsWith('/') ? directory : `${directory}/`;
+  const fsEntries = listStandaloneDirectory(normalizedDir);
+  if (Array.isArray(fsEntries)) {
+    return filterSuspiciousDirectoryEntries(fsEntries);
+  }
+  try {
+    const response = await fetch(normalizedDir, { cache: 'no-store' });
+    if (!response.ok) {
+      return [];
+    }
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('application/json')) {
+      const payload = await response.json();
+      return normalizeDirectoryListingFromJson(payload, normalizedDir);
+    }
+    const text = await response.text();
+    return normalizeDirectoryListingFromText(text, normalizedDir);
+  } catch (error) {
+    console.debug(`Failed to list directory ${directory}:`, error);
+    return [];
+  }
+}
+
+function normalizeDirectoryListingFromJson(payload, basePath) {
+  const results = new Set();
+  if (!payload) return [];
+  const base = basePath.endsWith('/') ? basePath : `${basePath}/`;
+  const candidateArrays = [];
+  if (Array.isArray(payload)) {
+    candidateArrays.push(payload);
+  }
+  if (Array.isArray(payload.files)) {
+    candidateArrays.push(payload.files);
+  }
+  if (Array.isArray(payload.entries)) {
+    candidateArrays.push(payload.entries);
+  }
+  for (const array of candidateArrays) {
+    for (const item of array) {
+      if (!item) continue;
+      if (typeof item === 'string') {
+        results.add(resolveRagPath(base, item));
+      } else if (typeof item.path === 'string') {
+        results.add(resolveRagPath(base, item.path));
+      }
+    }
+  }
+  return filterSuspiciousDirectoryEntries(Array.from(results));
+}
+
+function normalizeDirectoryListingFromText(text, basePath) {
+  const results = new Set();
+  if (!text) return [];
+  const normalizedBase = basePath.endsWith('/') ? basePath : `${basePath}/`;
+  try {
+    const parser = new DOMParser();
+    const baseUrl = new URL(normalizedBase, window.location.origin);
+    const expectedPrefix = baseUrl.pathname.replace(/^\//, '');
+    const doc = parser.parseFromString(text, 'text/html');
+    const anchors = Array.from(doc.querySelectorAll('a[href]'));
+    for (const anchor of anchors) {
+      const href = anchor.getAttribute('href');
+      if (!href || href.startsWith('#') || href.startsWith('?')) continue;
+      const resolvedUrl = new URL(href, baseUrl);
+      const pathname = resolvedUrl.pathname.replace(/^\//, '');
+      if (!pathname || pathname === expectedPrefix) continue;
+      if (!pathname.startsWith(expectedPrefix)) continue;
+      if (pathname.endsWith('/')) continue;
+      if (/["']/.test(pathname)) continue;
+      results.add(pathname);
+    }
+  } catch (error) {
+    console.debug('Failed to parse directory listing HTML', error);
+  }
+
+  if (results.size === 0) {
+    const lines = text.split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '.' || trimmed === '..') continue;
+      if (/[<>]/.test(trimmed)) continue;
+      if (/["']/.test(trimmed) && /=/.test(trimmed)) continue;
+      if (trimmed.endsWith('/')) continue;
+      results.add(resolveRagPath(normalizedBase, trimmed));
+    }
+  }
+
+  return filterSuspiciousDirectoryEntries(Array.from(results));
+}
+
+function filterSuspiciousDirectoryEntries(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries.filter((entry) => {
+    if (!entry) return false;
+    if (/["'<>]/.test(entry)) return false;
+    const lastSegment = entry.split('/').pop();
+    if (!lastSegment || lastSegment === '.' || lastSegment === '..') return false;
+    if (/["'<>]/.test(lastSegment)) return false;
+    return true;
+  });
+}
+
 async function scanForChunkableFiles() {
   if (chunkerState.isProcessing) {
     addSystemMessage('Chunker is already processing. Please wait.');
@@ -2966,65 +4436,154 @@ async function scanForChunkableFiles() {
 
     addSystemMessage('🔍 Scanning rag/ folder for chunkable files...');
 
-    const response = await fetch('rag/manifest.json');
-    if (!response.ok) {
-      throw new Error('Could not load RAG manifest');
-    }
-    const manifest = await response.json();
+    const [manifest, unchunkedListing, chunkedListing] = await Promise.all([
+      fetchRagManifest(STATIC_RAG_MANIFESTS[0]).catch((error) => {
+        console.warn('Could not load primary RAG manifest for chunking', error);
+        return null;
+      }),
+      listRagDirectoryEntries('rag/unchunked/'),
+      listRagDirectoryEntries('rag/chunked/')
+    ]);
 
     chunkerState.unchunkedFiles = [];
     chunkerState.chunkedFiles = [];
     chunkerState.totalChunks = 0;
 
-    // Check for files in rag/ directory
-    for (const entry of manifest.files || []) {
-      const filePath = `rag/${entry.path}`;
-      const chunkedPath = filePath.replace(/^rag\//, 'rag/chunked/');
-      const unchunkedPath = filePath.replace(/^rag\//, 'rag/unchunked/');
+    const seenChunked = new Set();
+    const seenUnchunked = new Set();
 
+    const chunkedPaths = dedupePaths(chunkedListing);
+    for (const chunkedPath of chunkedPaths) {
       try {
-        // Check if chunked version exists
-        const chunkedResponse = await fetch(chunkedPath);
-        if (chunkedResponse.ok) {
-          const chunkedData = await chunkedResponse.json();
-          chunkerState.chunkedFiles.push({
-            originalPath: filePath,
-            chunkedPath,
-            chunks: chunkedData.chunks || []
-          });
-          chunkerState.totalChunks += chunkedData.chunks?.length || 0;
-          addSystemMessage(`✓ Found chunked: ${entry.path} (${chunkedData.chunks?.length || 0} chunks)`);
-        } else {
-          // Check if file exists in unchunked
-          const unchunkedResponse = await fetch(unchunkedPath);
-          if (unchunkedResponse.ok) {
-            chunkerState.unchunkedFiles.push({
-              path: unchunkedPath,
-              originalPath: filePath,
-              size: entry.size || 0
-            });
-            addSystemMessage(`📁 Found unchunked: ${entry.path}`);
-          } else {
-            // Check if file exists in original location
-            const originalResponse = await fetch(filePath);
-            if (originalResponse.ok) {
-              chunkerState.unchunkedFiles.push({
-                path: filePath,
-                originalPath: filePath,
-                size: entry.size || 0
-              });
-              addSystemMessage(`📄 Found original: ${entry.path}`);
-            }
-          }
+        const chunkedRecord = await loadChunkedFileData(chunkedPath, fromChunkedPath(chunkedPath));
+        const chunkList = chunkedRecord?.data?.chunks;
+        if (!Array.isArray(chunkList) || chunkList.length === 0) {
+          continue;
         }
+        const originalPath = chunkedRecord?.data?.originalPath || fromChunkedPath(chunkedPath);
+        const canonical = canonicalizeOriginalPath(originalPath || chunkedPath);
+        if (seenChunked.has(canonical)) {
+          continue;
+        }
+        chunkerState.chunkedFiles.push({
+          originalPath,
+          chunkedPath,
+          chunks: chunkList,
+          source: chunkedRecord.source
+        });
+        chunkerState.totalChunks += chunkList.length;
+        seenChunked.add(canonical);
+        const label = (originalPath || chunkedPath).replace(/^rag\//, '');
+        const locationLabel = chunkedRecord.source === 'ram' ? 'RAM disk' : 'workspace';
+        addSystemMessage(`✓ Found chunked: ${label} (${chunkList.length} chunks, ${locationLabel})`);
       } catch (error) {
-        console.warn(`Error checking ${filePath}:`, error);
-        addSystemMessage(`⚠️ Could not check ${entry.path}`);
+        console.debug(`Failed to inspect chunked file ${chunkedPath}:`, error);
       }
     }
 
+    const manifestEntries = normalizeRagManifestEntries(manifest);
+    const manifestPaths = manifestEntries
+      .map((entry) => (entry && entry.path ? resolveRagPath('rag/', entry.path) : null))
+      .filter(Boolean);
+
+    const candidatePaths = filterChunkablePaths(dedupePaths([...manifestPaths, ...unchunkedListing]));
+
+    for (const candidate of candidatePaths) {
+      const canonicalCandidate = canonicalizeOriginalPath(candidate);
+      if (seenChunked.has(canonicalCandidate) || seenUnchunked.has(canonicalCandidate)) {
+        continue;
+      }
+
+      let chunkedRecord = null;
+      try {
+        const chunkedPath = toChunkedPath(candidate);
+        chunkedRecord = await loadChunkedFileData(chunkedPath, candidate);
+      } catch (error) {
+        console.debug(`Chunked probe failed for ${candidate}:`, error);
+      }
+
+      const chunkList = chunkedRecord?.data?.chunks;
+      if (Array.isArray(chunkList) && chunkList.length > 0) {
+        const originalPath = chunkedRecord?.data?.originalPath || candidate;
+        const canonicalOriginal = canonicalizeOriginalPath(originalPath);
+        if (!seenChunked.has(canonicalOriginal)) {
+          chunkerState.chunkedFiles.push({
+            originalPath,
+            chunkedPath: toChunkedPath(originalPath),
+            chunks: chunkList,
+            source: chunkedRecord.source
+          });
+          chunkerState.totalChunks += chunkList.length;
+          seenChunked.add(canonicalOriginal);
+          const label = originalPath.replace(/^rag\//, '');
+          const locationLabel = chunkedRecord.source === 'ram' ? 'RAM disk' : 'workspace';
+          addSystemMessage(`✓ Found chunked: ${label} (${chunkList.length} chunks, ${locationLabel})`);
+        }
+        continue;
+      }
+
+      const descriptor = await detectUnchunkedFile(candidate);
+      if (descriptor) {
+        const descriptorKey = canonicalizeOriginalPath(descriptor.originalPath || descriptor.path);
+        if (seenChunked.has(descriptorKey) || seenUnchunked.has(descriptorKey)) {
+          continue;
+        }
+        if (!isSupportedChunkablePath(descriptor.originalPath || descriptor.path)) {
+          continue;
+        }
+        chunkerState.unchunkedFiles.push(descriptor);
+        seenUnchunked.add(descriptorKey);
+        const locationLabel = descriptor.source === 'ram' ? 'RAM disk' : 'workspace';
+        const icon = descriptor.source === 'ram' ? '📦' : '📁';
+        const label = (descriptor.originalPath || descriptor.path).replace(/^rag\//, '');
+        addSystemMessage(`${icon} Found unchunked: ${label} (${locationLabel})`);
+      }
+    }
+
+    for (const { path, data } of listRamDiskChunkedEntries()) {
+      const originalPath = typeof data?.originalPath === 'string' ? data.originalPath : fromChunkedPath(path);
+      const canonical = canonicalizeOriginalPath(originalPath || path);
+      if (!originalPath || seenChunked.has(canonical) || !isSupportedChunkablePath(originalPath)) {
+        continue;
+      }
+      const chunks = Array.isArray(data?.chunks) ? data.chunks : [];
+      if (!chunks.length) {
+        continue;
+      }
+      chunkerState.chunkedFiles.push({
+        originalPath,
+        chunkedPath: toChunkedPath(originalPath),
+        chunks,
+        source: 'ram'
+      });
+      chunkerState.totalChunks += chunks.length;
+      seenChunked.add(canonical);
+      const label = originalPath.startsWith('rag/') ? originalPath.slice(4) : originalPath;
+      addSystemMessage(`✓ Found chunked: ${label} (${chunks.length} chunks, RAM disk)`);
+    }
+
+    for (const { path, content } of listRamDiskUnchunkedEntries()) {
+      const canonical = canonicalizeOriginalPath(path);
+      if (!path || seenChunked.has(canonical) || seenUnchunked.has(canonical) || !isSupportedChunkablePath(path)) {
+        continue;
+      }
+      const descriptor = {
+        path: toUnchunkedPath(path),
+        originalPath: path,
+        size: content.length,
+        source: 'ram',
+        ramContent: content
+      };
+      chunkerState.unchunkedFiles.push(descriptor);
+      seenUnchunked.add(canonical);
+      const label = path.startsWith('rag/') ? path.slice(4) : path;
+      addSystemMessage(`📦 Found unchunked: ${label} (RAM disk)`);
+    }
+
     updateChunkerStatus();
-    addSystemMessage(`✅ Scan complete. Found ${chunkerState.unchunkedFiles.length} files to chunk, ${chunkerState.chunkedFiles.length} already chunked.`);
+    addSystemMessage(
+      `✅ Scan complete. Found ${chunkerState.unchunkedFiles.length} files to chunk, ${chunkerState.chunkedFiles.length} already chunked.`
+    );
 
   } catch (error) {
     console.error('Error scanning for chunkable files:', error);
@@ -3056,37 +4615,51 @@ async function chunkAllFiles() {
 
     for (const file of chunkerState.unchunkedFiles) {
       try {
-        addSystemMessage(`Chunking ${file.path}...`);
-        const chunks = await chunkFile(file.path, chunkerState.chunkSize, chunkerState.chunkOverlap);
-        if (chunks && chunks.length > 0) {
+        const originalPath = file.originalPath || file.path;
+        const displayPath = originalPath || file.path;
+        if (!isSupportedChunkablePath(originalPath || '')) {
+          addSystemMessage(`Skipping ${displayPath}: unsupported file type for chunking.`);
+          continue;
+        }
+        addSystemMessage(`Chunking ${displayPath}...`);
+        let chunks = await chunkFile(file, chunkerState.chunkSize, chunkerState.chunkOverlap);
+        chunks = await enrichChunksWithEmbeddings(originalPath, chunks);
+        if (Array.isArray(chunks) && chunks.length > 0) {
           const chunkedData = {
-            originalPath: file.originalPath,
+            originalPath,
             chunkSize: chunkerState.chunkSize,
             chunkOverlap: chunkerState.chunkOverlap,
-            chunks: chunks,
+            embeddingModel: config.embeddingModel,
+            embeddingDimensions: Array.isArray(chunks[0]?.embedding)
+              ? chunks[0].embedding.length
+              : EMBEDDING_HASH_BUCKETS,
+            chunks,
             createdAt: new Date().toISOString()
           };
 
           // Save chunked file to rag/chunked/
-          const chunkedPath = file.originalPath.replace(/^rag\//, 'rag/chunked/');
-          await saveChunkedFileToFS(chunkedPath, chunkedData);
+          const chunkedPath = toChunkedPath(originalPath);
+          const saveLocation = await saveChunkedFileToFS(chunkedPath, chunkedData);
 
           // Move original to rag/unchunked/
-          await moveToUnchunkedFS(file.path, file.originalPath);
+          await moveToUnchunkedFS(file.path, originalPath);
 
           chunkerState.chunkedFiles.push({
-            originalPath: file.originalPath,
+            originalPath,
             chunkedPath,
-            chunks: chunks
+            chunks,
+            source: saveLocation
           });
 
           totalChunksCreated += chunks.length;
           processedCount++;
-          addSystemMessage(`✓ Chunked ${file.path} into ${chunks.length} chunks`);
+          const locationLabel = saveLocation === 'ram' ? 'RAM disk' : 'workspace';
+          addSystemMessage(`✓ Chunked ${displayPath} into ${chunks.length} chunks (${locationLabel})`);
         }
       } catch (error) {
-        console.error(`Error chunking ${file.path}:`, error);
-        addSystemMessage(`✗ Failed to chunk ${file.path}: ${error.message || 'Unknown error'}`);
+        const originalPath = file.originalPath || file.path;
+        console.error(`Error chunking ${originalPath}:`, error);
+        addSystemMessage(`✗ Failed to chunk ${originalPath}: ${error.message || 'Unknown error'}`);
       }
     }
 
@@ -3106,37 +4679,40 @@ async function chunkAllFiles() {
   }
 }
 
-async function chunkFile(filePath, chunkSize, overlap) {
+async function chunkFile(fileDescriptor, chunkSize, overlap) {
+  const descriptor =
+    typeof fileDescriptor === 'string'
+      ? { path: fileDescriptor, originalPath: fileDescriptor }
+      : { ...fileDescriptor };
+  const label = descriptor.originalPath || descriptor.path || 'unknown file';
+  const candidatePaths = dedupePaths([descriptor.path, descriptor.originalPath]);
+  const overlapTokens = Math.max(Math.round(chunkSize * 0.15), overlap);
+
   try {
-    const response = await fetch(filePath);
-    if (!response.ok) {
-      throw new Error(`Failed to load file: ${response.status}`);
-    }
+    let sourceContent = '';
 
-    let content = '';
-    const contentType = response.headers.get('content-type') || '';
-
-    if (contentType.includes('application/json')) {
-      const data = await response.json();
-      if (Array.isArray(data)) {
-        // Handle JSONL or array format
-        content = data.map(item => typeof item === 'string' ? item : JSON.stringify(item)).join('\n');
-      } else if (data.content) {
-        content = data.content;
-      } else {
-        content = JSON.stringify(data);
-      }
+    if (typeof descriptor.ramContent === 'string') {
+      cacheUnchunkedInRam(candidatePaths, descriptor.ramContent);
+      sourceContent = normalizeRagString(descriptor.ramContent);
     } else {
-      content = await response.text();
+      const loaded = await loadRagFileContent(candidatePaths);
+      if (loaded && typeof loaded.content === 'string') {
+        sourceContent = normalizeRagString(loaded.content);
+      } else {
+        const fallback = readRamDiskUnchunked(candidatePaths);
+        if (fallback !== null) {
+          sourceContent = normalizeRagString(fallback);
+        } else {
+          throw new Error('File not found in workspace or RAM disk');
+        }
+      }
     }
 
-    if (!content.trim()) {
+    if (!sourceContent.trim()) {
       return [];
     }
 
-    // Split into sentences/paragraphs for better chunking
-    const segments = content.split(/\n\s*\n/).filter(s => s.trim());
-
+    const segments = sourceContent.split(/\n\s*\n/).filter((segment) => segment.trim());
     const chunks = [];
     let currentChunk = '';
     let currentTokens = 0;
@@ -3145,16 +4721,14 @@ async function chunkFile(filePath, chunkSize, overlap) {
       const segmentTokens = estimateTokenCount(segment);
 
       if (currentTokens + segmentTokens > chunkSize && currentChunk.trim()) {
-        // Save current chunk
         chunks.push({
           content: currentChunk.trim(),
           tokens: currentTokens,
-          startIndex: chunks.length * (chunkSize - overlap)
+          startIndex: chunks.length * Math.max(1, chunkSize - overlapTokens)
         });
 
-        // Start new chunk with overlap
-        const overlapText = extractOverlapText(currentChunk, overlap);
-        currentChunk = overlapText + segment;
+        const overlapText = extractOverlapText(currentChunk, overlapTokens);
+        currentChunk = overlapText ? overlapText + segment : segment;
         currentTokens = estimateTokenCount(currentChunk);
       } else {
         currentChunk += (currentChunk ? '\n\n' : '') + segment;
@@ -3162,20 +4736,18 @@ async function chunkFile(filePath, chunkSize, overlap) {
       }
     }
 
-    // Add final chunk
     if (currentChunk.trim()) {
       chunks.push({
         content: currentChunk.trim(),
         tokens: currentTokens,
-        startIndex: chunks.length * (chunkSize - overlap)
+        startIndex: chunks.length * Math.max(1, chunkSize - overlapTokens)
       });
     }
 
     return chunks;
-
   } catch (error) {
-    console.error(`Error chunking file ${filePath}:`, error);
-    void recordLog('error', `Error chunking file ${filePath}: ${error.message}`, { level: 'error' });
+    console.error(`Error chunking file ${label}:`, error);
+    void recordLog('error', `Error chunking file ${label}: ${error.message}`, { level: 'error' });
     throw error;
   }
 }
@@ -3201,31 +4773,144 @@ function extractOverlapText(text, overlapTokens) {
   return overlapText;
 }
 
+// CODEx: Populate chunk embeddings so RAG retrieval can perform vector search.
+async function enrichChunksWithEmbeddings(originalPath, chunks) {
+  if (!Array.isArray(chunks) || !chunks.length) {
+    return chunks;
+  }
+  const canonical = canonicalizeOriginalPath(originalPath || '');
+  await Promise.all(
+    chunks.map(async (chunk, index) => {
+      if (!chunk || typeof chunk.content !== 'string') {
+        return;
+      }
+      const key = `${canonical}#${index}`;
+      if (Array.isArray(chunk.embedding) && chunk.embedding.length) {
+        chunkEmbeddingIndex.set(key, chunk.embedding);
+        return;
+      }
+      try {
+        const vector = await generateTextEmbedding(chunk.content);
+        if (vector) {
+          chunk.embedding = vector;
+          chunkEmbeddingIndex.set(key, vector);
+          return;
+        }
+      } catch (error) {
+        console.debug('Chunk embedding fallback:', error);
+      }
+      const fallback = lexicalEmbedding(chunk.content);
+      chunk.embedding = fallback;
+      chunkEmbeddingIndex.set(key, fallback);
+    })
+  );
+  return chunks;
+}
+
+// CODEx: Cache embeddings when chunk files are reloaded from disk or RAM.
+function hydrateChunkEmbeddingIndex(record) {
+  if (!record || !Array.isArray(record.chunks)) {
+    return;
+  }
+  const canonical = canonicalizeOriginalPath(record.originalPath || record.chunkedPath || '');
+  record.chunks.forEach((chunk, index) => {
+    if (chunk && Array.isArray(chunk.embedding) && chunk.embedding.length) {
+      const key = `${canonical}#${index}`;
+      chunkEmbeddingIndex.set(key, chunk.embedding);
+    }
+  });
+}
+
 async function saveChunkedFileToFS(path, data) {
+  const payloadForCache = { ...data, chunkedPath: path };
+  cacheChunkedInRam([path, data?.originalPath], payloadForCache);
+  const serialized = JSON.stringify(data, null, 2);
+  const directory = getDirectoryPath(path);
+  if (directory) {
+    ensureStandaloneDirectory(directory);
+  }
+  if (writeStandaloneFile(path, serialized, { contentType: 'application/json' })) {
+    console.log(`Saved chunked file to ${path} via standalone bridge`);
+    return 'workspace';
+  }
   try {
-    // Save to actual file system in rag/chunked/
     const response = await fetch(path, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data, null, 2)
+      body: serialized
     });
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
     console.log(`Saved chunked file to ${path}`);
+    return 'workspace';
   } catch (error) {
     console.error('Error saving chunked file to FS:', error);
-    // Fallback to localStorage
-    const key = `sam-chunked-${path}`;
-    window.localStorage.setItem(key, JSON.stringify(data));
-    console.log(`Fallback: Saved chunked file to localStorage: ${key}`);
+    try {
+      storageSetItem(`${RAM_DISK_CHUNK_PREFIX}${path}`, JSON.stringify(payloadForCache));
+      cacheChunkedInRam([path, data?.originalPath], payloadForCache);
+      console.log(`Fallback: Saved chunked file to localStorage: ${RAM_DISK_CHUNK_PREFIX}${path}`);
+    } catch (storageError) {
+      console.warn('Failed to persist chunked file to localStorage:', storageError);
+    }
+    return 'ram';
   }
 }
 
 async function moveToUnchunkedFS(fromPath, originalPath) {
+  const normalizedSource = (originalPath || fromPath || '').replace(/\\/g, '/');
+  if (!normalizedSource) {
+    return 'unknown';
+  }
+  const unchunkedPath = toUnchunkedPath(normalizedSource);
+  const candidatePaths = dedupePaths([fromPath, normalizedSource, unchunkedPath]);
+
+  if (normalizedSource.startsWith('rag/unchunked/')) {
+    if (deleteStandaloneFile(normalizedSource)) {
+      clearUnchunkedRamEntries(candidatePaths);
+      console.log(`Deleted ${normalizedSource} via standalone bridge`);
+      return 'workspace';
+    }
+    const cached = readRamDiskUnchunked(candidatePaths);
+    try {
+      const deleteResponse = await fetch(normalizedSource, { method: 'DELETE' });
+      if (deleteResponse?.ok) {
+        clearUnchunkedRamEntries(candidatePaths);
+        console.log(`Deleted ${normalizedSource} after chunking`);
+        return 'workspace';
+      }
+    } catch (error) {
+      console.warn(`Could not delete processed unchunked file ${normalizedSource}:`, error);
+    }
+
+    if (typeof cached === 'string') {
+      cacheUnchunkedInRam(candidatePaths, cached);
+      for (const target of candidatePaths) {
+        if (!target) continue;
+        try {
+          storageSetItem(`${RAM_DISK_UNCHUNKED_PREFIX}${target}`, cached);
+        } catch (storageError) {
+          console.warn(`Failed to persist unchunked fallback for ${target}:`, storageError);
+        }
+      }
+      console.log(`Fallback: retained ${normalizedSource} in RAM disk storage`);
+      return 'ram';
+    }
+    return 'unknown';
+  }
+
+  const fsSource = readStandaloneFile(fromPath) || readStandaloneFile(normalizedSource);
+  if (fsSource && typeof fsSource.content === 'string') {
+    ensureStandaloneDirectory(getDirectoryPath(unchunkedPath));
+    if (writeStandaloneFile(unchunkedPath, fsSource.content, { contentType: fsSource.contentType })) {
+      deleteStandaloneFile(fromPath);
+      cacheUnchunkedInRam(candidatePaths, fsSource.content);
+      console.log(`Moved ${fromPath} to ${unchunkedPath} via standalone bridge`);
+      return 'workspace';
+    }
+  }
+
   try {
-    // Move original file to rag/unchunked/
-    const unchunkedPath = originalPath.replace(/^rag\//, 'rag/unchunked/');
     const response = await fetch(fromPath);
     if (response.ok) {
       const content = await response.text();
@@ -3235,26 +4920,42 @@ async function moveToUnchunkedFS(fromPath, originalPath) {
         body: content
       });
       if (moveResponse.ok) {
-        // Delete original file
         await fetch(fromPath, { method: 'DELETE' });
+        cacheUnchunkedInRam(candidatePaths, content);
         console.log(`Moved ${fromPath} to ${unchunkedPath}`);
+        return 'workspace';
       }
     }
   } catch (error) {
     console.warn('Could not move file to unchunked folder, using localStorage fallback:', error);
-    // Fallback to localStorage
-    const key = `sam-unchunked-${originalPath}`;
-    try {
+  }
+
+  try {
+    let content = readRamDiskUnchunked(candidatePaths);
+    if (content === null) {
       const response = await fetch(fromPath);
       if (response.ok) {
-        const content = await response.text();
-        window.localStorage.setItem(key, content);
-        console.log(`Fallback: Moved file to localStorage: ${key}`);
+        content = await response.text();
       }
-    } catch (fallbackError) {
-      console.warn('Fallback also failed:', fallbackError);
     }
+    if (typeof content === 'string') {
+      cacheUnchunkedInRam(candidatePaths, content);
+      for (const target of candidatePaths) {
+        if (!target) continue;
+        try {
+          storageSetItem(`${RAM_DISK_UNCHUNKED_PREFIX}${target}`, content);
+        } catch (storageError) {
+          console.warn(`Failed to persist unchunked file to localStorage (${target}):`, storageError);
+        }
+      }
+      console.log(`Fallback: Moved file to RAM disk storage for ${normalizedSource}`);
+      return 'ram';
+    }
+  } catch (fallbackError) {
+    console.warn('Fallback also failed:', fallbackError);
   }
+
+  return 'unknown';
 }
 
 function clearAllChunks() {
@@ -3262,13 +4963,19 @@ function clearAllChunks() {
     addSystemMessage('🗑️ Clearing all chunked and unchunked files...');
 
     // Clear localStorage entries
-    const keys = Object.keys(window.localStorage).filter(key => key.startsWith('sam-chunked-') || key.startsWith('sam-unchunked-'));
-    keys.forEach(key => window.localStorage.removeItem(key));
+    const keys = storageKeys().filter(
+      (key) => key.startsWith(RAM_DISK_CHUNK_PREFIX) || key.startsWith(RAM_DISK_UNCHUNKED_PREFIX)
+    );
+    keys.forEach(key => storageRemoveItem(key));
 
     // Try to delete files from file system
     const deletePromises = [];
     chunkerState.chunkedFiles.forEach(file => {
       if (file.chunkedPath) {
+        if (deleteStandaloneFile(file.chunkedPath)) {
+          addSystemMessage(`✓ Deleted ${file.chunkedPath}`);
+          return deletePromises.push(Promise.resolve());
+        }
         deletePromises.push(
           fetch(file.chunkedPath, { method: 'DELETE' })
             .then(() => addSystemMessage(`✓ Deleted ${file.chunkedPath}`))
@@ -3278,6 +4985,10 @@ function clearAllChunks() {
     });
     chunkerState.unchunkedFiles.forEach(file => {
       if (file.path && file.path.includes('/unchunked/')) {
+        if (deleteStandaloneFile(file.path)) {
+          addSystemMessage(`✓ Deleted ${file.path}`);
+          return deletePromises.push(Promise.resolve());
+        }
         deletePromises.push(
           fetch(file.path, { method: 'DELETE' })
             .then(() => addSystemMessage(`✓ Deleted ${file.path}`))
@@ -3291,6 +5002,8 @@ function clearAllChunks() {
       chunkerState.unchunkedFiles = [];
       chunkerState.chunkedFiles = [];
       chunkerState.totalChunks = 0;
+      ramDiskCache.chunked.clear();
+      ramDiskCache.unchunked.clear();
       updateChunkerStatus();
       addSystemMessage(`✅ Cleared all chunked and unchunked files.`);
     });
@@ -3312,10 +5025,16 @@ async function handleUserMessage() {
 }
 
 async function respondToUser(userEntry) {
-  updateProcessState('modelA', { status: 'Retrieving', detail: 'Gathering relevant memories.' });
+  const autoInjecting = Boolean(config.autoInjectMemories);
+  updateProcessState('modelA', {
+    status: 'Retrieving',
+    detail: autoInjecting ? 'Gathering relevant memories.' : 'Auto-injection disabled; using floating buffer as needed.'
+  });
   try {
     const { messages, retrievedMemories } = await buildModelMessages(userEntry);
-    registerRetrieval('A', retrievedMemories.length);
+    if (autoInjecting) {
+      registerRetrieval('A', retrievedMemories.length);
+    }
     if (!config.endpoint || !config.model) {
       addSystemMessage('Configure the model endpoint and name to receive AI replies.');
       updateModelConnectionStatus();
@@ -3378,13 +5097,24 @@ async function respondToUser(userEntry) {
 
 async function buildModelMessages(userEntry) {
   const messages = [];
-  const retrievedMemories = await retrieveRelevantMemories(userEntry.content, config.retrievalCount);
+  let retrievedMemories = [];
+  const shouldAutoRetrieve = Boolean(config.autoInjectMemories);
+  const reasoningActive = isReasoningModeActive();
+
+  if (shouldAutoRetrieve) {
+    const retrievalCap = reasoningActive
+      ? Math.max(0, Math.min(3, config.retrievalCount || 3))
+      : config.retrievalCount;
+    if (retrievalCap !== 0) {
+      retrievedMemories = await retrieveRelevantMemories(userEntry.content, retrievalCap);
+    }
+  }
 
   if (config.systemPrompt?.trim()) {
     messages.push({ role: 'system', content: config.systemPrompt.trim() });
   }
 
-  if (retrievedMemories.length) {
+  if (shouldAutoRetrieve && retrievedMemories.length) {
     const compiled = retrievedMemories
       .map((item) => `${formatTimestamp(item.timestamp)} • ${item.role}: ${item.content}`)
       .join('\n');
@@ -3394,7 +5124,7 @@ async function buildModelMessages(userEntry) {
     });
   }
 
-  const recent = getRecentConversation();
+  const recent = getRecentConversation({ reasoningMode: reasoningActive });
   for (const item of recent) {
     messages.push({ role: item.role, content: item.content });
   }
@@ -3403,9 +5133,41 @@ async function buildModelMessages(userEntry) {
   return { messages, retrievedMemories };
 }
 
-function getRecentConversation() {
-  const limit = Math.max(2, Math.min(config.contextTurns, conversationLog.length));
+function getRecentConversation(options = {}) {
+  if (!conversationLog.length) {
+    return [];
+  }
+  const reasoningActive = isReasoningModeActive(options);
+  const maxTurns = reasoningActive ? Math.min(3, conversationLog.length) : config.contextTurns;
+  const limit = Math.max(2, Math.min(maxTurns, conversationLog.length));
   return conversationLog.slice(-limit);
+}
+
+// CODEx: Strip heavyweight properties from metadata before persisting chat entries.
+function sanitizeMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object') {
+    return undefined;
+  }
+  const sanitized = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value == null) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      if (key === 'retrievedMemories') {
+        sanitized.retrievalCount = value.length;
+        continue;
+      }
+      if (value.length > 12) {
+        sanitized[`${key}Count`] = value.length;
+        continue;
+      }
+      sanitized[key] = value.slice();
+      continue;
+    }
+    sanitized[key] = value;
+  }
+  return Object.keys(sanitized).length ? sanitized : undefined;
 }
 
 async function appendMessage(role, content, options = {}) {
@@ -3421,19 +5183,20 @@ async function appendMessage(role, content, options = {}) {
     timestamp += 1;
   }
 
+  const sanitizedMetadata = sanitizeMetadata(metadata) ?? {};
   const entry = {
-    id: metadata.id ?? timestamp,
+    id: sanitizedMetadata.id ?? timestamp,
     role,
     content,
     timestamp,
-    origin: metadata.origin ?? 'floating',
-    mode: metadata.mode ?? MODE_CHAT,
-    ...metadata
+    origin: sanitizedMetadata.origin ?? 'floating',
+    mode: sanitizedMetadata.mode ?? MODE_CHAT,
+    ...sanitizedMetadata
   };
 
-  assignTurnNumber(entry, metadata.turnNumber);
+  assignTurnNumber(entry, sanitizedMetadata.turnNumber);
   const normalizedId = normalizeMessageId(entry.id);
-  if (metadata.pinned || pinnedMessageIds.has(normalizedId)) {
+  if (sanitizedMetadata.pinned || pinnedMessageIds.has(normalizedId)) {
     entry.pinned = true;
     pinnedMessageIds.add(normalizedId);
   }
@@ -3652,6 +5415,21 @@ async function putRagRecord(record) {
   });
 }
 
+// CODEx: Persist reflex diagnostics for later analysis.
+async function putReflexHistory(record) {
+  if (!db) return;
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([REFLEX_HISTORY_STORE], 'readwrite');
+    const store = transaction.objectStore(REFLEX_HISTORY_STORE);
+    const request = store.add(record);
+    request.onsuccess = () => resolve();
+    request.onerror = (event) => {
+      console.error('Failed to persist reflex history', event);
+      reject(event);
+    };
+  });
+}
+
 async function persistChatRagSnapshot() {
   if (!db) return;
   const sessionId = ensureRagSessionId(MODE_CHAT);
@@ -3819,6 +5597,13 @@ function updateFloatingSummary() {
   if (elements.ragFootprint) {
     elements.ragFootprint.textContent = formatMegabytes(calculateRagMemoryUsage());
   }
+  if (elements.ragCompressionRatio) {
+    const currentBytes = calculateMemoryUsage();
+    const ragBytes = calculateRagMemoryUsage();
+    const combinedBytes = currentBytes + ragBytes;
+    const compression = combinedBytes > 0 ? 1 - currentBytes / combinedBytes : 0;
+    elements.ragCompressionRatio.textContent = `${(Math.max(0, Math.min(1, compression)) * 100).toFixed(1)}%`;
+  }
   updateRagStatusDisplay();
   updateRetrievalStats();
 }
@@ -3860,7 +5645,9 @@ function updateRagStatusDisplay() {
   }
 
   if (!lastLoad && !lastSave) {
-    elements.ragImportStatus.textContent = 'RAG archives not loaded yet.';
+    elements.ragImportStatus.textContent = config.autoInjectMemories
+      ? 'RAG archives not loaded yet. Auto-injecting floating memories when they match.'
+      : 'RAG archives not loaded yet. Auto-injection disabled; floating memory stays on standby.';
     return;
   }
 
@@ -3897,6 +5684,14 @@ function updateRagStatusDisplay() {
     segments.push(`Skipped ${ragTelemetry.staticErrors.length} ${errorLabel}; open the debug console for details.`);
   }
 
+  if (!config.autoInjectMemories) {
+    segments.push('Auto-injection disabled; floating memory stays on standby.');
+  } else if (Number.isFinite(config.retrievalCount) && config.retrievalCount > 0) {
+    segments.push(`Auto-injecting up to ${config.retrievalCount} memory snippet${config.retrievalCount === 1 ? '' : 's'} per prompt.`);
+  } else {
+    segments.push('Auto-injecting all matching memories per prompt.');
+  }
+
   elements.ragImportStatus.textContent = segments.join(' ');
 }
 
@@ -3915,10 +5710,23 @@ function updateChunkerStatus() {
       elements.chunkerStatus.textContent = '🔄 Processing files…';
       elements.chunkerStatus.style.color = '#ff6b35'; // Orange/red for processing
     } else if (chunkerState.unchunkedFiles.length > 0) {
-      elements.chunkerStatus.textContent = `🟡 ${chunkerState.unchunkedFiles.length} file${chunkerState.unchunkedFiles.length === 1 ? '' : 's'} ready to chunk.`;
+      const pending = chunkerState.unchunkedFiles.length;
+      const ramBacked = chunkerState.unchunkedFiles.filter((file) => file.source === 'ram').length;
+      let status = `🟡 ${pending} file${pending === 1 ? '' : 's'} ready to chunk.`;
+      if (ramBacked > 0) {
+        status += ` ${ramBacked} cached in RAM disk.`;
+      }
+      elements.chunkerStatus.textContent = status;
       elements.chunkerStatus.style.color = '#ffd23f'; // Yellow for ready
     } else {
-      elements.chunkerStatus.textContent = '🟢 No files to chunk. Scan the rag/ folder first.';
+      const chunkedCount = chunkerState.chunkedFiles.length;
+      const ramChunked = chunkerState.chunkedFiles.filter((file) => file.source === 'ram').length;
+      if (chunkedCount > 0) {
+        const ramNote = ramChunked > 0 ? ` (${ramChunked} cached in RAM disk)` : '';
+        elements.chunkerStatus.textContent = `🟢 ${chunkedCount} chunked file${chunkedCount === 1 ? '' : 's'} ready${ramNote}.`;
+      } else {
+        elements.chunkerStatus.textContent = '🟢 No files to chunk. Scan the rag/ folder first.';
+      }
       elements.chunkerStatus.style.color = '#06ffa5'; // Green for idle
     }
   }
@@ -4051,6 +5859,58 @@ function archiveUnpinnedFloatingMemory() {
   addSystemMessage(`Manually archived ${removed} unpinned ${removed === 1 ? 'memory' : 'memories'}.`);
 }
 
+function handleStandaloneWatchdogMessage(event) {
+  if (!event || typeof event.data !== 'object') {
+    return;
+  }
+  const data = event.data;
+  if (!data || data.source !== WATCHDOG_MESSAGE_SOURCE || data.type !== WATCHDOG_MESSAGE_TYPE) {
+    return;
+  }
+  runStandaloneMemoryWatchdog();
+}
+
+function runStandaloneMemoryWatchdog() {
+  if (typeof window === 'undefined') return;
+  if (!window.standaloneStore && !window.standaloneFs) return;
+  if (!isDualChatRunning) return;
+  const limitBytes = config.memoryLimitMB * MB;
+  if (!Number.isFinite(limitBytes) || limitBytes <= 0) return;
+  const totalBytes = calculateMemoryUsage();
+  if (totalBytes <= 0) return;
+  const utilization = totalBytes / limitBytes;
+  if (!Number.isFinite(utilization) || utilization < WATCHDOG_PRESSURE_THRESHOLD) {
+    return;
+  }
+  if (lastWatchdogArchiveAt && Date.now() - lastWatchdogArchiveAt < 60000) {
+    return;
+  }
+  const candidates = floatingMemory
+    .filter((entry) => entry && entry.origin === 'arena' && !entry.pinned)
+    .sort((a, b) => normalizeTimestamp(a.timestamp) - normalizeTimestamp(b.timestamp));
+  if (!candidates.length) return;
+  const removeCount = Math.max(1, Math.floor(candidates.length * WATCHDOG_ARCHIVE_PERCENT));
+  let archived = 0;
+  for (const entry of candidates.slice(0, removeCount)) {
+    if (archiveMemoryEntry(entry.id, { silent: true })) {
+      archived += 1;
+    }
+  }
+  if (archived === 0) {
+    return;
+  }
+  lastWatchdogArchiveAt = Date.now();
+  updateMemoryStatus();
+  renderFloatingMemoryWorkbench();
+  persistPinnedMessages();
+  void persistDualRagSnapshot();
+  const percent = (utilization * 100).toFixed(1);
+  addSystemMessage(
+    `Watchdog archived ${archived} arena ${archived === 1 ? 'turn' : 'turns'} after floating memory hit ${percent}% of its budget.`
+  );
+  void recordLog('arena', `Watchdog archived ${archived} arena turn(s) at ${percent}% utilization.`, { silent: true });
+}
+
 function moveEntryToArchive(entry, { silent = false } = {}) {
   if (!entry) return false;
   const normalizedId = normalizeMessageId(entry.id ?? entry.timestamp);
@@ -4073,7 +5933,7 @@ function moveEntryToArchive(entry, { silent = false } = {}) {
 
 function persistPinnedMessages() {
   try {
-    window.localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify(Array.from(pinnedMessageIds)));
+    storageSetItem(PINNED_STORAGE_KEY, JSON.stringify(Array.from(pinnedMessageIds)));
   } catch (error) {
     console.error('Failed to persist pinned messages:', error);
   }
@@ -4141,7 +6001,15 @@ function updateMemoryStatus(currentBytes = calculateMemoryUsage()) {
   const messageLabel = totalCount === 1 ? 'msg' : 'msgs';
   const ragCount = countRagMemories();
   const ragLabel = ragCount ? ` • ${ragCount} from RAG` : '';
-  elements.memoryStatus.innerHTML = `Floating memory: ${used} / ${config.memoryLimitMB}&nbsp;MB • ${totalCount} ${messageLabel} (${pinnedCount} pinned)${ragLabel}`;
+  const ragBytes = calculateRagMemoryUsage();
+  const combinedBytes = currentBytes + ragBytes;
+  const compression = combinedBytes > 0 ? 1 - currentBytes / combinedBytes : 0;
+  const compressionPercent = Math.max(0, Math.min(1, compression));
+  const compressionLabel = `${(compressionPercent * 100).toFixed(1)}% compressed`;
+  elements.memoryStatus.innerHTML = `Floating memory: ${used} / ${config.memoryLimitMB}&nbsp;MB • ${totalCount} ${messageLabel} (${pinnedCount} pinned)${ragLabel} • ${compressionLabel}`;
+  if (elements.ragCompressionRatio) {
+    elements.ragCompressionRatio.textContent = `${(compressionPercent * 100).toFixed(1)}%`;
+  }
 }
 
 async function runDiagnostics() {
@@ -4174,14 +6042,45 @@ async function runDiagnostics() {
     `• Arena ${formatArenaConnectionDiagnostic('A', agentAConnection)}`,
     `• Arena ${formatArenaConnectionDiagnostic('B', agentBConnection)}`
   ];
+  const retrievalDescriptor = !config.autoInjectMemories
+    ? 'manual (promote memories when needed)'
+    : Number.isFinite(config.retrievalCount) && config.retrievalCount > 0
+      ? `auto (up to ${config.retrievalCount} snippet${config.retrievalCount === 1 ? '' : 's'})`
+      : 'auto (all matching memories)';
+  diagnostics.push(`• Memory retrieval: ${retrievalDescriptor}`);
+
+  const callCount = modelCallMetrics.count;
+  const averageMs = callCount > 0 ? Math.round(modelCallMetrics.totalMs / callCount) : 0;
+  const timeoutLabel = `${modelCallMetrics.reasoningTimeouts} reasoning timeout${modelCallMetrics.reasoningTimeouts === 1 ? '' : 's'}`;
+  diagnostics.push(
+    callCount > 0
+      ? `• Model calls: ${callCount} run${callCount === 1 ? '' : 's'} averaging ${averageMs} ms (${timeoutLabel})`
+      : `• Model calls: no runs recorded yet (${timeoutLabel})`
+  );
+
+  const ragParts = [];
+  if (Number.isFinite(ragTelemetry.lastRetrievalMs) && ragTelemetry.lastRetrievalMs > 0) {
+    ragParts.push(`${ragTelemetry.lastRetrievalMs} ms last retrieval`);
+  }
+  if (ragTelemetry.lastLoadRecords) {
+    ragParts.push(`${ragTelemetry.lastLoadRecords} chunk${ragTelemetry.lastLoadRecords === 1 ? '' : 's'} loaded`);
+  }
+  if (ragTelemetry.lastLoadBytes) {
+    ragParts.push(`${formatMegabytes(ragTelemetry.lastLoadBytes)} footprint`);
+  }
+  if (ragTelemetry.lastLoad) {
+    ragParts.push(`updated ${formatTimestamp(ragTelemetry.lastLoad)}`);
+  }
+  diagnostics.push(`• RAG telemetry: ${ragParts.length ? ragParts.join(' • ') : 'no retrieval activity yet'}`);
 
   const reflexLabel = config.reflexEnabled
     ? `enabled every ${config.reflexInterval} turn(s)`
     : 'disabled';
   diagnostics.push(`• Reflex mode: ${reflexLabel}`);
   const entropyDetails = describeEntropy(currentEntropyScore);
+  const volleyLabel = `volley${config.entropyWindow === 1 ? '' : 's'}`;
   diagnostics.push(
-    `• Entropy (last ${config.entropyWindow} turns): ${(currentEntropyScore * 100).toFixed(0)}% ${entropyDetails.label}`
+    `• Entropy (last ${config.entropyWindow} ${volleyLabel}): ${(currentEntropyScore * 100).toFixed(0)}% ${entropyDetails.label}`
   );
 
   const endpointResult = await probeModelEndpoint();
@@ -4205,8 +6104,48 @@ async function runDiagnostics() {
     diagnostics.push(`• ${label} probe: ${emoji} ${entry.result.message}`);
   }
 
+  diagnostics.push(`• Request timeout: ${config.requestTimeoutSeconds}s (reasoning: ${config.reasoningTimeoutSeconds}s)`);
+
+  const diagnosticPayload = {
+    timestamp: startedAt.toISOString(),
+    model: {
+      preset: preset?.id ?? 'custom',
+      endpoint: config.endpoint,
+      model: config.model,
+      callCount,
+      averageMs,
+      totalMs: modelCallMetrics.totalMs,
+      reasoningTimeouts: modelCallMetrics.reasoningTimeouts
+    },
+    rag: {
+      lastRetrievalMs: ragTelemetry.lastRetrievalMs,
+      lastLoadCount: ragTelemetry.lastLoadCount,
+      lastLoadRecords: ragTelemetry.lastLoadRecords,
+      lastLoadBytes: ragTelemetry.lastLoadBytes,
+      lastLoad: ragTelemetry.lastLoad
+    },
+    memory: {
+      floatingBytes,
+      limitBytes,
+      pinnedCount,
+      floatingCount: floatingMemory.length,
+      ragCount: countRagMemories()
+    },
+    arena: {
+      running: isDualChatRunning,
+      turnsCompleted: dualTurnsCompleted,
+      entropy: currentEntropyScore
+    },
+    probes: {
+      main: endpointResult,
+      agents: agentProbeEntries
+    }
+  };
+
   const report = `Diagnostics @ ${startedAt.toLocaleTimeString()}\n${diagnostics.join('\n')}`;
   addSystemMessage(report);
+
+  console.info('[Diagnostics]', JSON.stringify(diagnosticPayload, null, 2));
 
   if (endpointResult.status === 'ok') {
     updateModelConnectionStatus();
@@ -4286,8 +6225,10 @@ async function promoteRelevantMemories() {
 }
 
 async function retrieveRelevantMemories(query, limit) {
-  const tokens = tokenize(query);
+  const normalizedQuery = (query ?? '').trim();
+  const tokens = tokenize(normalizedQuery);
   if (!tokens.length) return [];
+  const retrievalStarted = getTimestampMs();
 
   const candidates = new Map();
   for (const entry of floatingMemory) {
@@ -4316,18 +6257,23 @@ async function retrieveRelevantMemories(query, limit) {
       }
     }
   }
-
   const scores = [];
-  candidates.forEach((value) => {
-    const score = cosineSimilarity(tokens, tokenize(value.content));
-    if (score > 0) {
-      scores.push({ entry: value, score });
+  const queryVector = await generateQueryEmbedding(normalizedQuery, tokens);
+
+  for (const value of candidates.values()) {
+    const lexicalScore = cosineSimilarity(tokens, tokenize(value.content));
+    const vectorScore = await scoreEmbeddingMatch(queryVector, value);
+    const combinedScore = vectorScore !== null ? (vectorScore * 0.8 + lexicalScore * 0.2) : lexicalScore;
+    if (combinedScore > 0) {
+      scores.push({ entry: value, score: combinedScore });
     }
-  });
+  }
 
   scores.sort((a, b) => b.score - a.score);
   const selected = limit > 0 ? scores.slice(0, limit) : scores;
-  return selected.map((item) => item.entry);
+  const result = selected.map((item) => item.entry);
+  ragTelemetry.lastRetrievalMs = Math.round(Math.max(0, getTimestampMs() - retrievalStarted));
+  return result;
 }
 
 function tokenize(text) {
@@ -4337,6 +6283,7 @@ function tokenize(text) {
     ?.filter((token) => token.length > 1) || [];
 }
 
+// CODEx: Fallback cosine similarity for lexical retrieval when embeddings are unavailable.
 function cosineSimilarity(queryTokens, docTokens) {
   if (!docTokens.length) return 0;
   const tf = new Map();
@@ -4363,17 +6310,443 @@ function cosineSimilarity(queryTokens, docTokens) {
   return dotProduct / Math.sqrt(queryMagnitude * docMagnitude);
 }
 
-function estimateTokenCount(text) {
-  if (!text) return 0;
-  const parts = text
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  let total = 0;
-  for (const part of parts) {
-    total += Math.max(1, Math.ceil(part.length / 4));
+// CODEx: Generate or reuse embeddings for the active query text.
+async function generateQueryEmbedding(query, tokens) {
+  if (!query || query.length < EMBEDDING_MIN_QUERY_LENGTH) {
+    return null;
   }
-  return total;
+  try {
+    return await generateTextEmbedding(query);
+  } catch (error) {
+    console.debug('Embedding query fallback engaged:', error);
+    if (tokens.length < 2) {
+      return null;
+    }
+    return lexicalEmbedding(tokens);
+  }
+}
+
+// CODEx: Score a candidate memory against the current query embedding.
+async function scoreEmbeddingMatch(queryVector, entry) {
+  if (!queryVector) {
+    return null;
+  }
+  const vector = await ensureEntryEmbedding(entry);
+  if (!vector) {
+    return null;
+  }
+  return cosineSimilarityVectors(queryVector, vector);
+}
+
+// CODEx: Ensure a message has an embedding cached for future retrieval.
+async function ensureEntryEmbedding(entry) {
+  const key = normalizeMessageId(entry.id ?? entry.timestamp ?? entry.content);
+  if (messageEmbeddingCache.has(key)) {
+    return messageEmbeddingCache.get(key);
+  }
+  const content = (entry?.content ?? '').trim();
+  if (!content) {
+    return null;
+  }
+  try {
+    const vector = await generateTextEmbedding(content);
+    if (vector) {
+      messageEmbeddingCache.set(key, vector);
+      return vector;
+    }
+  } catch (error) {
+    console.debug('Message embedding fallback:', error);
+  }
+  const fallbackVector = lexicalEmbedding(content);
+  messageEmbeddingCache.set(key, fallbackVector);
+  return fallbackVector;
+}
+
+// CODEx: Produce or reuse an embedding for arbitrary text content.
+async function generateTextEmbedding(text, options = {}) {
+  const trimmed = (text ?? '').trim();
+  if (!trimmed) {
+    return null;
+  }
+  const model = (config.embeddingModel || defaultConfig.embeddingModel || '').trim() || 'text-embedding-3-large';
+  const cacheKey = `${model}::${hashString(trimmed)}`;
+  if (embeddingCache.has(cacheKey)) {
+    return embeddingCache.get(cacheKey);
+  }
+  let vector = null;
+  try {
+    vector = await requestEmbeddingFromProvider(trimmed, model, options);
+  } catch (error) {
+    console.debug('Embedding provider unavailable, falling back to lexical vector:', error);
+  }
+  if (!Array.isArray(vector) || !vector.length) {
+    vector = lexicalEmbedding(trimmed);
+  }
+  embeddingCache.set(cacheKey, vector);
+  return vector;
+}
+
+// CODEx: Resolve an embedding endpoint that matches the active provider.
+function resolveEmbeddingEndpoint() {
+  const configured = (config.embeddingEndpoint ?? '').trim();
+  if (configured) {
+    return configured;
+  }
+  const endpoint = (config.endpoint ?? '').trim();
+  if (!endpoint) {
+    return '';
+  }
+  if (isLikelyOllama(endpoint)) {
+    return `${stripTrailingSlashes(deriveBaseUrl(endpoint))}/api/embeddings`;
+  }
+  if (isLikelyLmStudio(endpoint)) {
+    return endpoint.replace(/\/v1\/chat\/completions/, '/api/embeddings').replace(/\/api\/chat$/, '/api/embeddings');
+  }
+  if (/\/chat\/completions/.test(endpoint)) {
+    return endpoint.replace(/\/chat\/completions/, '/embeddings');
+  }
+  if (endpoint.endsWith('/api/chat')) {
+    return `${endpoint.slice(0, -5)}embeddings`;
+  }
+  return `${stripTrailingSlashes(endpoint)}/embeddings`;
+}
+
+// CODEx: Detect Ollama endpoints for schema adjustments.
+function isLikelyOllama(endpoint) {
+  return /ollama/i.test(endpoint) || /11434/.test(endpoint);
+}
+
+// CODEx: Detect LM Studio endpoints for schema adjustments.
+function isLikelyLmStudio(endpoint) {
+  return /1234/.test(endpoint) || /lmstudio/i.test(endpoint);
+}
+
+// CODEx: Strip trailing slashes while preserving protocol prefixes.
+function stripTrailingSlashes(value) {
+  return value.replace(/\/+$/, '');
+}
+
+// CODEx: Reduce an endpoint to its base path.
+function deriveBaseUrl(endpoint) {
+  try {
+    const parsed = new URL(endpoint, window.location.origin);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    if (segments.length > 1) {
+      segments.pop();
+    }
+    parsed.pathname = segments.length ? `/${segments.join('/')}` : '/';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString().replace(/\/$/, '');
+  } catch (error) {
+    const withoutQuery = endpoint.split(/[?#]/)[0];
+    return withoutQuery.replace(/\/[^/]*$/, '');
+  }
+}
+
+// CODEx: Request embeddings from either local or cloud providers.
+async function requestEmbeddingFromProvider(text, model, { signal } = {}) {
+  const endpoint = resolveEmbeddingEndpoint();
+  if (!endpoint) {
+    throw new Error('Embedding endpoint unavailable');
+  }
+  const headers = { 'Content-Type': 'application/json' };
+  const apiKey = (config.embeddingApiKey || config.apiKey || '').trim();
+  if (apiKey && !isLikelyOllama(endpoint) && !isLikelyLmStudio(endpoint)) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  if (/openrouter\.ai/.test(endpoint) && (config.openRouterPolicy ?? '').trim()) {
+    headers['X-OpenRouter-Data-Policy'] = config.openRouterPolicy.trim();
+  }
+  let payload;
+  if (isLikelyOllama(endpoint)) {
+    payload = { model, prompt: text };
+  } else if (isLikelyLmStudio(endpoint)) {
+    payload = { model, input: [text] };
+  } else {
+    payload = { model, input: [text] };
+  }
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+    signal
+  });
+  if (!response.ok) {
+    throw new Error(`Embedding HTTP ${response.status}`);
+  }
+  const data = await response.json();
+  if (isLikelyOllama(endpoint)) {
+    const vector = data?.embedding ?? data?.data?.[0]?.embedding ?? null;
+    return Array.isArray(vector) ? vector : null;
+  }
+  const vector = data?.data?.[0]?.embedding ?? data?.embedding ?? null;
+  return Array.isArray(vector) ? vector : null;
+}
+
+// CODEx: Cosine similarity for numeric vectors.
+function cosineSimilarityVectors(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || !a.length || !b.length) {
+    return 0;
+  }
+  const length = Math.min(a.length, b.length);
+  let dot = 0;
+  let magA = 0;
+  let magB = 0;
+  for (let index = 0; index < length; index += 1) {
+    const x = a[index];
+    const y = b[index];
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      continue;
+    }
+    dot += x * y;
+    magA += x * x;
+    magB += y * y;
+  }
+  if (!magA || !magB) {
+    return 0;
+  }
+  return dot / Math.sqrt(magA * magB);
+}
+
+// CODEx: Produce hashed lexical embeddings as an offline fallback.
+function lexicalEmbedding(input, dimensions = EMBEDDING_HASH_BUCKETS) {
+  const tokens = Array.isArray(input) ? input : tokenize(input);
+  if (!tokens.length) {
+    return new Array(dimensions).fill(0);
+  }
+  const vector = new Array(dimensions).fill(0);
+  for (const token of tokens) {
+    const bucket = hashString(token) % dimensions;
+    vector[bucket] += 1;
+  }
+  return normalizeVector(vector);
+}
+
+// CODEx: Derive lightweight topic fingerprints for Reflex storage.
+function extractTopicFingerprints(text, limit = 5) {
+  const tokens = tokenize(text)
+    .filter((token) => token.length > 3)
+    .map((token) => token.toLowerCase());
+  if (!tokens.length) {
+    return [];
+  }
+  const counts = new Map();
+  for (const token of tokens) {
+    counts.set(token, (counts.get(token) || 0) + 1);
+  }
+  const sorted = Array.from(counts.entries()).sort((a, b) => {
+    if (b[1] === a[1]) {
+      return a[0].localeCompare(b[0]);
+    }
+    return b[1] - a[1];
+  });
+  return sorted.slice(0, limit).map(([token]) => token);
+}
+
+// CODEx: Normalize vectors to unit length for cosine scoring.
+function normalizeVector(vector) {
+  let magnitude = 0;
+  for (const value of vector) {
+    if (Number.isFinite(value)) {
+      magnitude += value * value;
+    }
+  }
+  if (!magnitude) {
+    return vector;
+  }
+  const scale = 1 / Math.sqrt(magnitude);
+  return vector.map((value) => (Number.isFinite(value) ? value * scale : 0));
+}
+
+// CODEx: Simple 32-bit hash for caching and lexical buckets.
+function hashString(value) {
+  let hash = 0;
+  const text = String(value);
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (hash << 5) - hash + text.charCodeAt(index);
+    hash |= 0;
+  }
+  return hash >>> 0;
+}
+
+// CODEx: Identify the connection strategy for the active endpoint.
+function detectConnectionType(endpoint, preset) {
+  const presetId = preset?.id ?? config.providerPreset;
+  if (presetId === 'ollama' || isLikelyOllama(endpoint)) {
+    return 'ollama';
+  }
+  if (presetId === 'lmstudio' || isLikelyLmStudio(endpoint)) {
+    return 'lmstudio';
+  }
+  return 'openai';
+}
+
+// CODEx: Derive the base local endpoint for LM Studio or Ollama.
+function resolveLocalChatEndpoint(endpoint, type) {
+  const base = deriveBaseUrl(endpoint);
+  if (type === 'ollama') {
+    return `${stripTrailingSlashes(base)}/api/chat`;
+  }
+  if (type === 'lmstudio') {
+    if (/\/api\/chat$/.test(endpoint)) {
+      return endpoint;
+    }
+    if (/\/v1\/chat\/completions$/.test(endpoint)) {
+      return endpoint.replace(/\/v1\/chat\/completions$/, '/api/chat');
+    }
+    return `${stripTrailingSlashes(base)}/api/chat`;
+  }
+  return endpoint;
+}
+
+// CODEx: Normalize chat messages for local APIs.
+function normalizeLocalMessages(messages) {
+  return messages.map((message) => ({ role: message.role, content: message.content }));
+}
+
+// CODEx: Convert a chat transcript into a single prompt for /api/generate fallbacks.
+function collapseMessagesToPrompt(messages) {
+  return messages.map((message) => `${message.role.toUpperCase()}: ${message.content}`).join('\n\n');
+}
+
+// CODEx: Handle local LM Studio/Ollama requests with context retries and fallbacks.
+async function callLocalModel({
+  type,
+  endpoint,
+  model,
+  messages,
+  temperature,
+  maxTokens,
+  timeoutMs
+}) {
+  let numCtx = getProviderContextLimit(type === 'ollama' ? 'ollama' : 'lmstudio');
+  let attempt = 0;
+  const chatEndpoint = resolveLocalChatEndpoint(endpoint, type);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    while (attempt < 2) {
+      attempt += 1;
+      const payload = {
+        model,
+        messages: normalizeLocalMessages(messages),
+        temperature,
+        stream: false,
+        num_ctx: numCtx,
+        num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx))
+      };
+      let response;
+      try {
+        response = await fetch(chatEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+      } catch (error) {
+        if (error.name === 'AbortError') {
+          const timeoutError = new Error(`Local request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+          timeoutError.code = 'timeout';
+          throw timeoutError;
+        }
+        throw error;
+      }
+      if (response.ok) {
+        const data = await response.json();
+        const text = data?.message?.content || data?.output || data?.response || '';
+        return { content: text, reasoning: data?.message?.reasoning || '', truncated: false };
+      }
+      const errorText = await response.text();
+      if (response.status >= 400 && response.status < 500) {
+        if (/no context/i.test(errorText) && attempt === 1) {
+          numCtx = Math.max(512, Math.floor(numCtx * 0.7));
+          continue;
+        }
+        if (/model not found/i.test(errorText) && type === 'ollama') {
+          const generateEndpoint = `${stripTrailingSlashes(deriveBaseUrl(endpoint))}/api/generate`;
+          const generatePayload = {
+            model,
+            prompt: collapseMessagesToPrompt(messages),
+            stream: false
+          };
+          const generateResponse = await fetch(generateEndpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(generatePayload),
+            signal: controller.signal
+          });
+          if (!generateResponse.ok) {
+            throw new Error(`HTTP ${generateResponse.status}: ${await generateResponse.text()}`);
+          }
+          const generateData = await generateResponse.json();
+          return { content: generateData?.response || generateData?.output || '', reasoning: '', truncated: false };
+        }
+      }
+      throw new Error(`HTTP ${response.status}: ${errorText}`);
+    }
+    throw new Error('Local model retry limit reached.');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// CODEx: Consume OpenAI-style streaming responses and merge text/reasoning segments.
+async function consumeOpenAiStream(response) {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const fallback = await response.text();
+    return { text: fallback, reasoning: '', truncated: false };
+  }
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  const textParts = [];
+  const reasoningParts = [];
+  let done = false;
+  while (!done) {
+    const { value, done: streamDone } = await reader.read();
+    done = streamDone;
+    if (value) {
+      buffer += decoder.decode(value, { stream: !done });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? '';
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || line === 'data:' || line === 'data: [DONE]') {
+          continue;
+        }
+        const payloadText = line.startsWith('data:') ? line.slice(5).trim() : line;
+        if (payloadText === '[DONE]') {
+          done = true;
+          break;
+        }
+        try {
+          const chunk = JSON.parse(payloadText);
+          const delta = chunk?.choices?.[0]?.delta ?? {};
+          if (typeof delta.content === 'string') {
+            textParts.push(delta.content);
+          }
+          if (typeof delta.reasoning === 'string') {
+            reasoningParts.push(delta.reasoning);
+          }
+          if (Array.isArray(delta.reasoning)) {
+            for (const item of delta.reasoning) {
+              if (typeof item?.text === 'string') {
+                reasoningParts.push(item.text);
+              }
+            }
+          }
+        } catch (error) {
+          textParts.push(payloadText);
+        }
+      }
+    }
+  }
+  return {
+    text: textParts.join(''),
+    reasoning: reasoningParts.join('\n').trim(),
+    truncated: false
+  };
 }
 
 function trimResponseToTokenLimit(text, limit) {
@@ -4480,28 +6853,104 @@ function normalizeModelMessage(message) {
   };
 }
 
+function resolveRequestTimeout(modelId, preset, overrideTimeout) {
+  if (Number.isFinite(overrideTimeout) && overrideTimeout > 0) {
+    return overrideTimeout;
+  }
+
+  const requestSeconds = Number.isFinite(config?.requestTimeoutSeconds)
+    ? config.requestTimeoutSeconds
+    : defaultConfig.requestTimeoutSeconds;
+  const reasoningSeconds = Number.isFinite(config?.reasoningTimeoutSeconds)
+    ? config.reasoningTimeoutSeconds
+    : defaultConfig.reasoningTimeoutSeconds;
+
+  const baseMs = Math.max(1000, Math.round(requestSeconds * 1000));
+  let reasoningMs = Math.max(baseMs, Math.round(reasoningSeconds * 1000));
+  reasoningMs = Math.max(reasoningMs, 300000);
+
+  if (preset?.reasoningTimeoutMs && Number.isFinite(preset.reasoningTimeoutMs) && preset.reasoningTimeoutMs > 0) {
+    reasoningMs = Math.max(reasoningMs, preset.reasoningTimeoutMs);
+  }
+
+  const reasoningActive = isReasoningModeActive({
+    model: modelId,
+    providerPreset: preset?.id ?? config.providerPreset
+  });
+
+  if (reasoningActive) {
+    return reasoningMs;
+  }
+
+  return baseMs;
+}
+
 async function callModel(messages, overrides = {}) {
   const endpoint = overrides.endpoint ?? config.endpoint;
   const model = overrides.model ?? config.model;
   const temperature = overrides.temperature ?? config.temperature;
   const apiKey = overrides.apiKey ?? config.apiKey;
-  const maxTokens = overrides.maxTokens ?? config.maxResponseTokens;
   const providerPreset = overrides.providerPreset ?? config.providerPreset;
+  const openRouterPolicy = (overrides.openRouterPolicy ?? config.openRouterPolicy ?? '').trim();
 
   if (!endpoint || !model) {
     throw new Error('Model endpoint or name missing.');
   }
 
   const preset = providerPresetMap.get(providerPreset);
+  const timeoutMs = resolveRequestTimeout(model, preset, overrides.timeoutMs);
+  const connectionType = detectConnectionType(endpoint, preset);
+  const reasoningActive = isReasoningModeActive({ model, providerPreset });
+  const contextLimit = getProviderContextLimit(providerPreset);
+  let effectiveMaxTokens = overrides.maxTokens ?? config.maxResponseTokens ?? contextLimit;
+  if (!Number.isFinite(effectiveMaxTokens) || effectiveMaxTokens <= 0) {
+    effectiveMaxTokens = contextLimit;
+  }
+  if (reasoningActive) {
+    effectiveMaxTokens = Math.max(4500, effectiveMaxTokens);
+  }
+  effectiveMaxTokens = Math.min(contextLimit, effectiveMaxTokens);
+
+  const callStarted = getTimestampMs();
+  // CODEx: Collect model latency metrics for diagnostics output.
+  const finalizeMetrics = () => {
+    const duration = Math.max(0, getTimestampMs() - callStarted);
+    modelCallMetrics.totalMs += duration;
+    modelCallMetrics.count += 1;
+  };
+
+  if (connectionType !== 'openai') {
+    try {
+      const result = await callLocalModel({
+        type: connectionType,
+        endpoint,
+        model,
+        messages,
+        temperature,
+        maxTokens: effectiveMaxTokens,
+        timeoutMs
+      });
+      finalizeMetrics();
+      return result;
+    } catch (error) {
+      finalizeMetrics();
+      if (reasoningActive && (error?.code === 'timeout' || /timed out/i.test(error?.message ?? ''))) {
+        modelCallMetrics.reasoningTimeouts += 1;
+      }
+      throw error;
+    }
+  }
+
   const isAnthropic = preset?.anthropicFormat;
   const isGoogle = preset?.googleFormat;
+  const usingOpenRouter = (preset?.id ?? providerPreset) === 'openrouter' || /openrouter\.ai/.test(endpoint);
+  const shouldStream = overrides.stream === true || (overrides.stream !== false && reasoningActive && !isAnthropic && !isGoogle);
 
   let headers = { 'Content-Type': 'application/json' };
   let payload = {};
   let requestEndpoint = endpoint;
 
   if (isAnthropic) {
-    // Anthropic format
     headers = {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
@@ -4509,46 +6958,49 @@ async function callModel(messages, overrides = {}) {
     };
     payload = {
       model,
-      max_tokens: Math.round(maxTokens) || 4096,
+      max_tokens: Math.round(effectiveMaxTokens) || 4096,
       temperature,
-      messages: messages.map(msg => ({
+      messages: messages.map((msg) => ({
         role: msg.role === 'assistant' ? 'assistant' : 'user',
         content: msg.content
       }))
     };
   } else if (isGoogle) {
-    // Google Gemini format
     requestEndpoint = `${endpoint}${model}:generateContent?key=${apiKey}`;
     payload = {
       contents: [{
-        parts: [{ text: messages.map(msg => `${msg.role}: ${msg.content}`).join('\n\n') }]
+        parts: [{ text: messages.map((msg) => `${msg.role}: ${msg.content}`).join('\n\n') }]
       }],
       generationConfig: {
         temperature,
-        maxOutputTokens: Math.round(maxTokens) || 2048
+        maxOutputTokens: Math.round(effectiveMaxTokens) || 2048
       }
     };
   } else {
-    // Standard OpenAI format
     if (apiKey) {
       headers.Authorization = `Bearer ${apiKey}`;
+    }
+    if (usingOpenRouter && openRouterPolicy) {
+      headers['X-OpenRouter-Data-Policy'] = openRouterPolicy;
     }
     payload = {
       model,
       messages,
       temperature,
-      stream: false
+      stream: shouldStream
     };
-    if (Number.isFinite(maxTokens) && maxTokens > 0) {
-      payload.max_tokens = Math.round(maxTokens);
+    if (Number.isFinite(effectiveMaxTokens) && effectiveMaxTokens > 0) {
+      payload.max_tokens = Math.round(effectiveMaxTokens);
     }
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response;
 
   try {
-    const response = await fetch(requestEndpoint, {
+    response = await fetch(requestEndpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
@@ -4558,32 +7010,44 @@ async function callModel(messages, overrides = {}) {
   } catch (error) {
     clearTimeout(timeoutId);
     if (error.name === 'AbortError') {
-      throw new Error('Request timed out after 30 seconds.');
+      if (reasoningActive) {
+        modelCallMetrics.reasoningTimeouts += 1;
+      }
+      finalizeMetrics();
+      const seconds = Math.round(timeoutMs / 100) / 10;
+      const timeoutError = new Error(`Request timed out after ${seconds}s.`);
+      timeoutError.code = 'timeout';
+      throw timeoutError;
     }
+    finalizeMetrics();
     throw error;
   }
 
   if (!response.ok) {
     const text = await response.text();
+    finalizeMetrics();
     throw new Error(`HTTP ${response.status}: ${text}`);
+  }
+
+  if (shouldStream && response.headers.get('content-type')?.includes('text/event-stream')) {
+    const streamed = await consumeOpenAiStream(response);
+    finalizeMetrics();
+    return { content: streamed.text, truncated: streamed.truncated, reasoning: streamed.reasoning };
   }
 
   const data = await response.json();
 
   let message = {};
   if (isAnthropic) {
-    // Anthropic response format
     message = {
       content: data.content?.[0]?.text || '',
-      reasoning: data.content?.find(c => c.type === 'thinking')?.thinking || ''
+      reasoning: data.content?.find((c) => c.type === 'thinking')?.thinking || ''
     };
   } else if (isGoogle) {
-    // Google Gemini response format
     message = {
       content: data.candidates?.[0]?.content?.parts?.[0]?.text || ''
     };
   } else {
-    // Standard OpenAI format
     message = data?.choices?.[0]?.message ?? {};
   }
 
@@ -4597,14 +7061,17 @@ async function callModel(messages, overrides = {}) {
   }
   const combined = segments.join('\n\n').trim();
   if (!combined) {
+    finalizeMetrics();
     return { content: '', truncated: false, reasoning: reasoning ?? '' };
   }
 
-  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+  if (!Number.isFinite(effectiveMaxTokens) || effectiveMaxTokens <= 0) {
+    finalizeMetrics();
     return { content: combined, truncated: false, reasoning };
   }
 
-  const trimmedResult = trimResponseToTokenLimit(combined, Math.round(maxTokens));
+  const trimmedResult = trimResponseToTokenLimit(combined, Math.round(effectiveMaxTokens));
+  finalizeMetrics();
   return { ...trimmedResult, reasoning };
 }
 
@@ -4927,6 +7394,7 @@ async function startDualChat() {
   activeDualSeed = seed;
   rotateRagSession(MODE_ARENA);
   resetDualChat();
+  clearDualCountdownTimer();
   activeDualConnections.A = agentAConnection;
   activeDualConnections.B = agentBConnection;
   isDualChatRunning = true;
@@ -4951,6 +7419,7 @@ async function startDualChat() {
   elements.dualStatus.textContent = 'Dual chat running…';
   updateModelConnectionStatus();
   startDualAutosaveTimer();
+  await activatePhase(0, { force: true, announce: true });
   updateReflexStatus(config.reflexEnabled ? 'Reflex armed' : 'Reflex disabled', config.reflexEnabled ? 'ready' : 'disabled');
   updateEntropyMeter();
   await generateDualTurn('A', seed, { isInitial: true });
@@ -4970,6 +7439,11 @@ function resetDualChat() {
   reflexSummaryCount = 0;
   lastReflexSummaryAt = null;
   reflexInFlight = false;
+  activePhaseIndex = 0;
+  activePhaseId = null;
+  pendingPhaseAdvance = false;
+  lastEntropyState = 'calibrating';
+  lastReflexSynthesisSignature = null;
   updateProcessState('arena', { status: 'Idle', detail: 'Dual chat reset.' });
   updateEntropyMeter();
   updateReflexStatus();
@@ -4981,6 +7455,7 @@ function stopDualChat() {
     clearTimeout(autoContinueTimer);
     autoContinueTimer = undefined;
   }
+  clearDualCountdownTimer();
   stopDualAutosaveTimer();
   activeDualConnections.A = null;
   activeDualConnections.B = null;
@@ -4989,6 +7464,7 @@ function stopDualChat() {
   updateModelConnectionStatus();
   void persistDualRagSnapshot();
   reflexInFlight = false;
+  pendingPhaseAdvance = false;
   updateProcessState('arena', { status: 'Idle', detail: 'Dual chat stopped.' });
   updateProcessState('modelA', { status: 'Idle', detail: 'Waiting for user prompt.' });
   const modelBDetail = config.agentBEnabled ? 'Awaiting arena start.' : 'Model B is disabled.';
@@ -5019,10 +7495,41 @@ async function advanceDualTurn() {
     stopDualChat();
     return;
   }
+  if (autoContinueTimer) {
+    clearTimeout(autoContinueTimer);
+    autoContinueTimer = undefined;
+  }
+  clearDualCountdownTimer();
   await generateDualTurn(nextDualSpeaker);
   if (config.dualAutoContinue) {
     scheduleNextDualTurn();
   }
+}
+
+function clearDualCountdownTimer() {
+  if (dualCountdownTimer) {
+    clearInterval(dualCountdownTimer);
+    dualCountdownTimer = undefined;
+  }
+  dualCountdownDeadline = null;
+}
+
+function updateDualCountdownStatus() {
+  if (!elements.dualStatus) return;
+  if (!isDualChatRunning || dualCountdownDeadline === null) {
+    if (isDualChatRunning) {
+      elements.dualStatus.textContent = 'Dual chat running…';
+    }
+    return;
+  }
+  const remainingMs = dualCountdownDeadline - Date.now();
+  if (remainingMs <= 0) {
+    elements.dualStatus.textContent = 'Dual chat running…';
+    clearDualCountdownTimer();
+    return;
+  }
+  const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  elements.dualStatus.textContent = `Next turn in ${seconds}s…`;
 }
 
 function scheduleNextDualTurn() {
@@ -5032,9 +7539,50 @@ function scheduleNextDualTurn() {
     stopDualChat();
     return;
   }
+  clearTimeout(autoContinueTimer);
+  clearDualCountdownTimer();
+  const delaySeconds = resolveDualTurnDelaySeconds();
+  const delayMs = Math.max(0, Math.round(delaySeconds * 1000));
+  if (delayMs === 0) {
+    elements.dualStatus.textContent = 'Dual chat running…';
+    autoContinueTimer = setTimeout(() => {
+      autoContinueTimer = undefined;
+      void advanceDualTurn();
+    }, 0);
+    return;
+  }
+  dualCountdownDeadline = Date.now() + delayMs;
+  updateDualCountdownStatus();
+  dualCountdownTimer = setInterval(() => {
+    updateDualCountdownStatus();
+  }, 1000);
   autoContinueTimer = setTimeout(() => {
+    autoContinueTimer = undefined;
+    clearDualCountdownTimer();
     void advanceDualTurn();
-  }, 2000);
+  }, delayMs);
+}
+
+function resolveDualTurnDelaySeconds() {
+  const baseDelay = clampNumber(
+    config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds,
+    0,
+    600,
+    defaultConfig.dualTurnDelaySeconds
+  );
+  if (baseDelay === 0) {
+    return 0;
+  }
+  if (!Number.isFinite(currentEntropyScore)) {
+    return baseDelay;
+  }
+  if (currentEntropyScore >= ENTROPY_LOOP_THRESHOLD) {
+    return Math.max(MIN_DYNAMIC_DELAY_SECONDS, Math.round(baseDelay * LOOP_DELAY_SCALE));
+  }
+  if (currentEntropyScore <= ENTROPY_EXPLORE_THRESHOLD) {
+    return Math.min(MAX_DYNAMIC_DELAY_SECONDS, Math.round(baseDelay * EXPLORE_DELAY_SCALE));
+  }
+  return baseDelay;
 }
 
 function startDualAutosaveTimer() {
@@ -5057,35 +7605,92 @@ function stopDualAutosaveTimer() {
   updateProcessState('autosave', { status: 'Idle', detail: 'Next snapshot pending.' });
 }
 
+function tokenizeForEntropy(content) {
+  const normalized = (content ?? '')
+    .toLowerCase()
+    .replace(/[“”]/g, '"')
+    .replace(/[’]/g, "'");
+  const tokens = normalized.match(/[a-z0-9]+/g);
+  return tokens ? tokens.filter(Boolean) : [];
+}
+
+function buildEntropyVector(content) {
+  const tokens = tokenizeForEntropy(content);
+  const weights = new Map();
+  for (const token of tokens) {
+    const nextCount = (weights.get(token) ?? 0) + 1;
+    weights.set(token, nextCount);
+  }
+  let magnitudeSquared = 0;
+  for (const value of weights.values()) {
+    magnitudeSquared += value * value;
+  }
+  return { weights, magnitude: magnitudeSquared > 0 ? Math.sqrt(magnitudeSquared) : 0 };
+}
+
+function cosineSimilarity(vecA, vecB) {
+  if (!vecA || !vecB || vecA.magnitude === 0 || vecB.magnitude === 0) {
+    return 0;
+  }
+  const [smaller, larger] = vecA.weights.size <= vecB.weights.size ? [vecA, vecB] : [vecB, vecA];
+  let dot = 0;
+  for (const [token, weight] of smaller.weights.entries()) {
+    const other = larger.weights.get(token);
+    if (other) {
+      dot += weight * other;
+    }
+  }
+  return dot / (vecA.magnitude * vecB.magnitude);
+}
+
 function computeEntropyScore(history, windowSize) {
   if (!Array.isArray(history) || history.length === 0) {
     return 0;
   }
-  const size = clampNumber(windowSize ?? config.entropyWindow ?? defaultConfig.entropyWindow, 2, 50, 6);
-  const recent = history.slice(-size);
-  const tokens = recent
-    .map((entry) => entry?.content ?? '')
-    .join(' ')
-    .toLowerCase()
-    .match(/[\w\-']+/g);
-  if (!tokens || tokens.length === 0) {
+  const volleyWindow = clampNumber(
+    windowSize ?? config.entropyWindow ?? defaultConfig.entropyWindow,
+    1,
+    25,
+    defaultConfig.entropyWindow
+  );
+  const sampleSize = Math.max(2, volleyWindow * 2);
+  const relevant = history.filter(
+    (entry) => entry && entry.countsAsTurn !== false && entry.speaker !== 'system' && typeof entry.content === 'string'
+  );
+  if (relevant.length < 2) {
     return 0;
   }
-  const unique = new Set(tokens);
-  return unique.size / tokens.length;
+  const recent = relevant.slice(-sampleSize);
+  if (recent.length < 2) {
+    return 0;
+  }
+  const vectors = recent.map((entry) => buildEntropyVector(entry.content));
+  let total = 0;
+  let comparisons = 0;
+  for (let index = 1; index < vectors.length; index += 1) {
+    const similarity = cosineSimilarity(vectors[index - 1], vectors[index]);
+    if (Number.isFinite(similarity)) {
+      total += similarity;
+      comparisons += 1;
+    }
+  }
+  if (comparisons === 0) {
+    return 0;
+  }
+  return total / comparisons;
 }
 
 function describeEntropy(score) {
   if (!Number.isFinite(score) || score <= 0) {
     return { state: 'calibrating', label: 'Calibrating…' };
   }
-  if (score < 0.3) {
+  if (score >= ENTROPY_LOOP_THRESHOLD) {
     return { state: 'loop', label: 'Looping' };
   }
-  if (score < 0.55) {
-    return { state: 'steady', label: 'Steady' };
+  if (score <= ENTROPY_EXPLORE_THRESHOLD) {
+    return { state: 'explore', label: 'Exploring' };
   }
-  return { state: 'explore', label: 'Exploring' };
+  return { state: 'steady', label: 'Steady' };
 }
 
 function updateEntropyMeter() {
@@ -5101,6 +7706,12 @@ function updateEntropyMeter() {
     meter.setAttribute('aria-valuenow', String(percent));
   }
   elements.entropyStatus.textContent = description.label;
+  if (description.state !== lastEntropyState) {
+    if (description.state === 'loop') {
+      void maybeAdvancePhase();
+    }
+    lastEntropyState = description.state;
+  }
 }
 
 function updateReflexStatus(message, state) {
@@ -5152,7 +7763,8 @@ async function runReflexSummary(speaker, options = {}) {
     const agentName = getAgentDisplayName(agent);
     const partnerName = getAgentDisplayName(partner);
     const persona = getAgentPersona(agent);
-    const lookback = Math.max(config.entropyWindow ?? 6, config.reflexInterval ?? 4, 6);
+    const volleyWindow = config.entropyWindow ?? defaultConfig.entropyWindow;
+    const lookback = Math.max(volleyWindow * 2, config.reflexInterval ?? 4, 6);
     const recent = dualChatHistory.slice(-lookback);
     const transcript = recent
       .map((item) => {
@@ -5179,14 +7791,31 @@ async function runReflexSummary(speaker, options = {}) {
       updateReflexStatus('Reflex ready (no summary returned)', 'ready');
       return;
     }
-    const decorated = `Reflex summary\n${summary.trim()}`;
+    const trimmedSummary = summary.trim();
+    const topicFingerprints = extractTopicFingerprints(trimmedSummary);
+    const fingerprintLine = topicFingerprints.length
+      ? `\n\nTopic fingerprints: ${topicFingerprints.join(', ')}`
+      : '';
+    const decorated = `Reflex summary\n${trimmedSummary}${fingerprintLine}`;
     recordDualMessage(agent, decorated, {
       marker: 'reflex',
       label: 'Reflex',
-      countsAsTurn: false
+      countsAsTurn: false,
+      metadata: { topicFingerprints }
     });
-    lastReflexSummaryAt = Date.now();
+    const reflexTimestamp = Date.now();
+    lastReflexSummaryAt = reflexTimestamp;
     reflexSummaryCount += 1;
+    void recordReflexHistory({
+      timestamp: reflexTimestamp,
+      speaker: agent,
+      summary: trimmedSummary,
+      keywords: topicFingerprints,
+      entropy: currentEntropyScore,
+      arenaTurn: dualTurnCounter,
+      phaseId: activePhaseId ?? null,
+      source: forced ? 'manual' : 'scheduled'
+    });
     void recordLog('arena', `${agentName} posted Reflex summary #${reflexSummaryCount}`, { silent: true });
     updateReflexStatus();
   } catch (error) {
@@ -5200,13 +7829,220 @@ async function runReflexSummary(speaker, options = {}) {
   }
 }
 
+// CODEx: Persist Reflex metrics for later diagnostics.
+async function recordReflexHistory(entry) {
+  const payload = {
+    timestamp: entry.timestamp ?? Date.now(),
+    speaker: entry.speaker ?? 'system',
+    summary: entry.summary ?? '',
+    keywords: Array.isArray(entry.keywords) ? entry.keywords : [],
+    entropy: Number.isFinite(entry.entropy) ? entry.entropy : currentEntropyScore,
+    arenaTurn: entry.arenaTurn ?? dualTurnCounter,
+    phaseId: entry.phaseId ?? activePhaseId ?? null,
+    source: entry.source ?? 'auto'
+  };
+  try {
+    await putReflexHistory(payload);
+  } catch (error) {
+    console.debug('Unable to store Reflex history record', error);
+  }
+}
+
+function findLastTurnBySpeaker(agent) {
+  for (let index = dualChatHistory.length - 1; index >= 0; index -= 1) {
+    const entry = dualChatHistory[index];
+    if (!entry) continue;
+    if (entry.speaker === agent && entry.countsAsTurn !== false) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function extractReflexSegments(content) {
+  const segments = { outcome: null, test: null };
+  if (typeof content !== 'string') {
+    return segments;
+  }
+  const pattern = /\[(Predicted Outcome|Test)[^\]]*?(?:→|->|=>|:)\s*([^\]\n\r]+)/gi;
+  let match;
+  while ((match = pattern.exec(content)) !== null) {
+    const label = match[1]?.toLowerCase();
+    const value = match[2]?.trim();
+    if (!value) continue;
+    if (label && label.includes('predicted') && !segments.outcome) {
+      segments.outcome = value;
+    } else if (label === 'test' && !segments.test) {
+      segments.test = value;
+    }
+  }
+  return segments;
+}
+
+function ensureSentence(text) {
+  if (!text) return '';
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+function composeReflexSynthesisParagraph(segmentsA, segmentsB) {
+  const aName = getAgentDisplayName('A');
+  const bName = getAgentDisplayName('B');
+  const sentences = [];
+  if (segmentsA.outcome) {
+    sentences.push(ensureSentence(`${aName} anticipates ${segmentsA.outcome}`));
+  }
+  if (segmentsB.outcome) {
+    sentences.push(ensureSentence(`${bName} expects ${segmentsB.outcome}`));
+  }
+  const testClauses = [];
+  if (segmentsA.test) {
+    testClauses.push(`${aName} proposes ${segmentsA.test}`);
+  }
+  if (segmentsB.test) {
+    testClauses.push(`${bName} suggests ${segmentsB.test}`);
+  }
+  if (testClauses.length) {
+    sentences.push(ensureSentence(testClauses.join('; ')));
+  }
+  return sentences.join(' ');
+}
+
+function maybeTriggerReflexHooks() {
+  if (!config.reflexEnabled) return;
+  if (dualChatHistory.length < 2) return;
+  const lastA = findLastTurnBySpeaker('A');
+  const lastB = findLastTurnBySpeaker('B');
+  if (!lastA || !lastB) return;
+  const segmentsA = extractReflexSegments(lastA.content);
+  const segmentsB = extractReflexSegments(lastB.content);
+  if (!segmentsA.outcome || !segmentsA.test || !segmentsB.outcome || !segmentsB.test) {
+    return;
+  }
+  const signature = `${normalizeTimestamp(lastA.timestamp)}|${normalizeTimestamp(lastB.timestamp)}`;
+  if (lastReflexSynthesisSignature === signature) {
+    return;
+  }
+  const summaryParagraph = composeReflexSynthesisParagraph(segmentsA, segmentsB);
+  if (!summaryParagraph) {
+    return;
+  }
+  const topicFingerprints = extractTopicFingerprints(summaryParagraph);
+  const fingerprintLine = topicFingerprints.length
+    ? `\n\nTopic fingerprints: ${topicFingerprints.join(', ')}`
+    : '';
+  const content = `Reflex summary\n${summaryParagraph}${fingerprintLine}`;
+  recordDualMessage('system', content, {
+    marker: 'reflex',
+    label: 'Reflex',
+    countsAsTurn: false,
+    metadata: { topicFingerprints }
+  });
+  const reflexTimestamp = Date.now();
+  lastReflexSummaryAt = reflexTimestamp;
+  reflexSummaryCount += 1;
+  lastReflexSynthesisSignature = signature;
+  updateReflexStatus();
+  void recordReflexHistory({
+    timestamp: reflexTimestamp,
+    speaker: 'system',
+    summary: summaryParagraph,
+    keywords: topicFingerprints,
+    entropy: currentEntropyScore,
+    arenaTurn: dualTurnCounter,
+    phaseId: activePhaseId ?? null,
+    source: 'auto-hook'
+  });
+  void recordLog('arena', 'Reflex auto-synthesis posted.', { silent: true });
+}
+
+async function readPhasePromptFile(fileName) {
+  if (!fileName) return null;
+  if (phasePromptCache.has(fileName)) {
+    return phasePromptCache.get(fileName);
+  }
+  const relativePath = `${PHASE_PROMPT_DIR}${fileName}`;
+  const fsResult = readStandaloneFile(relativePath);
+  if (fsResult?.content) {
+    phasePromptCache.set(fileName, fsResult.content);
+    return fsResult.content;
+  }
+  try {
+    const response = await fetch(relativePath, { cache: 'no-store' });
+    if (response.ok) {
+      const text = await response.text();
+      phasePromptCache.set(fileName, text);
+      return text;
+    }
+  } catch (error) {
+    console.warn('Failed to fetch phase prompt', relativePath, error);
+  }
+  return null;
+}
+
+async function activatePhase(index, options = {}) {
+  if (!Array.isArray(phases) || phases.length === 0) return;
+  if (index < 0 || index >= phases.length) return;
+  const phase = phases[index];
+  const alreadyActive = activePhaseId === phase.id && activePhaseIndex === index;
+  if (alreadyActive && !options.force) {
+    return;
+  }
+  let content = null;
+  if (phase.prompt) {
+    content = await readPhasePromptFile(phase.prompt);
+  }
+  activePhaseIndex = index;
+  activePhaseId = phase.id;
+  pendingPhaseAdvance = false;
+  lastEntropyState = 'calibrating';
+  lastReflexSynthesisSignature = null;
+  if (!content) {
+    const message = `Phase ${phase.id} (${phase.title}) prompt not found at ${PHASE_PROMPT_DIR}${phase.prompt || ''}.`;
+    addSystemMessage(message);
+    void recordLog('error', message, { level: 'warn' });
+    return;
+  }
+  const trimmed = content.trim();
+  const header = `Phase ${phase.id}: ${phase.title}`;
+  const body = trimmed ? `${header}\n${trimmed}` : header;
+  recordDualMessage('system', body, {
+    marker: 'phase',
+    label: `Phase ${phase.id}`,
+    countsAsTurn: false
+  });
+  if (options.announce) {
+    addSystemMessage(`Loaded ${header} from ${PHASE_PROMPT_DIR}.`);
+  }
+  void recordLog('arena', `Activated phase ${phase.id} – ${phase.title}`, { silent: true });
+}
+
+async function maybeAdvancePhase() {
+  if (!isDualChatRunning) return;
+  if (pendingPhaseAdvance) return;
+  if (!Array.isArray(phases) || phases.length === 0) return;
+  if (activePhaseIndex >= phases.length - 1) return;
+  pendingPhaseAdvance = true;
+  try {
+    await activatePhase(activePhaseIndex + 1, { auto: true });
+  } finally {
+    pendingPhaseAdvance = false;
+  }
+}
+
 async function generateDualTurn(speaker, seed, options = {}) {
   if (!isDualChatRunning) return;
   const partner = speaker === 'A' ? 'B' : 'A';
   const speakerName = getAgentDisplayName(speaker);
   const partnerName = getAgentDisplayName(partner);
+  const normalizedSeed = typeof seed === 'string' && seed.trim() ? seed : activeDualSeed || config.dualSeed || DEFAULT_DUAL_SEED;
   const persona = getAgentPersona(speaker);
   const connection = activeDualConnections[speaker] ?? getAgentConnection(speaker);
+  clearDualCountdownTimer();
+  if (elements.dualStatus) {
+    elements.dualStatus.textContent = `${speakerName} is thinking…`;
+  }
   if (!connection.endpoint || !connection.model) {
     addSystemMessage(`${speakerName} lost its connection details. Stop and reconfigure before resuming the arena.`);
     stopDualChat();
@@ -5214,9 +8050,12 @@ async function generateDualTurn(speaker, seed, options = {}) {
   }
 
   const processKey = speaker === 'A' ? 'modelA' : 'modelB';
+  const autoInjecting = Boolean(config.autoInjectMemories);
   updateProcessState(processKey, {
     status: 'Retrieving',
-    detail: `${speakerName} is gathering arena memories.`
+    detail: autoInjecting
+      ? `${speakerName} is gathering arena memories.`
+      : `${speakerName} is skipping auto retrieval.`
   });
 
   const historyMessages = [];
@@ -5226,6 +8065,11 @@ async function generateDualTurn(speaker, seed, options = {}) {
   });
 
   for (const turn of dualChatHistory) {
+    if (!turn) continue;
+    if (turn.speaker === 'system' || turn.marker === 'reflex' || turn.marker === 'phase') {
+      historyMessages.push({ role: 'system', content: turn.content });
+      continue;
+    }
     const label = turn.speaker === speaker ? speakerName : partnerName;
     const role = turn.speaker === speaker ? 'assistant' : 'user';
     historyMessages.push({ role, content: `${label}: ${turn.content}` });
@@ -5235,18 +8079,21 @@ async function generateDualTurn(speaker, seed, options = {}) {
   if (options.isInitial) {
     historyMessages.push({
       role: 'user',
-      content: `${partnerName}: ${seed}`
+      content: `${partnerName}: ${normalizedSeed}`
     });
-  } else if (latestPartnerTurn) {
-    historyMessages.push({
-      role: 'user',
-      content: `${partnerName}: ${latestPartnerTurn.content}`
-    });
+  } else {
+    const lastMessage = historyMessages[historyMessages.length - 1];
+    if (!lastMessage || lastMessage.role !== 'user') {
+      const fallbackContent = latestPartnerTurn
+        ? `${partnerName}: ${latestPartnerTurn.content}`
+        : `${partnerName}: ${normalizedSeed}`;
+      historyMessages.push({ role: 'user', content: fallbackContent });
+    }
   }
 
   const retrievalQuery = options.isInitial ? seed : latestPartnerTurn?.content ?? seed;
   let retrievedMemories = [];
-  if (retrievalQuery) {
+  if (autoInjecting && retrievalQuery) {
     retrievedMemories = await retrieveRelevantMemories(retrievalQuery, config.retrievalCount);
     if (retrievedMemories.length) {
       const compiled = retrievedMemories
@@ -5258,7 +8105,9 @@ async function generateDualTurn(speaker, seed, options = {}) {
       });
     }
   }
-  registerRetrieval(speaker, retrievedMemories.length);
+  if (autoInjecting) {
+    registerRetrieval(speaker, retrievedMemories.length);
+  }
 
   try {
     updateProcessState(processKey, {
@@ -5330,20 +8179,24 @@ async function generateDualTurn(speaker, seed, options = {}) {
 }
 
 function recordDualMessage(speaker, content, options = {}) {
-  const { saveHistory = true, label, marker, turnNumber: providedTurn, countsAsTurn = true } = options;
+  const { saveHistory = true, label, marker, turnNumber: providedTurn } = options;
+  const metadata = sanitizeMetadata(options.metadata);
+  const countsOption = options.countsAsTurn;
   const timestamp = Date.now();
   let turnNumber = typeof providedTurn === 'number' ? providedTurn : null;
+  const normalizedSpeaker = speaker === 'B' ? 'B' : speaker === 'system' ? 'system' : 'A';
+  const countsAsTurn = typeof countsOption === 'boolean' ? countsOption : normalizedSpeaker !== 'system';
 
-  const speakerName = getAgentDisplayName(speaker);
+  const speakerName = getAgentDisplayName(normalizedSpeaker);
 
   if (saveHistory) {
     if (countsAsTurn) {
-      if (speaker === 'A') {
+      if (normalizedSpeaker === 'A') {
         dualTurnCounter += 1;
         if (turnNumber === null) {
           turnNumber = dualTurnCounter;
         }
-      } else {
+      } else if (normalizedSpeaker === 'B') {
         if (dualTurnCounter === 0) {
           dualTurnCounter = 1;
         }
@@ -5354,18 +8207,30 @@ function recordDualMessage(speaker, content, options = {}) {
     } else if (turnNumber === null && dualChatHistory.length) {
       turnNumber = dualChatHistory[dualChatHistory.length - 1].turnNumber ?? dualTurnCounter;
     }
-    dualChatHistory.push({ speaker, content, timestamp, turnNumber });
+    dualChatHistory.push({
+      speaker: normalizedSpeaker,
+      content,
+      timestamp,
+      turnNumber,
+      marker,
+      countsAsTurn,
+      metadata
+    });
 
     const memoryEntry = {
-      id: `arena-${timestamp}-${speaker}-${dualChatHistory.length}`,
+      id: `arena-${timestamp}-${normalizedSpeaker}-${dualChatHistory.length}`,
       role: speakerName,
-      speaker,
+      speaker: normalizedSpeaker,
       speakerName,
       content,
       timestamp,
       origin: 'arena',
       turnNumber,
-      mode: MODE_ARENA
+      mode: MODE_ARENA,
+      marker,
+      countsAsTurn,
+      phaseId: activePhaseId ?? null,
+      metadata
     };
     floatingMemory.push(memoryEntry);
     trimFloatingMemory();
@@ -5403,6 +8268,9 @@ function recordDualMessage(speaker, content, options = {}) {
   elements.dualChatWindow.appendChild(node);
   scrollContainerToBottom(elements.dualChatWindow);
   void persistDualRagSnapshot();
+  if (countsAsTurn && (normalizedSpeaker === 'A' || normalizedSpeaker === 'B')) {
+    maybeTriggerReflexHooks();
+  }
   updateEntropyMeter();
 }
 

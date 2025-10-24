@@ -35,7 +35,7 @@
         <span id="modelStatus" class="status-pill status-pill--alert" role="status">Model A: Not connected</span>
         <span id="modelBStatus" class="status-pill status-pill--alert" role="status">Model B: Disabled</span>
         <span id="ragStatusFlag" class="status-pill status-pill--alert" role="status">RAG: Not loaded</span>
-        <span id="memoryStatus" class="status-pill">Floating memory: 0 / 500&nbsp;MB</span>
+        <span id="memoryStatus" class="status-pill">Floating memory: 0 / 100&nbsp;MB</span>
       </div>
       <div class="status-row status-row--actions">
         <span id="systemResourceStatus" class="status-note">Detecting system memory and GPU…</span>
@@ -117,13 +117,23 @@
   <aside id="optionsDrawer" class="side-panel" aria-labelledby="memory-heading" tabindex="-1" aria-hidden="true" inert>
       <section class="side-card">
         <h2 id="memory-heading">Memory &amp; Retrieval</h2>
-        <label class="slider-label" for="memorySlider">Floating memory budget <span id="memorySliderValue">500&nbsp;MB</span></label>
-        <input id="memorySlider" type="range" min="50" max="1024" step="50" value="500">
+        <label class="slider-label" for="memorySlider">Floating memory budget <span id="memorySliderValue">100&nbsp;MB</span></label>
+        <input id="memorySlider" type="range" min="50" max="200" step="10" value="100">
 
         <div class="field">
           <label for="retrievalCount">Memories per retrieval (0 = unlimited)</label>
           <input id="retrievalCount" type="number" min="0" max="200" value="0">
         </div>
+
+        <label class="toggle">
+          <input id="autoInjectMemories" type="checkbox">
+          <span>Auto-inject retrieved memories into prompts</span>
+        </label>
+
+        <label class="toggle">
+          <input id="reasoningModeToggle" type="checkbox">
+          <span>Reasoning mode (limit context to fresh turns and lightweight RAG)</span>
+        </label>
 
         <div class="field">
           <label for="contextTurns">Recent turns in context</label>
@@ -157,6 +167,10 @@
             <dt>RAG footprint</dt>
             <dd id="ragFootprint">0 MB</dd>
           </div>
+          <div class="memory-stat">
+            <dt>Compression ratio</dt>
+            <dd id="ragCompressionRatio">0%</dd>
+          </div>
         </dl>
         <dl class="memory-stats memory-stats--retrieval" aria-live="polite">
           <div class="memory-stat">
@@ -171,7 +185,9 @@
         <p id="ragImportStatus" class="hint-text" role="status">RAG archives not loaded yet.</p>
         <div id="floatingMemoryList" class="memory-list" role="list"></div>
         <div class="memory-actions">
+          <button id="saveChatArchiveButton" class="ghost" type="button">Save chat to archive</button>
           <button id="loadRagButton" class="ghost" type="button">Load RAG archives</button>
+          <button id="loadChunkDataButton" class="ghost" type="button">Load chunk data</button>
           <button id="refreshFloatingButton" class="ghost" type="button">Refresh view</button>
           <button id="archiveUnpinnedButton" class="ghost danger" type="button">Archive unpinned</button>
         </div>
@@ -270,6 +286,29 @@
           <input id="apiKeyInput" type="password" autocomplete="off">
         </div>
         <div class="field">
+          <label for="embeddingModelInput">Embedding model</label>
+          <input id="embeddingModelInput" type="text" placeholder="text-embedding-3-large">
+          <p class="field-hint">Controls vector retrieval quality. Leave blank to restore the default.</p>
+        </div>
+        <div class="field">
+          <label for="embeddingEndpointInput">Embedding endpoint</label>
+          <input id="embeddingEndpointInput" type="url" placeholder="Optional override e.g. http://localhost:11434/api/embeddings">
+          <p class="field-hint">Blank = auto-detect from the selected provider.</p>
+        </div>
+        <div class="field">
+          <label for="embeddingApiKeyInput">Embedding API key</label>
+          <input id="embeddingApiKeyInput" type="password" autocomplete="off" placeholder="Optional unless required by the service">
+        </div>
+        <div class="field" id="openRouterPolicyField">
+          <label for="openRouterPolicyInput">OpenRouter data policy</label>
+          <input id="openRouterPolicyInput" type="text" placeholder="e.g. default, opt-out, free">
+          <p class="field-hint">Match your OpenRouter privacy mode to avoid 404 data-policy errors.</p>
+        </div>
+        <div class="field">
+          <label for="agentAName">Model A display name</label>
+          <input id="agentAName" type="text" placeholder="SAM-A">
+        </div>
+        <div class="field">
           <label for="systemPromptInput">Persona / system prompt</label>
           <textarea id="systemPromptInput" rows="4" placeholder="You are SAM, a helpful memory-augmented assistant."></textarea>
         </div>
@@ -286,37 +325,19 @@
 
         <h3 class="side-card-subheading">Model B (arena partner)</h3>
         <label class="toggle">
-          <input id="agentBEnabled" type="checkbox" checked>
+          <input id="agentBEnabled" type="checkbox">
           <span>Enable Model B for dual debates</span>
         </label>
-        <div class="field">
-          <label for="agentAName">Model A display name</label>
-          <input id="agentAName" type="text" placeholder="SAM-A">
+        <div class="field field--inline">
+          <label for="requestTimeout">Request timeout (seconds)</label>
+          <input id="requestTimeout" type="number" min="10" max="600" value="30">
         </div>
-        <div class="field">
-          <label for="agentAPrompt">Model A arena persona</label>
-          <textarea id="agentAPrompt" rows="3" placeholder="You are SAM-A, an analytical thinker."></textarea>
+        <div class="field field--inline">
+          <label for="reasoningTimeout">Reasoning timeout (seconds)</label>
+          <input id="reasoningTimeout" type="number" min="30" max="900" value="120">
+          <p class="field-hint">Used whenever a model or preset signals extended thinking time.</p>
         </div>
-        <div class="field">
-          <label for="agentAProviderSelect">Model A preset override</label>
-          <select id="agentAProviderSelect">
-            <option value="inherit">Share Model A settings</option>
-          </select>
-          <p id="agentAProviderNotes" class="field-hint" role="note"></p>
-        </div>
-        <div class="field">
-          <label for="agentAEndpoint">Model A override endpoint</label>
-          <input id="agentAEndpoint" type="url" placeholder="http://localhost:1234/v1/chat/completions">
-        </div>
-        <div class="field">
-          <label for="agentAModel">Model A override name</label>
-          <input id="agentAModel" type="text" placeholder="lmstudio-community/TinyLlama-1.1B-Chat-v1.0">
-        </div>
-        <div class="field">
-          <label for="agentAApiKey">Model A override key</label>
-          <input id="agentAApiKey" type="password" autocomplete="off" placeholder="Optional unless required by the service">
-        </div>
-        <div id="agentBConfig" class="agent-b-config">
+        <div id="agentBConfig" class="agent-b-config" hidden aria-hidden="true">
           <div class="field">
             <label for="agentBName">Model B display name</label>
             <input id="agentBName" type="text" placeholder="SAM-B">
@@ -350,6 +371,11 @@
           <label for="dualTurnLimit">Max turns (0 = unlimited)</label>
           <input id="dualTurnLimit" type="number" min="0" max="50" value="0" placeholder="0">
         </div>
+        <div class="field field--inline">
+          <label for="dualTurnDelay">Dual turn delay (seconds)</label>
+          <input id="dualTurnDelay" type="number" min="0" max="600" value="15" placeholder="15">
+          <p class="field-hint">Wait this long before auto-starting the partner&apos;s next turn.</p>
+        </div>
         <label class="toggle">
           <input id="dualAutoContinue" type="checkbox" checked>
           <span>Auto-continue conversation</span>
@@ -369,8 +395,8 @@
           <input id="reflexInterval" type="number" min="2" max="50" value="8">
         </div>
         <div class="field field--inline">
-          <label for="entropyWindow">Entropy lookback (turns)</label>
-          <input id="entropyWindow" type="number" min="2" max="50" value="6">
+          <label for="entropyWindow">Entropy lookback (volleys)</label>
+          <input id="entropyWindow" type="number" min="1" max="25" value="5">
         </div>
         <div class="field field--stack">
           <button id="triggerReflexButton" class="ghost" type="button">Trigger Reflex now</button>
