@@ -431,8 +431,14 @@ const defaultConfig = {
   agentBModel: '',
   agentAEmbeddingProvider: EMBEDDING_PROVIDERS.OLLAMA_LOCAL, // CODEx: Default SAM-A embedding provider.
   agentAEmbeddingModel: 'mxbai-embed-large', // CODEx: Default SAM-A embedding checkpoint.
+  agentAEmbeddingEndpoint: '', // CODEx: SAM-A specific embedding endpoint override.
+  agentAEmbeddingApiKey: '', // CODEx: SAM-A specific embedding API key.
+  agentAEmbeddingContextLength: 1024, // CODEx: SAM-A embedding context hint.
   agentBEmbeddingProvider: EMBEDDING_PROVIDERS.LM_STUDIO, // CODEx: Default SAM-B embedding provider.
   agentBEmbeddingModel: 'text-embedding-3-large', // CODEx: Default SAM-B embedding checkpoint.
+  agentBEmbeddingEndpoint: '', // CODEx: SAM-B specific embedding endpoint override.
+  agentBEmbeddingApiKey: '', // CODEx: SAM-B specific embedding API key.
+  agentBEmbeddingContextLength: 1024, // CODEx: SAM-B embedding context hint.
   agentBApiKey: '',
   dualAutoContinue: true,
   dualTurnLimit: 0,
@@ -486,7 +492,60 @@ const REASONING_MODEL_HINTS = [
   'cot' // CODEx: Support chain-of-thought model aliases.
 ];
 const REASONING_MODEL_REGEX = /reason|think|deep|reflect|cot|chain|reflection/i; // CODEx: Phase VI expanded reasoning detector.
-const EMBEDDING_MODEL_REGEX = /embed|embedding|textembedding/i; // CODEx: Identify embedding-specialized checkpoints.
+const EMBEDDING_MODEL_REGEX = /embed|embedding|text[-_]?embedding|e5|gte-|nv-embed|textembedding/i; // CODEx: Identify embedding-specialized checkpoints including modern aliases.
+const CHAT_ROUTES = Object.freeze({ // CODEx: Centralize provider-specific chat endpoints.
+  'openai-like': '/v1/chat/completions', // CODEx: Default OpenAI-compatible route.
+  'lmstudio-local': '/v1/chat/completions', // CODEx: LM Studio aligns with OpenAI schema for chat.
+  'ollama-local': '/api/generate', // CODEx: Native Ollama chat endpoint.
+  'ollama-cloud': '/v1/chat/completions', // CODEx: Ollama Cloud mirrors OpenAI routes.
+  openrouter: '/v1/chat/completions' // CODEx: OpenRouter leverages OpenAI-compatible schema.
+});
+const EMBED_ROUTES = Object.freeze({ // CODEx: Centralize provider-specific embedding endpoints.
+  'openai-like': '/v1/embeddings', // CODEx: Default embeddings route for OpenAI-compatible APIs.
+  'lmstudio-local': '/v1/embeddings', // CODEx: LM Studio local embeddings endpoint.
+  'ollama-local': '/api/embed', // CODEx: Native Ollama embedding endpoint.
+  'ollama-cloud': '/v1/embeddings', // CODEx: Ollama Cloud exposes OpenAI-compatible embeddings route.
+  openrouter: '/v1/embeddings' // CODEx: OpenRouter embeddings mirror OpenAI routes.
+});
+
+function getProviderRouteKey(providerId) { // CODEx: Map provider identifiers to standardized routing keys.
+  const id = (providerId || '').toString().toLowerCase(); // CODEx: Normalize provider identifier for comparisons.
+  if (id === EMBEDDING_PROVIDERS.LM_STUDIO || id === 'lmstudio' || id === 'lmstudio-local') {
+    return 'lmstudio-local';
+  }
+  if (id === EMBEDDING_PROVIDERS.OLLAMA_LOCAL || id === 'ollama' || id === 'ollama-local') {
+    return 'ollama-local';
+  }
+  if (id === EMBEDDING_PROVIDERS.OLLAMA_CLOUD || id === 'ollama-cloud') {
+    return 'ollama-cloud';
+  }
+  if (id === 'openrouter') {
+    return 'openrouter';
+  }
+  return 'openai-like'; // CODEx: Default to OpenAI-compatible routing.
+}
+
+function joinProviderEndpoint(baseUrl, suffix) { // CODEx: Combine a base URL with a provider route suffix.
+  const base = stripTrailingSlashes(baseUrl || ''); // CODEx: Ensure base lacks trailing slash before concatenation.
+  if (!base) {
+    return suffix || '';
+  }
+  const cleanedSuffix = (suffix || '').replace(/^\/+/, ''); // CODEx: Avoid duplicate slashes when joining.
+  return `${base}/${cleanedSuffix}`;
+}
+
+function deriveBaseOrigin(url) { // CODEx: Reduce a URL to its scheme and host for provider routing.
+  if (!url) {
+    return '';
+  }
+  try {
+    const parsed = new URL(url, typeof window !== 'undefined' ? window.location.origin : undefined); // CODEx: Resolve relative URLs when running in browser.
+    return `${parsed.protocol}//${parsed.host}`.replace(/\/$/, ''); // CODEx: Return scheme + host without trailing slash.
+  } catch (error) {
+    const sanitized = String(url).split(/[?#]/)[0]; // CODEx: Drop query/hash fragments manually.
+    return sanitized.replace(/\/[^/]*$/, '').replace(/\/$/, ''); // CODEx: Remove trailing path components and slash.
+  }
+}
 
 const providerPresets = [
   {
@@ -876,6 +935,15 @@ function isEmbeddingModelId(modelId) {
   return EMBEDDING_MODEL_REGEX.test(modelId.toLowerCase()); // CODEx: Apply embedding model heuristic pattern.
 }
 
+function ensureChatModel(modelId, providerPreset) { // CODEx: Guard against embedding checkpoints in chat routes.
+  if (!isEmbeddingModelId(modelId)) {
+    return modelId; // CODEx: Safe to reuse requested model when it supports chat.
+  }
+  const fallback = providerPreset?.model || defaultConfig.model; // CODEx: Defer to preset defaults when available.
+  console.warn('[SAM] Chat requested with embedding model; switching to fallback', { requested: modelId, fallback }); // CODEx: Surface automatic fallback telemetry.
+  return fallback || modelId; // CODEx: Preserve original identifier if no safer fallback exists.
+}
+
 // CODEx: Determine whether reasoning safeguards should be active for the current request.
 function isReasoningModeActive(overrides = {}) {
   if (overrides.reasoningMode === true) {
@@ -1023,6 +1091,43 @@ function refreshEmbeddingStatusIndicator() { // CODEx: Update the memory drawer 
   } // CODEx
   const reason = embeddingServiceReason ? ` (${embeddingServiceReason})` : ' (offline)'; // CODEx: Prepare contextual failure messaging.
   indicator.textContent = `Embedding Active ✗ (Provider: ${providerLabel}, Cache: ${cacheLabel})${reason}`; // CODEx: Combine failure message with provider context.
+} // CODEx
+
+function toggleEmbeddingCard(cardElement, toggleButton) { // CODEx: Collapse or expand per-agent embedding cards.
+  if (!cardElement || !toggleButton) { // CODEx: Guard against missing DOM nodes.
+    return; // CODEx: Exit safely when elements are unavailable.
+  }
+  const collapsed = cardElement.getAttribute('data-collapsed') === 'true'; // CODEx: Inspect current collapsed state.
+  const nextState = !collapsed; // CODEx: Flip collapse boolean.
+  cardElement.setAttribute('data-collapsed', String(nextState)); // CODEx: Persist new state on the card container.
+  toggleButton.setAttribute('aria-expanded', String(!nextState)); // CODEx: Keep accessibility attributes in sync.
+  toggleButton.textContent = nextState ? '▸' : '▾'; // CODEx: Swap chevron indicator for collapsed/expanded state.
+} // CODEx
+
+async function runEmbeddingTest(agent) { // CODEx: Probe embedding health for a specific arena agent.
+  const normalizedAgent = agent === 'B' ? 'B' : 'A'; // CODEx: Default to SAM-A when unspecified.
+  const statusElement = normalizedAgent === 'A' ? elements.agentAEmbeddingStatus : elements.agentBEmbeddingStatus; // CODEx: Resolve status label target.
+  if (statusElement) {
+    statusElement.textContent = 'Testing…'; // CODEx: Provide immediate feedback to the user.
+  }
+  const sampleText = `Embedding diagnostics ping for SAM-${normalizedAgent}`; // CODEx: Deterministic sample phrase.
+  const started = getTimestampMs(); // CODEx: Track latency for diagnostics.
+  try {
+    const channel = resolveEmbeddingChannel({ speaker: normalizedAgent }); // CODEx: Snapshot provider details for logging.
+    console.log('[Embedding Test] starting', { agent: normalizedAgent, provider: channel.provider, model: channel.model, bucket: channel.bucket }); // CODEx: Emit telemetry prior to request.
+    const vector = await generateTextEmbedding(sampleText, { speaker: normalizedAgent }); // CODEx: Reuse standard embedding flow scoped to agent bucket.
+    const duration = Math.max(1, getTimestampMs() - started); // CODEx: Derive latency in milliseconds.
+    const length = Array.isArray(vector) ? vector.length : 0; // CODEx: Capture resulting vector dimensionality.
+    if (statusElement) {
+      statusElement.textContent = `✓ ${length} dims in ${duration} ms`; // CODEx: Surface successful metrics inline.
+    }
+    console.log('[Embedding Test] success', { agent: normalizedAgent, provider: channel.provider, model: channel.model, duration, dimensions: length }); // CODEx: Persist success telemetry.
+  } catch (error) {
+    if (statusElement) {
+      statusElement.textContent = `✗ ${error?.message ?? 'Failed'}`; // CODEx: Surface error message inline for the user.
+    }
+    console.warn('[Embedding Test] failure', { agent: normalizedAgent, error }); // CODEx: Emit warning for debugging.
+  }
 } // CODEx
 
 function estimateEmbeddingBytes(vector) { // CODEx: Estimate bytes consumed by an embedding array.
@@ -1204,14 +1309,20 @@ function resolveEmbeddingChannel(options = {}) { // CODEx: Map speakers to embed
   if (desiredBucket === EMBEDDING_BUCKET_KEYS.SAM_A) { // CODEx: SAM-A specific channel configuration.
     const provider = config.agentAEmbeddingProvider || defaultConfig.agentAEmbeddingProvider; // CODEx: Prefer configured SAM-A provider.
     const model = (config.agentAEmbeddingModel || defaultConfig.agentAEmbeddingModel).trim(); // CODEx: Normalize SAM-A model.
-    const contextLength = resolveEmbeddingContextLength(model, config.embeddingContextLength); // CODEx: Derive SAM-A context window.
-    return { bucket: desiredBucket, provider, model, contextLength, useDetection: false, speaker: 'A' }; // CODEx: Return SAM-A channel descriptor.
+    const contextLength = resolveEmbeddingContextLength(model, config.agentAEmbeddingContextLength); // CODEx: Derive SAM-A context window.
+    const endpoint = (config.agentAEmbeddingEndpoint || '').trim(); // CODEx: SAM-A endpoint override when provided.
+    const apiKey = (config.agentAEmbeddingApiKey || '').trim(); // CODEx: SAM-A API key override when provided.
+    const baseUrl = endpoint ? deriveBaseOrigin(endpoint) : ''; // CODEx: Derive SAM-A base URL for provider bridge.
+    return { bucket: desiredBucket, provider, model, contextLength, endpoint, apiKey, baseUrl, useDetection: false, speaker: 'A' }; // CODEx: Return SAM-A channel descriptor.
   }
   if (desiredBucket === EMBEDDING_BUCKET_KEYS.SAM_B) { // CODEx: SAM-B specific channel configuration.
     const provider = config.agentBEmbeddingProvider || defaultConfig.agentBEmbeddingProvider; // CODEx: Prefer configured SAM-B provider.
     const model = (config.agentBEmbeddingModel || defaultConfig.agentBEmbeddingModel).trim(); // CODEx: Normalize SAM-B model.
-    const contextLength = resolveEmbeddingContextLength(model, config.embeddingContextLength); // CODEx: Derive SAM-B context window.
-    return { bucket: desiredBucket, provider, model, contextLength, useDetection: false, speaker: 'B' }; // CODEx: Return SAM-B channel descriptor.
+    const contextLength = resolveEmbeddingContextLength(model, config.agentBEmbeddingContextLength); // CODEx: Derive SAM-B context window.
+    const endpoint = (config.agentBEmbeddingEndpoint || '').trim(); // CODEx: SAM-B endpoint override when provided.
+    const apiKey = (config.agentBEmbeddingApiKey || '').trim(); // CODEx: SAM-B API key override when provided.
+    const baseUrl = endpoint ? deriveBaseOrigin(endpoint) : ''; // CODEx: Derive SAM-B base URL for provider bridge.
+    return { bucket: desiredBucket, provider, model, contextLength, endpoint, apiKey, baseUrl, useDetection: false, speaker: 'B' }; // CODEx: Return SAM-B channel descriptor.
   }
   const model = (config.embeddingModel || defaultConfig.embeddingModel || 'text-embedding-3-large').trim(); // CODEx: Resolve shared embedding model.
   const contextLength = resolveEmbeddingContextLength(model, config.embeddingContextLength); // CODEx: Derive shared context window.
@@ -1220,6 +1331,9 @@ function resolveEmbeddingChannel(options = {}) { // CODEx: Map speakers to embed
     provider: config.embeddingProviderPreference || defaultConfig.embeddingProviderPreference, // CODEx: Shared provider preference.
     model,
     contextLength,
+    endpoint: (config.embeddingEndpoint || '').trim(), // CODEx: Shared endpoint override when provided.
+    apiKey: (config.embeddingApiKey || config.apiKey || '').trim(), // CODEx: Shared embedding API key fallback.
+    baseUrl: config.embeddingEndpoint ? deriveBaseOrigin(config.embeddingEndpoint) : '', // CODEx: Shared base URL hint for provider bridge.
     useDetection: true,
     speaker: speaker || null
   }; // CODEx: Shared embedding channel descriptor.
@@ -1436,8 +1550,22 @@ const elements = {
   embeddingContextLength: document.getElementById('embeddingContextLength'), // CODEx: Numeric input for embedding context window.
   agentAEmbeddingProviderSelect: document.getElementById('agentAEmbeddingProvider'), // CODEx: SAM-A embedding provider select.
   agentAEmbeddingModelInput: document.getElementById('agentAEmbeddingModel'), // CODEx: SAM-A embedding model input.
+  agentAEmbeddingEndpointInput: document.getElementById('agentAEmbeddingEndpoint'), // CODEx: SAM-A endpoint override input.
+  agentAEmbeddingApiKeyInput: document.getElementById('agentAEmbeddingApiKey'), // CODEx: SAM-A API key input.
+  agentAEmbeddingContextInput: document.getElementById('agentAEmbeddingContext'), // CODEx: SAM-A context input.
+  agentAEmbeddingTestButton: document.getElementById('agentAEmbeddingTestButton'), // CODEx: SAM-A embedding test trigger.
+  agentAEmbeddingStatus: document.getElementById('agentAEmbeddingStatus'), // CODEx: SAM-A test status label.
+  agentAEmbeddingCard: document.getElementById('agentAEmbeddingCard'), // CODEx: SAM-A card container reference.
+  agentAEmbeddingCollapse: document.getElementById('agentAEmbeddingCollapse'), // CODEx: SAM-A collapse toggle.
   agentBEmbeddingProviderSelect: document.getElementById('agentBEmbeddingProvider'), // CODEx: SAM-B embedding provider select.
   agentBEmbeddingModelInput: document.getElementById('agentBEmbeddingModel'), // CODEx: SAM-B embedding model input.
+  agentBEmbeddingEndpointInput: document.getElementById('agentBEmbeddingEndpoint'), // CODEx: SAM-B endpoint override input.
+  agentBEmbeddingApiKeyInput: document.getElementById('agentBEmbeddingApiKey'), // CODEx: SAM-B API key input.
+  agentBEmbeddingContextInput: document.getElementById('agentBEmbeddingContext'), // CODEx: SAM-B context input.
+  agentBEmbeddingTestButton: document.getElementById('agentBEmbeddingTestButton'), // CODEx: SAM-B embedding test trigger.
+  agentBEmbeddingStatus: document.getElementById('agentBEmbeddingStatus'), // CODEx: SAM-B test status label.
+  agentBEmbeddingCard: document.getElementById('agentBEmbeddingCard'), // CODEx: SAM-B card container reference.
+  agentBEmbeddingCollapse: document.getElementById('agentBEmbeddingCollapse'), // CODEx: SAM-B collapse toggle.
   openRouterPolicyField: document.getElementById('openRouterPolicyField'),
   openRouterPolicyInput: document.getElementById('openRouterPolicyInput'),
   systemPromptInput: document.getElementById('systemPromptInput'),
@@ -1693,6 +1821,31 @@ function loadConfig() {
     config.agentBEmbeddingModel = typeof config.agentBEmbeddingModel === 'string' && config.agentBEmbeddingModel.trim()
       ? config.agentBEmbeddingModel.trim()
       : defaultConfig.agentBEmbeddingModel; // CODEx: Normalize SAM-B embedding model identifier.
+    config.agentAEmbeddingEndpoint = typeof config.agentAEmbeddingEndpoint === 'string'
+      ? config.agentAEmbeddingEndpoint.trim()
+      : ''; // CODEx: Normalize SAM-A embedding endpoint override.
+    config.agentBEmbeddingEndpoint = typeof config.agentBEmbeddingEndpoint === 'string'
+      ? config.agentBEmbeddingEndpoint.trim()
+      : ''; // CODEx: Normalize SAM-B embedding endpoint override.
+    config.agentAEmbeddingApiKey = typeof config.agentAEmbeddingApiKey === 'string'
+      ? config.agentAEmbeddingApiKey.trim()
+      : ''; // CODEx: Normalize SAM-A embedding API key.
+    config.agentBEmbeddingApiKey = typeof config.agentBEmbeddingApiKey === 'string'
+      ? config.agentBEmbeddingApiKey.trim()
+      : ''; // CODEx: Normalize SAM-B embedding API key.
+    const sharedContextFallback = config.embeddingContextLength ?? defaultConfig.embeddingContextLength; // CODEx: Reuse shared context hint as fallback.
+    config.agentAEmbeddingContextLength = clampNumber(
+      config.agentAEmbeddingContextLength ?? sharedContextFallback,
+      512,
+      4096,
+      sharedContextFallback
+    ); // CODEx: Clamp SAM-A embedding context window.
+    config.agentBEmbeddingContextLength = clampNumber(
+      config.agentBEmbeddingContextLength ?? sharedContextFallback,
+      512,
+      4096,
+      sharedContextFallback
+    ); // CODEx: Clamp SAM-B embedding context window.
     if (typeof config.dualTurnLimit !== 'number' || config.dualTurnLimit < 0) {
       config.dualTurnLimit = defaultConfig.dualTurnLimit;
     }
@@ -2076,11 +2229,35 @@ function updateConfigInputs() {
   if (elements.agentAEmbeddingModelInput) {
     elements.agentAEmbeddingModelInput.value = config.agentAEmbeddingModel ?? defaultConfig.agentAEmbeddingModel; // CODEx: Sync SAM-A embedding model text.
   }
+  if (elements.agentAEmbeddingEndpointInput) {
+    elements.agentAEmbeddingEndpointInput.value = config.agentAEmbeddingEndpoint ?? ''; // CODEx: Populate SAM-A endpoint override.
+  }
+  if (elements.agentAEmbeddingApiKeyInput) {
+    elements.agentAEmbeddingApiKeyInput.value = config.agentAEmbeddingApiKey ?? ''; // CODEx: Populate SAM-A embedding key.
+  }
+  if (elements.agentAEmbeddingContextInput) {
+    elements.agentAEmbeddingContextInput.value = config.agentAEmbeddingContextLength ?? defaultConfig.agentAEmbeddingContextLength; // CODEx: Reflect SAM-A context length.
+  }
+  if (elements.agentAEmbeddingStatus) {
+    elements.agentAEmbeddingStatus.textContent = ''; // CODEx: Clear SAM-A test status on load.
+  }
   if (elements.agentBEmbeddingProviderSelect) {
     elements.agentBEmbeddingProviderSelect.value = config.agentBEmbeddingProvider ?? defaultConfig.agentBEmbeddingProvider; // CODEx: Reflect SAM-B embedding provider.
   }
   if (elements.agentBEmbeddingModelInput) {
     elements.agentBEmbeddingModelInput.value = config.agentBEmbeddingModel ?? defaultConfig.agentBEmbeddingModel; // CODEx: Sync SAM-B embedding model text.
+  }
+  if (elements.agentBEmbeddingEndpointInput) {
+    elements.agentBEmbeddingEndpointInput.value = config.agentBEmbeddingEndpoint ?? ''; // CODEx: Populate SAM-B endpoint override.
+  }
+  if (elements.agentBEmbeddingApiKeyInput) {
+    elements.agentBEmbeddingApiKeyInput.value = config.agentBEmbeddingApiKey ?? ''; // CODEx: Populate SAM-B embedding key.
+  }
+  if (elements.agentBEmbeddingContextInput) {
+    elements.agentBEmbeddingContextInput.value = config.agentBEmbeddingContextLength ?? defaultConfig.agentBEmbeddingContextLength; // CODEx: Reflect SAM-B context length.
+  }
+  if (elements.agentBEmbeddingStatus) {
+    elements.agentBEmbeddingStatus.textContent = ''; // CODEx: Clear SAM-B test status on load.
   }
   if (elements.openRouterPolicyInput) {
     elements.openRouterPolicyInput.value = config.openRouterPolicy ?? '';
@@ -2209,6 +2386,19 @@ function updateAgentConnectionInputs(agent) {
       : apiKeyInput.dataset.placeholder;
   }
 
+  const embeddingControls = [
+    elements.agentBEmbeddingProviderSelect,
+    elements.agentBEmbeddingModelInput,
+    elements.agentBEmbeddingEndpointInput,
+    elements.agentBEmbeddingApiKeyInput,
+    elements.agentBEmbeddingContextInput,
+    elements.agentBEmbeddingTestButton
+  ];
+  for (const node of embeddingControls) {
+    if (!node) continue;
+    node.disabled = connection.inherits; // CODEx: Lock SAM-B embedding controls when inheriting Model A settings.
+  }
+
   updateArenaProviderNotes(agent, connection);
 }
 
@@ -2227,7 +2417,13 @@ function applyAgentBEnabledState() {
     'agentBModel',
     'agentBApiKey',
     'agentBName',
-    'agentBPrompt'
+    'agentBPrompt',
+    'agentBEmbeddingProviderSelect', // CODEx: Disable SAM-B embedding provider when Model B is off.
+    'agentBEmbeddingModelInput', // CODEx: Disable SAM-B embedding model input when Model B is off.
+    'agentBEmbeddingEndpointInput', // CODEx: Disable SAM-B endpoint override when Model B is off.
+    'agentBEmbeddingApiKeyInput', // CODEx: Disable SAM-B embedding key when Model B is off.
+    'agentBEmbeddingContextInput', // CODEx: Disable SAM-B context length when Model B is off.
+    'agentBEmbeddingTestButton' // CODEx: Disable SAM-B test trigger when Model B is off.
   ];
   for (const key of toggledFields) {
     const node = elements[key];
@@ -2241,6 +2437,10 @@ function applyAgentBEnabledState() {
   }
   if (!enabled && elements.agentBProviderNotes) {
     elements.agentBProviderNotes.textContent = 'Enable Model B to configure a separate connection.';
+  }
+  if (elements.agentBEmbeddingCard) {
+    elements.agentBEmbeddingCard.hidden = !enabled; // CODEx: Hide SAM-B embedding controls when disabled.
+    elements.agentBEmbeddingCard.setAttribute('aria-hidden', String(!enabled)); // CODEx: Maintain accessibility state.
   }
   if (enabled) {
     updateAgentConnectionInputs('B');
@@ -2661,6 +2861,32 @@ function bindEvents() {
     });
   }
 
+  if (elements.agentAEmbeddingEndpointInput) {
+    addListener(elements.agentAEmbeddingEndpointInput, 'input', (event) => {
+      config.agentAEmbeddingEndpoint = event.target.value.trim();
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
+  if (elements.agentAEmbeddingApiKeyInput) {
+    addListener(elements.agentAEmbeddingApiKeyInput, 'input', (event) => {
+      config.agentAEmbeddingApiKey = event.target.value.trim();
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
+  if (elements.agentAEmbeddingContextInput) {
+    addListener(elements.agentAEmbeddingContextInput, 'change', (event) => {
+      const parsed = Number.parseInt(event.target.value, 10);
+      config.agentAEmbeddingContextLength = clampNumber(parsed, 512, 4096, defaultConfig.agentAEmbeddingContextLength);
+      event.target.value = config.agentAEmbeddingContextLength;
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
   if (elements.agentBEmbeddingProviderSelect) {
     addListener(elements.agentBEmbeddingProviderSelect, 'change', (event) => {
       config.agentBEmbeddingProvider = event.target.value;
@@ -2677,6 +2903,56 @@ function bindEvents() {
       saveConfig();
       clearCachedEmbeddings();
       void warmEmbeddings();
+    });
+  }
+
+  if (elements.agentBEmbeddingEndpointInput) {
+    addListener(elements.agentBEmbeddingEndpointInput, 'input', (event) => {
+      config.agentBEmbeddingEndpoint = event.target.value.trim();
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
+  if (elements.agentBEmbeddingApiKeyInput) {
+    addListener(elements.agentBEmbeddingApiKeyInput, 'input', (event) => {
+      config.agentBEmbeddingApiKey = event.target.value.trim();
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
+  if (elements.agentBEmbeddingContextInput) {
+    addListener(elements.agentBEmbeddingContextInput, 'change', (event) => {
+      const parsed = Number.parseInt(event.target.value, 10);
+      config.agentBEmbeddingContextLength = clampNumber(parsed, 512, 4096, defaultConfig.agentBEmbeddingContextLength);
+      event.target.value = config.agentBEmbeddingContextLength;
+      saveConfig();
+      clearCachedEmbeddings();
+    });
+  }
+
+  if (elements.agentAEmbeddingTestButton) {
+    addListener(elements.agentAEmbeddingTestButton, 'click', () => {
+      void runEmbeddingTest('A'); // CODEx: Execute SAM-A embedding test utility.
+    });
+  }
+
+  if (elements.agentBEmbeddingTestButton) {
+    addListener(elements.agentBEmbeddingTestButton, 'click', () => {
+      void runEmbeddingTest('B'); // CODEx: Execute SAM-B embedding test utility.
+    });
+  }
+
+  if (elements.agentAEmbeddingCollapse) {
+    addListener(elements.agentAEmbeddingCollapse, 'click', () => {
+      toggleEmbeddingCard(elements.agentAEmbeddingCard, elements.agentAEmbeddingCollapse); // CODEx: Toggle SAM-A embedding card collapse state.
+    });
+  }
+
+  if (elements.agentBEmbeddingCollapse) {
+    addListener(elements.agentBEmbeddingCollapse, 'click', () => {
+      toggleEmbeddingCard(elements.agentBEmbeddingCard, elements.agentBEmbeddingCollapse); // CODEx: Toggle SAM-B embedding card collapse state.
     });
   }
 
@@ -7058,7 +7334,9 @@ async function generateTextEmbedding(text, options = {}) {
       vector = await requestEmbeddingFromProvider(trimmed, channel.model, {
         signal: options.signal,
         providerOverride: channel.useDetection ? null : channel.provider,
-        baseUrlOverride: options.baseUrlOverride,
+        baseUrlOverride: channel.baseUrl || options.baseUrlOverride,
+        endpointOverride: channel.endpoint || options.endpointOverride,
+        apiKeyOverride: channel.apiKey || options.apiKeyOverride,
         bucketKey: channel.bucket,
         contextLength: channel.contextLength
       }); // CODEx: Request embedding via the resolved channel.
@@ -7171,9 +7449,12 @@ async function requestEmbeddingFromProvider(text, model, options = {}) {
     signal,
     providerOverride = null,
     baseUrlOverride = '',
+    endpointOverride = '',
+    apiKeyOverride = '',
     contextLength
   } = options; // CODEx: Extend embedding requests with override metadata.
-  const apiKey = (config.embeddingApiKey || config.apiKey || '').trim(); // CODEx: Prefer embedding-specific key.
+  const sharedApiKey = (config.embeddingApiKey || config.apiKey || '').trim(); // CODEx: Shared embedding key fallback.
+  const manualApiKey = (apiKeyOverride || '').trim(); // CODEx: Manual override supplied by caller.
   const policyHeader = (config.openRouterPolicy ?? '').trim(); // CODEx: Data policy header for OpenRouter.
   const embeddingEndpointOverride = (config.embeddingEndpoint ?? '').trim(); // CODEx: Use configured embedding endpoint when provided.
   const remoteEndpoint = (() => { // CODEx: Derive remote fallback endpoint when applicable.
@@ -7187,6 +7468,8 @@ async function requestEmbeddingFromProvider(text, model, options = {}) {
     return ''; // CODEx: Default to module-provided OpenAI endpoint.
   })();
 
+  const manualBase = baseUrlOverride ? baseUrlOverride.trim() : ''; // CODEx: Normalize manual base override.
+  const manualEndpoint = endpointOverride ? endpointOverride.trim() : ''; // CODEx: Normalize manual endpoint override.
   const fetchWithPolicy = (url, options = {}) => { // CODEx: Inject OpenRouter policy header when necessary.
     const next = { ...options, headers: { ...(options?.headers || {}) } }; // CODEx: Clone options to avoid mutation.
     if (policyHeader && /openrouter\.ai/.test(url)) { // CODEx: Match OpenRouter host heuristically.
@@ -7196,19 +7479,27 @@ async function requestEmbeddingFromProvider(text, model, options = {}) {
   };
 
   const overrideSnapshot = providerOverride
-    ? { active: providerOverride, baseUrl: baseUrlOverride || '' }
+    ? { active: providerOverride, baseUrl: manualBase }
     : null; // CODEx: Snapshot for explicit provider overrides.
   const detectionSnapshot = overrideSnapshot ? null : await resolveActiveEmbeddingProvider(false); // CODEx: Probe environment only when overrides absent.
   const providerSnapshot = overrideSnapshot ?? detectionSnapshot ?? { active: EMBEDDING_PROVIDERS.OPENAI, baseUrl: '' }; // CODEx: Use detection or fall back to remote defaults.
 
   async function invokeProvider(provider, baseUrl, endpoint) { // CODEx: Shared helper for provider invocation.
+    const appliesManual = !providerOverride || provider === providerOverride; // CODEx: Only apply manual overrides to matching providers.
+    const resolvedBase = appliesManual && manualBase ? manualBase : (baseUrl || ''); // CODEx: Choose base URL override when applicable.
+    const providerRouteKey = getProviderRouteKey(provider); // CODEx: Derive route mapping key for provider.
+    const routeSuffix = EMBED_ROUTES[providerRouteKey] || EMBED_ROUTES['openai-like']; // CODEx: Resolve expected embedding route suffix.
+    const defaultEndpoint = resolvedBase ? joinProviderEndpoint(resolvedBase, routeSuffix) : endpoint; // CODEx: Build default endpoint when base provided.
+    const resolvedEndpoint = appliesManual && manualEndpoint ? manualEndpoint : (endpoint || defaultEndpoint); // CODEx: Choose endpoint override or default route.
+    const resolvedKey = appliesManual && manualApiKey ? manualApiKey : sharedApiKey; // CODEx: Prefer manual API key when provided.
+    console.log('[RAG] Provider route', { provider, endpoint: resolvedEndpoint || 'auto', baseUrl: resolvedBase || baseUrl || '', model }); // CODEx: Emit provider routing telemetry.
     return requestEmbeddingVector({
       provider,
-      baseUrl,
-      endpointOverride: endpoint,
+      baseUrl: resolvedBase,
+      endpointOverride: resolvedEndpoint,
       model,
       text,
-      apiKey,
+      apiKey: resolvedKey,
       signal,
       logger: console,
       fetchImpl: fetchWithPolicy,
@@ -7766,7 +8057,7 @@ function resolveRequestTimeout(modelId, preset, overrideTimeout) {
 
 async function callModel(messages, overrides = {}) {
   const endpoint = overrides.endpoint ?? config.endpoint;
-  const model = overrides.model ?? config.model;
+  let model = overrides.model ?? config.model; // CODEx: Allow reassignment for embedding guardrails.
   const temperature = overrides.temperature ?? config.temperature;
   const apiKey = overrides.apiKey ?? config.apiKey;
   const providerPreset = overrides.providerPreset ?? config.providerPreset;
@@ -7777,6 +8068,7 @@ async function callModel(messages, overrides = {}) {
   }
 
   const preset = providerPresetMap.get(providerPreset);
+  model = ensureChatModel(model, preset); // CODEx: Prevent embedding checkpoints from entering chat flows.
   const timeoutMs = resolveRequestTimeout(model, preset, overrides.timeoutMs);
   const connectionType = detectConnectionType(endpoint, preset);
   const reasoningActive = isReasoningModeActive({ model, providerPreset });

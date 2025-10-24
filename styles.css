@@ -844,6 +844,52 @@ button.danger {
   color: var(--text-muted);
 }
 
+.embed-card { /* // CODEx: Card container for per-agent embedding controls */
+  border: 1px solid var(--surface-border);
+  border-radius: 14px;
+  padding: 0.9rem;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.embed-card__header { /* // CODEx: Align card title with collapse toggle */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.embed-card__header h4 { /* // CODEx: Normalize subheading typography */
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.embed-card__body { /* // CODEx: Stack embedding inputs vertically */
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.embed-card[data-collapsed="true"] .embed-card__body { /* // CODEx: Hide body when collapsed */
+  display: none;
+}
+
+.embed-card__actions { /* // CODEx: Layout for test button and status */
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.ghost--icon { /* // CODEx: Compact icon button styling for collapse chevrons */
+  padding: 0.2rem 0.5rem;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
 .field {
   display: flex;
   flex-direction: column;

@@ -322,34 +322,82 @@
           <p class="field-hint">Controls the token window sent to embedding models (512–4096). Defaults to 1024.</p> <!-- // CODEx: Context hint copy -->
         </div>
         <h3 class="side-card-subheading">Arena embedding channels</h3> <!-- // CODEx: Subheading for per-agent embeddings -->
-        <div class="field">
-          <label for="agentAEmbeddingProvider">SAM-A embedding provider</label> <!-- // CODEx: SAM-A provider label -->
-          <select id="agentAEmbeddingProvider"> <!-- // CODEx: SAM-A provider select -->
-            <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Default SAM-A provider option -->
-            <option value="lmstudio">LM Studio</option> <!-- // CODEx: Alternate local provider -->
-            <option value="openai">OpenAI / remote</option> <!-- // CODEx: Remote fallback -->
-            <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Cloud provider option -->
-          </select>
-          <p class="field-hint">SAM-A (Flowfield advocate) prefers fast local embeddings. Adjust if you host the vectors elsewhere.</p> <!-- // CODEx: SAM-A hint -->
-        </div>
-        <div class="field">
-          <label for="agentAEmbeddingModel">SAM-A embedding model</label> <!-- // CODEx: SAM-A model label -->
-          <input id="agentAEmbeddingModel" type="text" placeholder="mxbai-embed-large"> <!-- // CODEx: SAM-A model input -->
-        </div>
-        <div class="field">
-          <label for="agentBEmbeddingProvider">SAM-B embedding provider</label> <!-- // CODEx: SAM-B provider label -->
-          <select id="agentBEmbeddingProvider"> <!-- // CODEx: SAM-B provider select -->
-            <option value="lmstudio">LM Studio</option> <!-- // CODEx: Default SAM-B provider option -->
-            <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Alternate local provider -->
-            <option value="openai">OpenAI / remote</option> <!-- // CODEx: Remote fallback -->
-            <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Cloud provider option -->
-          </select>
-          <p class="field-hint">SAM-B (skeptic) defaults to LM Studio embeddings. Override for custom vector stores.</p> <!-- // CODEx: SAM-B hint -->
-        </div>
-        <div class="field">
-          <label for="agentBEmbeddingModel">SAM-B embedding model</label> <!-- // CODEx: SAM-B model label -->
-          <input id="agentBEmbeddingModel" type="text" placeholder="text-embedding-3-large"> <!-- // CODEx: SAM-B model input -->
-        </div>
+        <section class="embed-card" id="agentAEmbeddingCard" data-collapsed="false"> <!-- // CODEx: Container for SAM-A embedding controls -->
+          <header class="embed-card__header"> <!-- // CODEx: Header with collapse toggle for SAM-A -->
+            <h4>SAM-A embeddings</h4> <!-- // CODEx: SAM-A embedding heading -->
+            <button id="agentAEmbeddingCollapse" class="ghost ghost--icon" type="button" aria-expanded="true" aria-controls="agentAEmbeddingBody">▾</button> <!-- // CODEx: Collapse toggle -->
+          </header>
+          <div class="embed-card__body" id="agentAEmbeddingBody"> <!-- // CODEx: Collapsible region for SAM-A inputs -->
+            <div class="field">
+              <label for="agentAEmbeddingProvider">Provider preset</label> <!-- // CODEx: SAM-A provider label -->
+              <select id="agentAEmbeddingProvider"> <!-- // CODEx: SAM-A provider select -->
+                <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Default SAM-A provider option -->
+                <option value="lmstudio">LM Studio</option> <!-- // CODEx: Alternate local provider -->
+                <option value="openai">OpenAI / remote</option> <!-- // CODEx: Remote fallback -->
+                <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Cloud provider option -->
+              </select>
+              <p class="field-hint">Flowfield advocate prefers fast local vectors. Override for remote caches.</p> <!-- // CODEx: SAM-A hint -->
+            </div>
+            <div class="field">
+              <label for="agentAEmbeddingModel">Embedding model</label> <!-- // CODEx: SAM-A model label -->
+              <input id="agentAEmbeddingModel" type="text" placeholder="mxbai-embed-large"> <!-- // CODEx: SAM-A model input -->
+            </div>
+            <div class="field">
+              <label for="agentAEmbeddingEndpoint">Endpoint</label> <!-- // CODEx: SAM-A endpoint label -->
+              <input id="agentAEmbeddingEndpoint" type="url" placeholder="http://localhost:11434/api/embed"> <!-- // CODEx: SAM-A endpoint input -->
+            </div>
+            <div class="field">
+              <label for="agentAEmbeddingApiKey">API key</label> <!-- // CODEx: SAM-A key label -->
+              <input id="agentAEmbeddingApiKey" type="password" autocomplete="off"> <!-- // CODEx: SAM-A key input -->
+            </div>
+            <div class="field">
+              <label for="agentAEmbeddingContext">Context length</label> <!-- // CODEx: SAM-A context label -->
+              <input id="agentAEmbeddingContext" type="number" min="512" max="4096" step="128" value="1024"> <!-- // CODEx: SAM-A context input -->
+            </div>
+            <div class="embed-card__actions"> <!-- // CODEx: Actions row for SAM-A -->
+              <button id="agentAEmbeddingTestButton" class="ghost" type="button">Test embedding</button> <!-- // CODEx: SAM-A test trigger -->
+              <span id="agentAEmbeddingStatus" class="hint-text" role="status"></span> <!-- // CODEx: SAM-A status output -->
+            </div>
+          </div>
+        </section>
+        <section class="embed-card" id="agentBEmbeddingCard" data-collapsed="false"> <!-- // CODEx: Container for SAM-B embedding controls -->
+          <header class="embed-card__header"> <!-- // CODEx: Header with collapse toggle for SAM-B -->
+            <h4>SAM-B embeddings</h4> <!-- // CODEx: SAM-B embedding heading -->
+            <button id="agentBEmbeddingCollapse" class="ghost ghost--icon" type="button" aria-expanded="true" aria-controls="agentBEmbeddingBody">▾</button> <!-- // CODEx: Collapse toggle -->
+          </header>
+          <div class="embed-card__body" id="agentBEmbeddingBody"> <!-- // CODEx: Collapsible region for SAM-B inputs -->
+            <div class="field">
+              <label for="agentBEmbeddingProvider">Provider preset</label> <!-- // CODEx: SAM-B provider label -->
+              <select id="agentBEmbeddingProvider"> <!-- // CODEx: SAM-B provider select -->
+                <option value="lmstudio">LM Studio</option> <!-- // CODEx: Default SAM-B provider option -->
+                <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Alternate local provider -->
+                <option value="openai">OpenAI / remote</option> <!-- // CODEx: Remote fallback -->
+                <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Cloud provider option -->
+              </select>
+              <p class="field-hint">Skeptic prefers LM Studio for contrastive recall. Adjust as needed.</p> <!-- // CODEx: SAM-B hint -->
+            </div>
+            <div class="field">
+              <label for="agentBEmbeddingModel">Embedding model</label> <!-- // CODEx: SAM-B model label -->
+              <input id="agentBEmbeddingModel" type="text" placeholder="text-embedding-3-large"> <!-- // CODEx: SAM-B model input -->
+            </div>
+            <div class="field">
+              <label for="agentBEmbeddingEndpoint">Endpoint</label> <!-- // CODEx: SAM-B endpoint label -->
+              <input id="agentBEmbeddingEndpoint" type="url" placeholder="http://localhost:1234/v1/embeddings"> <!-- // CODEx: SAM-B endpoint input -->
+            </div>
+            <div class="field">
+              <label for="agentBEmbeddingApiKey">API key</label> <!-- // CODEx: SAM-B key label -->
+              <input id="agentBEmbeddingApiKey" type="password" autocomplete="off"> <!-- // CODEx: SAM-B key input -->
+            </div>
+            <div class="field">
+              <label for="agentBEmbeddingContext">Context length</label> <!-- // CODEx: SAM-B context label -->
+              <input id="agentBEmbeddingContext" type="number" min="512" max="4096" step="128" value="1024"> <!-- // CODEx: SAM-B context input -->
+            </div>
+            <div class="embed-card__actions"> <!-- // CODEx: Actions row for SAM-B -->
+              <button id="agentBEmbeddingTestButton" class="ghost" type="button">Test embedding</button> <!-- // CODEx: SAM-B test trigger -->
+              <span id="agentBEmbeddingStatus" class="hint-text" role="status"></span> <!-- // CODEx: SAM-B status output -->
+            </div>
+          </div>
+        </section>
         <div class="field" id="openRouterPolicyField">
           <label for="openRouterPolicyInput">OpenRouter data policy</label>
           <input id="openRouterPolicyInput" type="text" placeholder="e.g. default, opt-out, free">
