@@ -365,12 +365,30 @@ const defaultConfig = {
   dualSeed: DEFAULT_DUAL_SEED,
   reflexEnabled: true,
   reflexInterval: 8,
-  entropyWindow: 6,
+  entropyWindow: 5,
   backgroundSource: 'default',
   backgroundImage: '',
   backgroundUrl: '',
   debugEnabled: false
 };
+
+const phases = [
+  { id: 1, title: 'Flow Dynamics', prompt: 'phase1.txt' },
+  { id: 2, title: 'Collapse Engine', prompt: 'phase2.txt' },
+  { id: 3, title: 'Entanglement Node', prompt: 'phase3.txt' }
+];
+
+const PHASE_PROMPT_DIR = 'rag/phase-prompts/';
+const WATCHDOG_MESSAGE_SOURCE = 'sam-standalone-watchdog';
+const WATCHDOG_MESSAGE_TYPE = 'check-arena-memory';
+const WATCHDOG_PRESSURE_THRESHOLD = 0.8;
+const WATCHDOG_ARCHIVE_PERCENT = 0.1;
+const ENTROPY_LOOP_THRESHOLD = 0.8;
+const ENTROPY_EXPLORE_THRESHOLD = 0.3;
+const LOOP_DELAY_SCALE = 0.6;
+const EXPLORE_DELAY_SCALE = 1.4;
+const MIN_DYNAMIC_DELAY_SECONDS = 5;
+const MAX_DYNAMIC_DELAY_SECONDS = 120;
 
 const TEST_TTS_PHRASE = 'This is SAM performing a voice check with persistent memory engaged.';
 const TTS_ERROR_COOLDOWN = 15000;
@@ -683,6 +701,7 @@ let reflexInFlight = false;
 let lastReflexSummaryAt = null;
 let reflexSummaryCount = 0;
 let currentEntropyScore = 0;
+let lastEntropyState = 'calibrating';
 let deviceMemoryEstimate;
 let gpuRendererInfo;
 let logEntries = [];
@@ -709,6 +728,12 @@ const ramDiskCache = {
   archives: new Map(),
   manifests: new Map()
 };
+const phasePromptCache = new Map();
+let activePhaseIndex = 0;
+let activePhaseId = null;
+let pendingPhaseAdvance = false;
+let lastReflexSynthesisSignature = null;
+let lastWatchdogArchiveAt = 0;
 
 function getManifestStorageKey(descriptor) {
   if (!descriptor) return `${RAM_DISK_MANIFEST_PREFIX}default`;
@@ -935,6 +960,7 @@ async function init() {
   updateChunkerStatus();
   addSystemMessage('SAM is ready. Configure Model A to enable live responses and arena debates.');
   setActiveMode(MODE_CHOOSER);
+  window.addEventListener('message', handleStandaloneWatchdogMessage);
   window.addEventListener('beforeunload', () => {
     void recordLog('shutdown', 'Browser session closed.', { level: 'info', silent: true });
   });
@@ -1054,8 +1080,8 @@ function loadConfig() {
     );
     config.entropyWindow = clampNumber(
       config.entropyWindow ?? defaultConfig.entropyWindow,
-      2,
-      50,
+      1,
+      25,
       defaultConfig.entropyWindow
     );
     config.requestTimeoutSeconds = clampNumber(
@@ -1326,7 +1352,19 @@ function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
 }
 
 function getAgentDisplayName(agent) {
-  return agent === 'A' ? config.agentAName || 'SAM-A' : config.agentBName || 'SAM-B';
+  if (agent === 'A') {
+    return config.agentAName || 'SAM-A';
+  }
+  if (agent === 'B') {
+    return config.agentBName || 'SAM-B';
+  }
+  if (agent === 'system') {
+    return 'System';
+  }
+  if (typeof agent === 'string' && agent.trim()) {
+    return agent;
+  }
+  return 'System';
 }
 
 function getAgentPersona(agent) {
@@ -2073,7 +2111,7 @@ function bindEvents() {
 
   addListener(elements.entropyWindow, 'change', (event) => {
     const value = Number.parseInt(event.target.value, 10);
-    config.entropyWindow = clampNumber(value, 2, 50, defaultConfig.entropyWindow);
+    config.entropyWindow = clampNumber(value, 1, 25, defaultConfig.entropyWindow);
     event.target.value = String(config.entropyWindow);
     saveConfig();
     updateEntropyMeter();
@@ -5544,6 +5582,58 @@ function archiveUnpinnedFloatingMemory() {
   addSystemMessage(`Manually archived ${removed} unpinned ${removed === 1 ? 'memory' : 'memories'}.`);
 }
 
+function handleStandaloneWatchdogMessage(event) {
+  if (!event || typeof event.data !== 'object') {
+    return;
+  }
+  const data = event.data;
+  if (!data || data.source !== WATCHDOG_MESSAGE_SOURCE || data.type !== WATCHDOG_MESSAGE_TYPE) {
+    return;
+  }
+  runStandaloneMemoryWatchdog();
+}
+
+function runStandaloneMemoryWatchdog() {
+  if (typeof window === 'undefined') return;
+  if (!window.standaloneStore && !window.standaloneFs) return;
+  if (!isDualChatRunning) return;
+  const limitBytes = config.memoryLimitMB * MB;
+  if (!Number.isFinite(limitBytes) || limitBytes <= 0) return;
+  const totalBytes = calculateMemoryUsage();
+  if (totalBytes <= 0) return;
+  const utilization = totalBytes / limitBytes;
+  if (!Number.isFinite(utilization) || utilization < WATCHDOG_PRESSURE_THRESHOLD) {
+    return;
+  }
+  if (lastWatchdogArchiveAt && Date.now() - lastWatchdogArchiveAt < 60000) {
+    return;
+  }
+  const candidates = floatingMemory
+    .filter((entry) => entry && entry.origin === 'arena' && !entry.pinned)
+    .sort((a, b) => normalizeTimestamp(a.timestamp) - normalizeTimestamp(b.timestamp));
+  if (!candidates.length) return;
+  const removeCount = Math.max(1, Math.floor(candidates.length * WATCHDOG_ARCHIVE_PERCENT));
+  let archived = 0;
+  for (const entry of candidates.slice(0, removeCount)) {
+    if (archiveMemoryEntry(entry.id, { silent: true })) {
+      archived += 1;
+    }
+  }
+  if (archived === 0) {
+    return;
+  }
+  lastWatchdogArchiveAt = Date.now();
+  updateMemoryStatus();
+  renderFloatingMemoryWorkbench();
+  persistPinnedMessages();
+  void persistDualRagSnapshot();
+  const percent = (utilization * 100).toFixed(1);
+  addSystemMessage(
+    `Watchdog archived ${archived} arena ${archived === 1 ? 'turn' : 'turns'} after floating memory hit ${percent}% of its budget.`
+  );
+  void recordLog('arena', `Watchdog archived ${archived} arena turn(s) at ${percent}% utilization.`, { silent: true });
+}
+
 function moveEntryToArchive(entry, { silent = false } = {}) {
   if (!entry) return false;
   const normalizedId = normalizeMessageId(entry.id ?? entry.timestamp);
@@ -5679,8 +5769,9 @@ async function runDiagnostics() {
     : 'disabled';
   diagnostics.push(`• Reflex mode: ${reflexLabel}`);
   const entropyDetails = describeEntropy(currentEntropyScore);
+  const volleyLabel = `volley${config.entropyWindow === 1 ? '' : 's'}`;
   diagnostics.push(
-    `• Entropy (last ${config.entropyWindow} turns): ${(currentEntropyScore * 100).toFixed(0)}% ${entropyDetails.label}`
+    `• Entropy (last ${config.entropyWindow} ${volleyLabel}): ${(currentEntropyScore * 100).toFixed(0)}% ${entropyDetails.label}`
   );
 
   const endpointResult = await probeModelEndpoint();
@@ -6478,6 +6569,7 @@ async function startDualChat() {
   elements.dualStatus.textContent = 'Dual chat running…';
   updateModelConnectionStatus();
   startDualAutosaveTimer();
+  await activatePhase(0, { force: true, announce: true });
   updateReflexStatus(config.reflexEnabled ? 'Reflex armed' : 'Reflex disabled', config.reflexEnabled ? 'ready' : 'disabled');
   updateEntropyMeter();
   await generateDualTurn('A', seed, { isInitial: true });
@@ -6497,6 +6589,11 @@ function resetDualChat() {
   reflexSummaryCount = 0;
   lastReflexSummaryAt = null;
   reflexInFlight = false;
+  activePhaseIndex = 0;
+  activePhaseId = null;
+  pendingPhaseAdvance = false;
+  lastEntropyState = 'calibrating';
+  lastReflexSynthesisSignature = null;
   updateProcessState('arena', { status: 'Idle', detail: 'Dual chat reset.' });
   updateEntropyMeter();
   updateReflexStatus();
@@ -6517,6 +6614,7 @@ function stopDualChat() {
   updateModelConnectionStatus();
   void persistDualRagSnapshot();
   reflexInFlight = false;
+  pendingPhaseAdvance = false;
   updateProcessState('arena', { status: 'Idle', detail: 'Dual chat stopped.' });
   updateProcessState('modelA', { status: 'Idle', detail: 'Waiting for user prompt.' });
   const modelBDetail = config.agentBEnabled ? 'Awaiting arena start.' : 'Model B is disabled.';
@@ -6593,12 +6691,7 @@ function scheduleNextDualTurn() {
   }
   clearTimeout(autoContinueTimer);
   clearDualCountdownTimer();
-  const delaySeconds = clampNumber(
-    config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds,
-    0,
-    600,
-    defaultConfig.dualTurnDelaySeconds
-  );
+  const delaySeconds = resolveDualTurnDelaySeconds();
   const delayMs = Math.max(0, Math.round(delaySeconds * 1000));
   if (delayMs === 0) {
     elements.dualStatus.textContent = 'Dual chat running…';
@@ -6618,6 +6711,28 @@ function scheduleNextDualTurn() {
     clearDualCountdownTimer();
     void advanceDualTurn();
   }, delayMs);
+}
+
+function resolveDualTurnDelaySeconds() {
+  const baseDelay = clampNumber(
+    config.dualTurnDelaySeconds ?? defaultConfig.dualTurnDelaySeconds,
+    0,
+    600,
+    defaultConfig.dualTurnDelaySeconds
+  );
+  if (baseDelay === 0) {
+    return 0;
+  }
+  if (!Number.isFinite(currentEntropyScore)) {
+    return baseDelay;
+  }
+  if (currentEntropyScore >= ENTROPY_LOOP_THRESHOLD) {
+    return Math.max(MIN_DYNAMIC_DELAY_SECONDS, Math.round(baseDelay * LOOP_DELAY_SCALE));
+  }
+  if (currentEntropyScore <= ENTROPY_EXPLORE_THRESHOLD) {
+    return Math.min(MAX_DYNAMIC_DELAY_SECONDS, Math.round(baseDelay * EXPLORE_DELAY_SCALE));
+  }
+  return baseDelay;
 }
 
 function startDualAutosaveTimer() {
@@ -6640,35 +6755,92 @@ function stopDualAutosaveTimer() {
   updateProcessState('autosave', { status: 'Idle', detail: 'Next snapshot pending.' });
 }
 
+function tokenizeForEntropy(content) {
+  const normalized = (content ?? '')
+    .toLowerCase()
+    .replace(/[“”]/g, '"')
+    .replace(/[’]/g, "'");
+  const tokens = normalized.match(/[a-z0-9]+/g);
+  return tokens ? tokens.filter(Boolean) : [];
+}
+
+function buildEntropyVector(content) {
+  const tokens = tokenizeForEntropy(content);
+  const weights = new Map();
+  for (const token of tokens) {
+    const nextCount = (weights.get(token) ?? 0) + 1;
+    weights.set(token, nextCount);
+  }
+  let magnitudeSquared = 0;
+  for (const value of weights.values()) {
+    magnitudeSquared += value * value;
+  }
+  return { weights, magnitude: magnitudeSquared > 0 ? Math.sqrt(magnitudeSquared) : 0 };
+}
+
+function cosineSimilarity(vecA, vecB) {
+  if (!vecA || !vecB || vecA.magnitude === 0 || vecB.magnitude === 0) {
+    return 0;
+  }
+  const [smaller, larger] = vecA.weights.size <= vecB.weights.size ? [vecA, vecB] : [vecB, vecA];
+  let dot = 0;
+  for (const [token, weight] of smaller.weights.entries()) {
+    const other = larger.weights.get(token);
+    if (other) {
+      dot += weight * other;
+    }
+  }
+  return dot / (vecA.magnitude * vecB.magnitude);
+}
+
 function computeEntropyScore(history, windowSize) {
   if (!Array.isArray(history) || history.length === 0) {
     return 0;
   }
-  const size = clampNumber(windowSize ?? config.entropyWindow ?? defaultConfig.entropyWindow, 2, 50, 6);
-  const recent = history.slice(-size);
-  const tokens = recent
-    .map((entry) => entry?.content ?? '')
-    .join(' ')
-    .toLowerCase()
-    .match(/[\w\-']+/g);
-  if (!tokens || tokens.length === 0) {
+  const volleyWindow = clampNumber(
+    windowSize ?? config.entropyWindow ?? defaultConfig.entropyWindow,
+    1,
+    25,
+    defaultConfig.entropyWindow
+  );
+  const sampleSize = Math.max(2, volleyWindow * 2);
+  const relevant = history.filter(
+    (entry) => entry && entry.countsAsTurn !== false && entry.speaker !== 'system' && typeof entry.content === 'string'
+  );
+  if (relevant.length < 2) {
     return 0;
   }
-  const unique = new Set(tokens);
-  return unique.size / tokens.length;
+  const recent = relevant.slice(-sampleSize);
+  if (recent.length < 2) {
+    return 0;
+  }
+  const vectors = recent.map((entry) => buildEntropyVector(entry.content));
+  let total = 0;
+  let comparisons = 0;
+  for (let index = 1; index < vectors.length; index += 1) {
+    const similarity = cosineSimilarity(vectors[index - 1], vectors[index]);
+    if (Number.isFinite(similarity)) {
+      total += similarity;
+      comparisons += 1;
+    }
+  }
+  if (comparisons === 0) {
+    return 0;
+  }
+  return total / comparisons;
 }
 
 function describeEntropy(score) {
   if (!Number.isFinite(score) || score <= 0) {
     return { state: 'calibrating', label: 'Calibrating…' };
   }
-  if (score < 0.3) {
+  if (score >= ENTROPY_LOOP_THRESHOLD) {
     return { state: 'loop', label: 'Looping' };
   }
-  if (score < 0.55) {
-    return { state: 'steady', label: 'Steady' };
+  if (score <= ENTROPY_EXPLORE_THRESHOLD) {
+    return { state: 'explore', label: 'Exploring' };
   }
-  return { state: 'explore', label: 'Exploring' };
+  return { state: 'steady', label: 'Steady' };
 }
 
 function updateEntropyMeter() {
@@ -6684,6 +6856,12 @@ function updateEntropyMeter() {
     meter.setAttribute('aria-valuenow', String(percent));
   }
   elements.entropyStatus.textContent = description.label;
+  if (description.state !== lastEntropyState) {
+    if (description.state === 'loop') {
+      void maybeAdvancePhase();
+    }
+    lastEntropyState = description.state;
+  }
 }
 
 function updateReflexStatus(message, state) {
@@ -6735,7 +6913,8 @@ async function runReflexSummary(speaker, options = {}) {
     const agentName = getAgentDisplayName(agent);
     const partnerName = getAgentDisplayName(partner);
     const persona = getAgentPersona(agent);
-    const lookback = Math.max(config.entropyWindow ?? 6, config.reflexInterval ?? 4, 6);
+    const volleyWindow = config.entropyWindow ?? defaultConfig.entropyWindow;
+    const lookback = Math.max(volleyWindow * 2, config.reflexInterval ?? 4, 6);
     const recent = dualChatHistory.slice(-lookback);
     const transcript = recent
       .map((item) => {
@@ -6783,6 +6962,169 @@ async function runReflexSummary(speaker, options = {}) {
   }
 }
 
+function findLastTurnBySpeaker(agent) {
+  for (let index = dualChatHistory.length - 1; index >= 0; index -= 1) {
+    const entry = dualChatHistory[index];
+    if (!entry) continue;
+    if (entry.speaker === agent && entry.countsAsTurn !== false) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function extractReflexSegments(content) {
+  const segments = { outcome: null, test: null };
+  if (typeof content !== 'string') {
+    return segments;
+  }
+  const pattern = /\[(Predicted Outcome|Test)[^\]]*?(?:→|->|=>|:)\s*([^\]\n\r]+)/gi;
+  let match;
+  while ((match = pattern.exec(content)) !== null) {
+    const label = match[1]?.toLowerCase();
+    const value = match[2]?.trim();
+    if (!value) continue;
+    if (label && label.includes('predicted') && !segments.outcome) {
+      segments.outcome = value;
+    } else if (label === 'test' && !segments.test) {
+      segments.test = value;
+    }
+  }
+  return segments;
+}
+
+function ensureSentence(text) {
+  if (!text) return '';
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+function composeReflexSynthesisParagraph(segmentsA, segmentsB) {
+  const aName = getAgentDisplayName('A');
+  const bName = getAgentDisplayName('B');
+  const sentences = [];
+  if (segmentsA.outcome) {
+    sentences.push(ensureSentence(`${aName} anticipates ${segmentsA.outcome}`));
+  }
+  if (segmentsB.outcome) {
+    sentences.push(ensureSentence(`${bName} expects ${segmentsB.outcome}`));
+  }
+  const testClauses = [];
+  if (segmentsA.test) {
+    testClauses.push(`${aName} proposes ${segmentsA.test}`);
+  }
+  if (segmentsB.test) {
+    testClauses.push(`${bName} suggests ${segmentsB.test}`);
+  }
+  if (testClauses.length) {
+    sentences.push(ensureSentence(testClauses.join('; ')));
+  }
+  return sentences.join(' ');
+}
+
+function maybeTriggerReflexHooks() {
+  if (!config.reflexEnabled) return;
+  if (dualChatHistory.length < 2) return;
+  const lastA = findLastTurnBySpeaker('A');
+  const lastB = findLastTurnBySpeaker('B');
+  if (!lastA || !lastB) return;
+  const segmentsA = extractReflexSegments(lastA.content);
+  const segmentsB = extractReflexSegments(lastB.content);
+  if (!segmentsA.outcome || !segmentsA.test || !segmentsB.outcome || !segmentsB.test) {
+    return;
+  }
+  const signature = `${normalizeTimestamp(lastA.timestamp)}|${normalizeTimestamp(lastB.timestamp)}`;
+  if (lastReflexSynthesisSignature === signature) {
+    return;
+  }
+  const summaryParagraph = composeReflexSynthesisParagraph(segmentsA, segmentsB);
+  if (!summaryParagraph) {
+    return;
+  }
+  const content = `Reflex summary\n${summaryParagraph}`;
+  recordDualMessage('system', content, { marker: 'reflex', label: 'Reflex', countsAsTurn: false });
+  lastReflexSummaryAt = Date.now();
+  reflexSummaryCount += 1;
+  lastReflexSynthesisSignature = signature;
+  updateReflexStatus();
+  void recordLog('arena', 'Reflex auto-synthesis posted.', { silent: true });
+}
+
+async function readPhasePromptFile(fileName) {
+  if (!fileName) return null;
+  if (phasePromptCache.has(fileName)) {
+    return phasePromptCache.get(fileName);
+  }
+  const relativePath = `${PHASE_PROMPT_DIR}${fileName}`;
+  const fsResult = readStandaloneFile(relativePath);
+  if (fsResult?.content) {
+    phasePromptCache.set(fileName, fsResult.content);
+    return fsResult.content;
+  }
+  try {
+    const response = await fetch(relativePath, { cache: 'no-store' });
+    if (response.ok) {
+      const text = await response.text();
+      phasePromptCache.set(fileName, text);
+      return text;
+    }
+  } catch (error) {
+    console.warn('Failed to fetch phase prompt', relativePath, error);
+  }
+  return null;
+}
+
+async function activatePhase(index, options = {}) {
+  if (!Array.isArray(phases) || phases.length === 0) return;
+  if (index < 0 || index >= phases.length) return;
+  const phase = phases[index];
+  const alreadyActive = activePhaseId === phase.id && activePhaseIndex === index;
+  if (alreadyActive && !options.force) {
+    return;
+  }
+  let content = null;
+  if (phase.prompt) {
+    content = await readPhasePromptFile(phase.prompt);
+  }
+  activePhaseIndex = index;
+  activePhaseId = phase.id;
+  pendingPhaseAdvance = false;
+  lastEntropyState = 'calibrating';
+  lastReflexSynthesisSignature = null;
+  if (!content) {
+    const message = `Phase ${phase.id} (${phase.title}) prompt not found at ${PHASE_PROMPT_DIR}${phase.prompt || ''}.`;
+    addSystemMessage(message);
+    void recordLog('error', message, { level: 'warn' });
+    return;
+  }
+  const trimmed = content.trim();
+  const header = `Phase ${phase.id}: ${phase.title}`;
+  const body = trimmed ? `${header}\n${trimmed}` : header;
+  recordDualMessage('system', body, {
+    marker: 'phase',
+    label: `Phase ${phase.id}`,
+    countsAsTurn: false
+  });
+  if (options.announce) {
+    addSystemMessage(`Loaded ${header} from ${PHASE_PROMPT_DIR}.`);
+  }
+  void recordLog('arena', `Activated phase ${phase.id} – ${phase.title}`, { silent: true });
+}
+
+async function maybeAdvancePhase() {
+  if (!isDualChatRunning) return;
+  if (pendingPhaseAdvance) return;
+  if (!Array.isArray(phases) || phases.length === 0) return;
+  if (activePhaseIndex >= phases.length - 1) return;
+  pendingPhaseAdvance = true;
+  try {
+    await activatePhase(activePhaseIndex + 1, { auto: true });
+  } finally {
+    pendingPhaseAdvance = false;
+  }
+}
+
 async function generateDualTurn(speaker, seed, options = {}) {
   if (!isDualChatRunning) return;
   const partner = speaker === 'A' ? 'B' : 'A';
@@ -6817,6 +7159,11 @@ async function generateDualTurn(speaker, seed, options = {}) {
   });
 
   for (const turn of dualChatHistory) {
+    if (!turn) continue;
+    if (turn.speaker === 'system' || turn.marker === 'reflex' || turn.marker === 'phase') {
+      historyMessages.push({ role: 'system', content: turn.content });
+      continue;
+    }
     const label = turn.speaker === speaker ? speakerName : partnerName;
     const role = turn.speaker === speaker ? 'assistant' : 'user';
     historyMessages.push({ role, content: `${label}: ${turn.content}` });
@@ -6926,20 +7273,23 @@ async function generateDualTurn(speaker, seed, options = {}) {
 }
 
 function recordDualMessage(speaker, content, options = {}) {
-  const { saveHistory = true, label, marker, turnNumber: providedTurn, countsAsTurn = true } = options;
+  const { saveHistory = true, label, marker, turnNumber: providedTurn } = options;
+  const countsOption = options.countsAsTurn;
   const timestamp = Date.now();
   let turnNumber = typeof providedTurn === 'number' ? providedTurn : null;
+  const normalizedSpeaker = speaker === 'B' ? 'B' : speaker === 'system' ? 'system' : 'A';
+  const countsAsTurn = typeof countsOption === 'boolean' ? countsOption : normalizedSpeaker !== 'system';
 
-  const speakerName = getAgentDisplayName(speaker);
+  const speakerName = getAgentDisplayName(normalizedSpeaker);
 
   if (saveHistory) {
     if (countsAsTurn) {
-      if (speaker === 'A') {
+      if (normalizedSpeaker === 'A') {
         dualTurnCounter += 1;
         if (turnNumber === null) {
           turnNumber = dualTurnCounter;
         }
-      } else {
+      } else if (normalizedSpeaker === 'B') {
         if (dualTurnCounter === 0) {
           dualTurnCounter = 1;
         }
@@ -6950,18 +7300,28 @@ function recordDualMessage(speaker, content, options = {}) {
     } else if (turnNumber === null && dualChatHistory.length) {
       turnNumber = dualChatHistory[dualChatHistory.length - 1].turnNumber ?? dualTurnCounter;
     }
-    dualChatHistory.push({ speaker, content, timestamp, turnNumber });
+    dualChatHistory.push({
+      speaker: normalizedSpeaker,
+      content,
+      timestamp,
+      turnNumber,
+      marker,
+      countsAsTurn
+    });
 
     const memoryEntry = {
-      id: `arena-${timestamp}-${speaker}-${dualChatHistory.length}`,
+      id: `arena-${timestamp}-${normalizedSpeaker}-${dualChatHistory.length}`,
       role: speakerName,
-      speaker,
+      speaker: normalizedSpeaker,
       speakerName,
       content,
       timestamp,
       origin: 'arena',
       turnNumber,
-      mode: MODE_ARENA
+      mode: MODE_ARENA,
+      marker,
+      countsAsTurn,
+      phaseId: activePhaseId ?? null
     };
     floatingMemory.push(memoryEntry);
     trimFloatingMemory();
@@ -6999,6 +7359,9 @@ function recordDualMessage(speaker, content, options = {}) {
   elements.dualChatWindow.appendChild(node);
   scrollContainerToBottom(elements.dualChatWindow);
   void persistDualRagSnapshot();
+  if (countsAsTurn && (normalizedSpeaker === 'A' || normalizedSpeaker === 'B')) {
+    maybeTriggerReflexHooks();
+  }
   updateEntropyMeter();
 }
 

@@ -35,3 +35,17 @@ contextBridge.exposeInMainWorld('standaloneFs', {
     return ipcRenderer.sendSync('standalone-fs-ensure', target);
   }
 });
+
+const WATCHDOG_SOURCE = 'sam-standalone-watchdog';
+const WATCHDOG_TYPE = 'check-arena-memory';
+const WATCHDOG_INTERVAL_MS = 3 * 60 * 1000;
+
+if (typeof window !== 'undefined' && typeof window.postMessage === 'function') {
+  setInterval(() => {
+    try {
+      window.postMessage({ source: WATCHDOG_SOURCE, type: WATCHDOG_TYPE }, '*');
+    } catch (error) {
+      console.warn('Failed to dispatch watchdog heartbeat', error);
+    }
+  }, WATCHDOG_INTERVAL_MS);
+}
