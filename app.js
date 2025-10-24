@@ -444,7 +444,8 @@ const REASONING_MODEL_HINTS = [
   'reflect', // CODEx: Extend hints for reflect-oriented reasoning checkpoints.
   'cot' // CODEx: Support chain-of-thought model aliases.
 ];
-const REASONING_MODEL_REGEX = /reason|think|deep|reflect|cot/i; // CODEx: Phase II handshake pattern for reasoning detectors.
+const REASONING_MODEL_REGEX = /reason|think|deep|reflect|cot|chain|reflection/i; // CODEx: Phase VI expanded reasoning detector.
+const EMBEDDING_MODEL_REGEX = /embed|embedding|textembedding/i; // CODEx: Identify embedding-specialized checkpoints.
 
 const providerPresets = [
   {
@@ -826,6 +827,14 @@ function isReasoningModelId(modelId, preset) {
     return true; // CODEx: Apply Phase II reasoning handshake detector.
   }
   return REASONING_MODEL_HINTS.some((hint) => normalized.includes(hint)); // CODEx: Retain heuristic fallback coverage.
+}
+
+// CODEx: Detect embedding-only checkpoints to avoid routing them through text generation endpoints.
+function isEmbeddingModelId(modelId) {
+  if (typeof modelId !== 'string') {
+    return false; // CODEx: Non-string identifiers cannot be matched reliably.
+  }
+  return EMBEDDING_MODEL_REGEX.test(modelId.toLowerCase()); // CODEx: Apply embedding model heuristic pattern.
 }
 
 // CODEx: Determine whether reasoning safeguards should be active for the current request.
@@ -6976,30 +6985,39 @@ function detectConnectionType(endpoint, preset) {
 }
 
 // CODEx: Derive the base local endpoint for LM Studio or Ollama.
-function resolveLocalChatEndpoint(endpoint, type) {
-  const base = deriveBaseUrl(endpoint);
-  if (type === 'ollama') {
-    if (/\/api\/generate$/i.test(endpoint)) {
-      return endpoint; // CODEx hot-fix: retain explicit generate endpoint without changes.
-    } // CODEx hot-fix
-    if (/\/v1\/chat\/completions$/i.test(endpoint)) {
-      return endpoint.replace(/\/v1\/chat\/completions$/i, '/api/generate'); // CODEx hot-fix: translate legacy path.
-    } // CODEx hot-fix
-    if (/\/api\/chat$/i.test(endpoint)) {
-      return endpoint.replace(/\/api\/chat$/i, '/api/generate'); // CODEx hot-fix: swap deprecated chat route.
-    } // CODEx hot-fix
-    return `${stripTrailingSlashes(base)}/api/generate`; // CODEx hot-fix: default to generate endpoint.
-  }
-  if (type === 'lmstudio') {
-    if (/\/api\/chat$/.test(endpoint)) {
-      return endpoint;
+function resolveLocalChatEndpoint(endpoint, type, modelName) {
+  const base = stripTrailingSlashes(deriveBaseUrl(endpoint) || endpoint || ''); // CODEx: Normalize base endpoint for routing.
+  const providerLabel = type === 'ollama' ? 'Ollama (Local)' : 'LM Studio'; // CODEx: Human-readable provider label for logs.
+  const isEmbeddingModel = isEmbeddingModelId(modelName); // CODEx: Detect embedding-only checkpoints for guardrails.
+  const url = (() => { // CODEx: Resolve provider-specific chat endpoint.
+    if (type === 'ollama') {
+      if (/\/api\/generate$/i.test(endpoint)) {
+        return endpoint; // CODEx: Respect explicit generate endpoint overrides.
+      }
+      if (/\/v1\/chat\/completions$/i.test(endpoint)) {
+        return endpoint.replace(/\/v1\/chat\/completions$/i, '/api/generate'); // CODEx: Translate legacy OpenAI path.
+      }
+      if (/\/api\/chat$/i.test(endpoint)) {
+        return endpoint.replace(/\/api\/chat$/i, '/api/generate'); // CODEx: Normalize deprecated chat path.
+      }
+      return `${base}/api/generate`; // CODEx: Default Ollama local chat endpoint.
     }
-    if (/\/v1\/chat\/completions$/.test(endpoint)) {
-      return endpoint.replace(/\/v1\/chat\/completions$/, '/api/chat');
+    if (type === 'lmstudio') {
+      if (/\/v1\/chat\/completions$/i.test(endpoint)) {
+        return endpoint; // CODEx: Accept already-normalized LM Studio path.
+      }
+      if (/\/api\/chat$/i.test(endpoint)) {
+        return endpoint.replace(/\/api\/chat$/i, '/v1/chat/completions'); // CODEx: Upgrade legacy API path.
+      }
+      return `${base}/v1/chat/completions`; // CODEx: Default LM Studio chat endpoint.
     }
-    return `${stripTrailingSlashes(base)}/api/chat`;
+    return endpoint; // CODEx: Fallback for unhandled provider types.
+  })();
+  if (isEmbeddingModel && /generate|chat\/completions/i.test(url)) {
+    throw new Error(`Model ${modelName} does not support text generation`); // CODEx: Block embedding checkpoints from chat route.
   }
-  return endpoint;
+  console.log(`[Bridge] ${providerLabel} → ${url} :: ${modelName}`); // CODEx: Telemetry for provider routing decisions.
+  return url;
 }
 
 // CODEx: Normalize chat messages for local APIs.
@@ -7023,98 +7041,123 @@ async function callLocalModel({
   timeoutMs,
   onStream
 }) { // CODEx: Support streaming callbacks for local backends.
-  let numCtx = getProviderContextLimit(type === 'ollama' ? 'ollama' : 'lmstudio');
-  let attempt = 0;
-  const chatEndpoint = resolveLocalChatEndpoint(endpoint, type);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    while (attempt < 2) {
-      attempt += 1;
-      const isOllamaLocal = type === 'ollama'; // CODEx hot-fix: flag Ollama routing.
-      const payload = isOllamaLocal
-        ? {
-            model, // CODEx hot-fix: request Ollama model identifier.
-            prompt: collapseMessagesToPrompt(messages), // CODEx hot-fix: flatten transcript for /api/generate.
-            stream: false, // CODEx hot-fix: keep non-streamed response for existing parser.
-            options: {
-              temperature, // CODEx hot-fix: forward temperature control.
-              num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx)) // CODEx hot-fix: respect prediction bounds.
-            }
-          }
-        : {
-            model,
-            messages: normalizeLocalMessages(messages),
+  if (isEmbeddingModelId(model)) { // CODEx: Guard against embedding-only checkpoints.
+    throw new Error(`Model ${model} does not support text generation`); // CODEx: Block embedding checkpoints from chat usage.
+  }
+  let numCtx = getProviderContextLimit(type === 'ollama' ? 'ollama' : 'lmstudio'); // CODEx: Initialize local context budget.
+  let attempt = 0; // CODEx: Track retry iteration count.
+  const maxAttempts = 3; // CODEx: Allow retries for watchdog and context recovery.
+  const chatEndpoint = resolveLocalChatEndpoint(endpoint, type, model); // CODEx: Normalize chat endpoint per provider rules.
+  const reasoningMode = isReasoningModelId(model); // CODEx: Drive watchdog budget from reasoning detector.
+  const deadline = Date.now() + Math.max(timeoutMs, 1000); // CODEx: Track overall timeout window.
+
+  async function executeAttempt() {
+    attempt += 1; // CODEx: Increment attempt counter for diagnostics.
+    const isOllamaLocal = type === 'ollama'; // CODEx: Flag Ollama routing for payload construction.
+    const payload = isOllamaLocal
+      ? {
+          model,
+          prompt: collapseMessagesToPrompt(messages),
+          stream: false,
+          options: {
             temperature,
-            stream: false,
-            num_ctx: numCtx,
             num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx))
-          };
-      let response;
-      try {
-        response = await fetch(chatEndpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          signal: controller.signal
-        });
-      } catch (error) {
-        if (error.name === 'AbortError') {
-          const timeoutError = new Error(`Local request timed out after ${Math.round(timeoutMs / 1000)}s.`);
-          timeoutError.code = 'timeout';
-          throw timeoutError;
+          }
         }
-        throw error;
-      }
+      : {
+          model,
+          messages: normalizeLocalMessages(messages),
+          temperature,
+          stream: false,
+          num_ctx: numCtx,
+          num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx))
+        };
+
+    const remaining = Math.max(0, deadline - Date.now()); // CODEx: Derive remaining overall budget in milliseconds.
+    if (remaining <= 0) { // CODEx: Abort when the global timeout has elapsed.
+      const timeoutError = new Error(`Local request timed out after ${Math.round(timeoutMs / 1000)}s.`); // CODEx: Emit when budget exhausted.
+      timeoutError.code = 'timeout'; // CODEx: Tag timeout errors for upstream handling.
+      throw timeoutError; // CODEx: Surface timeout to caller.
+    }
+
+    const controller = new AbortController(); // CODEx: Manage abort lifecycle per attempt.
+    let watchdogTriggered = false; // CODEx: Track watchdog intervention state.
+    const watchdogLimit = Math.min(remaining, reasoningMode ? 180000 : 60000); // CODEx: Adaptive watchdog budget.
+    const watchdog = setTimeout(() => {
+      watchdogTriggered = true; // CODEx: Flag that the watchdog triggered.
+      controller.abort(); // CODEx: Abort the pending fetch to trigger retry.
+      console.warn(`[Watchdog] ${model} exceeded reasoning timeout; retrying`); // CODEx: Surface watchdog intervention.
+    }, watchdogLimit); // CODEx: Schedule watchdog abort.
+    const globalTimer = setTimeout(() => controller.abort(), remaining); // CODEx: Preserve overall timeout budget.
+
+    try {
+      const response = await fetch(chatEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      clearTimeout(watchdog); // CODEx: Dispose watchdog timer after completion.
+      clearTimeout(globalTimer); // CODEx: Dispose global timeout timer after completion.
       if (response.ok) {
-        const data = await response.json(); // CODEx hot-fix: parse completion payload.
+        const data = await response.json();
         const text = isOllamaLocal
-          ? data?.response || data?.output || data?.message?.content || '' // CODEx hot-fix: normalize Ollama generate outputs.
-          : data?.message?.content || data?.output || data?.response || ''; // CODEx hot-fix: preserve LM Studio parsing.
+          ? data?.response || data?.output || data?.message?.content || ''
+          : data?.message?.content || data?.output || data?.response || '';
         if (isOllamaLocal && attempt === 1) {
-          console.log('[RAG] Provider = Ollama Local → /api/generate OK'); // CODEx hot-fix: surface successful routing telemetry.
-        } // CODEx hot-fix
+          console.log('[RAG] Provider = Ollama Local → /api/generate OK'); // CODEx: Confirm successful local routing.
+        }
         if (typeof onStream === 'function') {
-          onStream({ type: 'content', text }); // CODEx: Emit final payload for local completions.
+          onStream({ type: 'content', text });
         }
         return { content: text, reasoning: data?.message?.reasoning || '', truncated: false };
       }
-      const errorText = await response.text();
+      const errorText = await response.text(); // CODEx: Capture response body for diagnostics.
       if (response.status >= 400 && response.status < 500) {
-        if (/no context/i.test(errorText) && attempt === 1) {
-          numCtx = Math.max(512, Math.floor(numCtx * 0.7));
-          continue;
+        if (/no context/i.test(errorText) && attempt < maxAttempts) {
+          numCtx = Math.max(512, Math.floor(numCtx * 0.7)); // CODEx: Reduce context window on capacity errors.
+          return executeAttempt();
         }
         if (/model not found/i.test(errorText) && type === 'ollama') {
-          const generateEndpoint = `${stripTrailingSlashes(deriveBaseUrl(endpoint))}/api/generate`;
-          const generatePayload = {
-            model,
-            prompt: collapseMessagesToPrompt(messages),
-            stream: false
-          };
-          const generateResponse = await fetch(generateEndpoint, {
+          const fallbackEndpoint = `${stripTrailingSlashes(deriveBaseUrl(endpoint))}/api/generate`;
+          const fallbackResponse = await fetch(fallbackEndpoint, { // CODEx: Retry using canonical generate endpoint.
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(generatePayload),
+            body: JSON.stringify({
+              model,
+              prompt: collapseMessagesToPrompt(messages),
+              stream: false
+            }),
             signal: controller.signal
           });
-          if (!generateResponse.ok) {
-            throw new Error(`HTTP ${generateResponse.status}: ${await generateResponse.text()}`);
+          if (!fallbackResponse.ok) {
+            throw new Error(`HTTP ${fallbackResponse.status}: ${await fallbackResponse.text()}`);
           }
-          const generateData = await generateResponse.json();
-          const fallbackText = generateData?.response || generateData?.output || '';
+          const fallbackData = await fallbackResponse.json(); // CODEx: Decode fallback response payload.
+          const fallbackText = fallbackData?.response || fallbackData?.output || ''; // CODEx: Normalize fallback text content.
           if (typeof onStream === 'function') {
-            onStream({ type: 'content', text: fallbackText }); // CODEx: Surface fallback text for generate endpoint responses.
+            onStream({ type: 'content', text: fallbackText });
           }
           return { content: fallbackText, reasoning: '', truncated: false };
         }
       }
       throw new Error(`HTTP ${response.status}: ${errorText}`);
+    } catch (error) {
+      clearTimeout(watchdog); // CODEx: Ensure watchdog timer cleared on error path.
+      clearTimeout(globalTimer); // CODEx: Ensure global timer cleared on error path.
+      if (error.name === 'AbortError') {
+        if (watchdogTriggered && attempt < maxAttempts) {
+          return executeAttempt(); // CODEx: Retry automatically after watchdog intervention.
+        }
+        const timeoutError = new Error(`Local request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+        timeoutError.code = 'timeout';
+        throw timeoutError;
+      }
+      throw error;
     }
-    throw new Error('Local model retry limit reached.');
-  } finally {
-    clearTimeout(timer);
   }
+
+  return executeAttempt();
 }
 
 // CODEx: Consume OpenAI-style streaming responses and merge text/reasoning segments.
@@ -7496,33 +7539,56 @@ async function callModel(messages, overrides = {}) {
     }
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const maxAttempts = 2; // CODEx: Allow one retry when watchdog intervenes.
+  let attempt = 0; // CODEx: Track remote retry attempts.
+
+  async function issueRequest() {
+    attempt += 1; // CODEx: Increment attempt counter for diagnostics.
+    const controller = new AbortController(); // CODEx: Manage fetch cancellation per attempt.
+    let watchdogTriggered = false; // CODEx: Track watchdog activation state.
+    const watchdogLimit = reasoningActive ? 180000 : 60000; // CODEx: Adaptive watchdog threshold.
+    const watchdogTimer = setTimeout(() => {
+      watchdogTriggered = true; // CODEx: Record watchdog activation.
+      controller.abort(); // CODEx: Abort fetch to enable retry.
+      console.warn(`[Watchdog] ${model} exceeded reasoning timeout; retrying`); // CODEx: Surface watchdog telemetry.
+    }, watchdogLimit); // CODEx: Schedule watchdog for long requests.
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs); // CODEx: Preserve configured timeout budget.
+    try {
+      const response = await fetch(requestEndpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId); // CODEx: Dispose configured timeout timer.
+      clearTimeout(watchdogTimer); // CODEx: Dispose watchdog timer after completion.
+      return { response, watchdogTriggered }; // CODEx: Return response with watchdog flag.
+    } catch (error) {
+      clearTimeout(timeoutId); // CODEx: Ensure timers cleared on error path.
+      clearTimeout(watchdogTimer); // CODEx: Ensure watchdog timer cleared on error path.
+      if (error.name === 'AbortError' && watchdogTriggered && attempt < maxAttempts) { // CODEx: Retry after watchdog abort.
+        return issueRequest(); // CODEx: Re-run request after watchdog abort.
+      }
+      if (error.name === 'AbortError') {
+        if (reasoningActive) {
+          modelCallMetrics.reasoningTimeouts += 1; // CODEx: Track reasoning timeout metrics.
+        }
+        const seconds = Math.round(timeoutMs / 100) / 10; // CODEx: Convert timeout to seconds with decimal precision.
+        const timeoutError = new Error(`Request timed out after ${seconds}s.`); // CODEx: Provide human-readable timeout error.
+        timeoutError.code = 'timeout'; // CODEx: Tag timeout errors for upstream handling.
+        throw timeoutError;
+      }
+      throw error; // CODEx: Propagate non-timeout errors.
+    }
+  }
 
   let response;
-
   try {
-    response = await fetch(requestEndpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
+    const { response: resolvedResponse } = await issueRequest(); // CODEx: Execute request with watchdog handling.
+    response = resolvedResponse; // CODEx: Normalize response reference for downstream logic.
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      if (reasoningActive) {
-        modelCallMetrics.reasoningTimeouts += 1;
-      }
-      finalizeMetrics();
-      const seconds = Math.round(timeoutMs / 100) / 10;
-      const timeoutError = new Error(`Request timed out after ${seconds}s.`);
-      timeoutError.code = 'timeout';
-      throw timeoutError;
-    }
-    finalizeMetrics();
-    throw error;
+    finalizeMetrics(); // CODEx: Preserve metrics on failure.
+    throw error; // CODEx: Propagate error to caller.
   }
 
   const contentType = response.headers.get('content-type') ?? ''; // CODEx: Capture response type for streaming selection.

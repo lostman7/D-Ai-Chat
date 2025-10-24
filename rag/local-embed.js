@@ -205,11 +205,11 @@ export async function requestEmbeddingVector(options = {}) { // CODEx: Retrieve 
 
   if (provider === EMBEDDING_PROVIDERS.LM_STUDIO) { // CODEx: LM Studio request handling.
     const normalizedBase = normalizeBaseUrl(baseUrl || endpointOverride || DEFAULT_LM_STUDIO_BASE); // CODEx: Derive LM Studio base path.
-    let target = `${normalizedBase}/api/generate`; // CODEx: Default LM Studio embedding endpoint.
-    if (endpointOverride && !/\/api\/generate$/i.test(endpointOverride)) { // CODEx: Detect unexpected overrides when provided.
-      logger.warn?.('[RAG] Unexpected endpoint → retrying with /api/generate'); // CODEx: Surface correction log.
+    let target = `${normalizedBase}/v1/embeddings`; // CODEx: Default LM Studio embedding endpoint.
+    if (endpointOverride && !/\/v1\/embeddings$/i.test(endpointOverride)) { // CODEx: Detect unexpected overrides when provided.
+      logger.warn?.('[RAG] Unexpected endpoint → retrying with /v1/embeddings'); // CODEx: Surface correction log.
     } // CODEx
-    const payload = { prompt: trimmed, stream: false }; // CODEx: LM Studio generate payload.
+    const payload = { model, input: trimmed }; // CODEx: LM Studio embedding payload.
     const response = await fetchImpl(target, { ...fetchOptions, body: JSON.stringify(payload) }); // CODEx: Execute LM Studio request.
     if (!response.ok) { // CODEx: Validate response status.
       throw new Error(`LM Studio embedding HTTP ${response.status}`); // CODEx: Propagate failure.
