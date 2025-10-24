@@ -161,6 +161,21 @@ function storageRemoveItem(key) {
   }
 }
 
+function syncReasoningTimeoutToShell() {
+  if (typeof window === 'undefined') {
+    return; // CODEx: Skip when running outside the browser shell.
+  }
+  const updater = window.standaloneRuntime?.updateReasoningTimeout;
+  if (typeof updater !== 'function') {
+    return; // CODEx: Standalone shell not active.
+  }
+  try {
+    updater(config.reasoningTimeoutSeconds); // CODEx: Relay current reasoning timeout to Electron main process.
+  } catch (error) {
+    console.debug('Failed to sync reasoning timeout to shell', error); // CODEx: Swallow bridge errors without disruption.
+  }
+}
+
 function storageKeys() {
   try {
     const keys = storage.keys?.();
@@ -411,17 +426,19 @@ const RAM_DISK_UNCHUNKED_PREFIX = 'sam-unchunked-';
 const RAM_DISK_ARCHIVE_PREFIX = 'sam-archive-';
 const RAM_DISK_MANIFEST_PREFIX = 'sam-manifest-';
 const REASONING_MODEL_HINTS = [
-  'reason',
-  'cogito',
-  'sonar',
-  'think',
-  'deepseek-r1',
-  'deepseek_reasoner',
-  'reasoner',
-  'o1',
-  'o3'
+  'reason', // CODEx: Preserve legacy hints for bespoke preset labels.
+  'cogito', // CODEx: Retain prior identifier coverage for specialized checkpoints.
+  'sonar', // CODEx: Keep community alias alignment.
+  'think', // CODEx: Maintain compatibility with earlier think-prefixed models.
+  'deepseek-r1', // CODEx: Support DeepSeek reasoning suite detection.
+  'deepseek_reasoner', // CODEx: Alias for DeepSeek reasoning models.
+  'reasoner', // CODEx: Capture general reasoner naming conventions.
+  'o1', // CODEx: Include OpenAI o-series heuristics.
+  'o3', // CODEx: Preserve existing o-series mapping.
+  'reflect', // CODEx: Extend hints for reflect-oriented reasoning checkpoints.
+  'cot' // CODEx: Support chain-of-thought model aliases.
 ];
-const REASONING_MODEL_REGEX = /reason|think|deep|cogito|solver|analyze/i;
+const REASONING_MODEL_REGEX = /reason|think|deep|reflect|cot/i; // CODEx: Phase II handshake pattern for reasoning detectors.
 
 const providerPresets = [
   {
@@ -780,16 +797,16 @@ function clearCachedEmbeddings() {
 // CODEx: Detect reasoning-focused checkpoints to adjust timeouts and context.
 function isReasoningModelId(modelId, preset) {
   if (preset?.anthropicFormat) {
-    return true;
+    return true; // CODEx: Anthropic chat endpoints are treated as reasoning-safe by default.
   }
-  const normalized = typeof modelId === 'string' ? modelId.toLowerCase() : '';
+  const normalized = typeof modelId === 'string' ? modelId.toLowerCase() : ''; // CODEx: Normalize identifiers for regex tests.
   if (!normalized) {
-    return false;
+    return false; // CODEx: Skip empty identifiers.
   }
   if (REASONING_MODEL_REGEX.test(normalized)) {
-    return true;
+    return true; // CODEx: Apply Phase II reasoning handshake detector.
   }
-  return REASONING_MODEL_HINTS.some((hint) => normalized.includes(hint));
+  return REASONING_MODEL_HINTS.some((hint) => normalized.includes(hint)); // CODEx: Retain heuristic fallback coverage.
 }
 
 // CODEx: Determine whether reasoning safeguards should be active for the current request.
@@ -1268,6 +1285,7 @@ function loadConfig() {
       reasoningFallback
     );
     config.reasoningTimeoutSeconds = Math.max(config.reasoningTimeoutSeconds, config.requestTimeoutSeconds);
+    syncReasoningTimeoutToShell(); // CODEx: Propagate timeout to standalone shell.
     config.autoInjectMemories = Boolean(config.autoInjectMemories);
     config.openRouterPolicy = (config.openRouterPolicy ?? '').trim();
   } catch (error) {
@@ -2134,6 +2152,7 @@ function bindEvents() {
       if (elements.reasoningTimeout) {
         elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
       }
+      syncReasoningTimeoutToShell(); // CODEx: Keep shell timeout aligned with new baseline.
     }
     saveConfig();
   });
@@ -2146,6 +2165,7 @@ function bindEvents() {
       if (elements.reasoningTimeout) {
         elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
       }
+      syncReasoningTimeoutToShell(); // CODEx: Reflect live baseline adjustments.
     }
     saveConfig();
   });
@@ -2156,6 +2176,7 @@ function bindEvents() {
       config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
     }
     elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+    syncReasoningTimeoutToShell(); // CODEx: Mirror manual changes into standalone shell.
     saveConfig();
   });
 
@@ -2165,6 +2186,7 @@ function bindEvents() {
       config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
     }
     elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
+    syncReasoningTimeoutToShell(); // CODEx: Sync live slider adjustments to shell.
     saveConfig();
   });
 
@@ -5216,7 +5238,7 @@ function getRecentConversation(options = {}) {
     return [];
   }
   const reasoningActive = isReasoningModeActive(options);
-  const maxTurns = reasoningActive ? Math.min(3, conversationLog.length) : config.contextTurns;
+  const maxTurns = reasoningActive ? Math.min(6, conversationLog.length) : config.contextTurns; // CODEx: Phase II limit on reasoning context.
   const limit = Math.max(2, Math.min(maxTurns, conversationLog.length));
   return conversationLog.slice(-limit);
 }
@@ -5919,6 +5941,38 @@ function archiveMemoryEntry(id, { silent = false } = {}) {
   return true;
 }
 
+function archiveOldArenaTurns(fraction = WATCHDOG_ARCHIVE_PERCENT, { reason = 'watchdog', silent = false } = {}) {
+  if (!Number.isFinite(fraction) || fraction <= 0) {
+    return 0; // CODEx: Ignore invalid archive fractions.
+  }
+  const arenaEntries = floatingMemory
+    .filter((entry) => entry && entry.origin === 'arena' && !entry.pinned)
+    .sort((a, b) => normalizeTimestamp(a.timestamp) - normalizeTimestamp(b.timestamp)); // CODEx: Oldest-first ordering.
+  if (!arenaEntries.length) {
+    return 0; // CODEx: Nothing to archive.
+  }
+  const removeCount = Math.max(1, Math.floor(arenaEntries.length * fraction)); // CODEx: Ensure at least one record.
+  let archived = 0;
+  for (const entry of arenaEntries.slice(0, removeCount)) {
+    if (archiveMemoryEntry(entry.id, { silent: true })) {
+      archived += 1; // CODEx: Track archived count for telemetry.
+    }
+  }
+  if (archived > 0) {
+    updateMemoryStatus();
+    renderFloatingMemoryWorkbench();
+    persistPinnedMessages();
+    void persistDualRagSnapshot();
+    if (!silent) {
+      const label = reason === 'reflex' ? 'Reflex' : 'Watchdog';
+      addSystemMessage(
+        `${label} archived ${archived} arena ${archived === 1 ? 'turn' : 'turns'} to rag-logs.`
+      ); // CODEx: Surface auto-archive context.
+    }
+  }
+  return archived;
+}
+
 function archiveUnpinnedFloatingMemory() {
   const removable = floatingMemory.filter((item) => !item.pinned);
   if (!removable.length) {
@@ -5963,25 +6017,11 @@ function runStandaloneMemoryWatchdog() {
   if (lastWatchdogArchiveAt && Date.now() - lastWatchdogArchiveAt < 60000) {
     return;
   }
-  const candidates = floatingMemory
-    .filter((entry) => entry && entry.origin === 'arena' && !entry.pinned)
-    .sort((a, b) => normalizeTimestamp(a.timestamp) - normalizeTimestamp(b.timestamp));
-  if (!candidates.length) return;
-  const removeCount = Math.max(1, Math.floor(candidates.length * WATCHDOG_ARCHIVE_PERCENT));
-  let archived = 0;
-  for (const entry of candidates.slice(0, removeCount)) {
-    if (archiveMemoryEntry(entry.id, { silent: true })) {
-      archived += 1;
-    }
-  }
+  const archived = archiveOldArenaTurns(WATCHDOG_ARCHIVE_PERCENT, { reason: 'watchdog', silent: true });
   if (archived === 0) {
     return;
   }
   lastWatchdogArchiveAt = Date.now();
-  updateMemoryStatus();
-  renderFloatingMemoryWorkbench();
-  persistPinnedMessages();
-  void persistDualRagSnapshot();
   const percent = (utilization * 100).toFixed(1);
   addSystemMessage(
     `Watchdog archived ${archived} arena ${archived === 1 ? 'turn' : 'turns'} after floating memory hit ${percent}% of its budget.`
@@ -6718,8 +6758,9 @@ async function callLocalModel({
   messages,
   temperature,
   maxTokens,
-  timeoutMs
-}) {
+  timeoutMs,
+  onStream
+}) { // CODEx: Support streaming callbacks for local backends.
   let numCtx = getProviderContextLimit(type === 'ollama' ? 'ollama' : 'lmstudio');
   let attempt = 0;
   const chatEndpoint = resolveLocalChatEndpoint(endpoint, type);
@@ -6755,6 +6796,9 @@ async function callLocalModel({
       if (response.ok) {
         const data = await response.json();
         const text = data?.message?.content || data?.output || data?.response || '';
+        if (typeof onStream === 'function') {
+          onStream({ type: 'content', text }); // CODEx: Emit final payload for local completions.
+        }
         return { content: text, reasoning: data?.message?.reasoning || '', truncated: false };
       }
       const errorText = await response.text();
@@ -6780,7 +6824,11 @@ async function callLocalModel({
             throw new Error(`HTTP ${generateResponse.status}: ${await generateResponse.text()}`);
           }
           const generateData = await generateResponse.json();
-          return { content: generateData?.response || generateData?.output || '', reasoning: '', truncated: false };
+          const fallbackText = generateData?.response || generateData?.output || '';
+          if (typeof onStream === 'function') {
+            onStream({ type: 'content', text: fallbackText }); // CODEx: Surface fallback text for generate endpoint responses.
+          }
+          return { content: fallbackText, reasoning: '', truncated: false };
         }
       }
       throw new Error(`HTTP ${response.status}: ${errorText}`);
@@ -6792,7 +6840,8 @@ async function callLocalModel({
 }
 
 // CODEx: Consume OpenAI-style streaming responses and merge text/reasoning segments.
-async function consumeOpenAiStream(response) {
+async function consumeOpenAiStream(response, options = {}) {
+  const { onContent, onReasoning } = options; // CODEx: Optional callbacks for incremental rendering.
   const reader = response.body?.getReader();
   if (!reader) {
     const fallback = await response.text();
@@ -6802,6 +6851,8 @@ async function consumeOpenAiStream(response) {
   let buffer = '';
   const textParts = [];
   const reasoningParts = [];
+  let runningText = ''; // CODEx: Track incremental content for streaming updates.
+  let runningReasoning = ''; // CODEx: Track incremental reasoning for streaming updates.
   let done = false;
   while (!done) {
     const { value, done: streamDone } = await reader.read();
@@ -6825,19 +6876,35 @@ async function consumeOpenAiStream(response) {
           const delta = chunk?.choices?.[0]?.delta ?? {};
           if (typeof delta.content === 'string') {
             textParts.push(delta.content);
+            runningText += delta.content; // CODEx: Build incremental assistant response.
+            if (typeof onContent === 'function') {
+              onContent(runningText); // CODEx: Emit partial assistant text.
+            }
           }
           if (typeof delta.reasoning === 'string') {
             reasoningParts.push(delta.reasoning);
+            runningReasoning += delta.reasoning; // CODEx: Build incremental reasoning trace.
+            if (typeof onReasoning === 'function') {
+              onReasoning(runningReasoning); // CODEx: Emit partial reasoning text.
+            }
           }
           if (Array.isArray(delta.reasoning)) {
             for (const item of delta.reasoning) {
               if (typeof item?.text === 'string') {
                 reasoningParts.push(item.text);
+                runningReasoning += item.text; // CODEx: Extend reasoning accumulation for array payloads.
+                if (typeof onReasoning === 'function') {
+                  onReasoning(runningReasoning); // CODEx: Emit aggregated reasoning updates.
+                }
               }
             }
           }
         } catch (error) {
           textParts.push(payloadText);
+          runningText += payloadText; // CODEx: Append raw payload fallback.
+          if (typeof onContent === 'function') {
+            onContent(runningText); // CODEx: Emit fallback chunk.
+          }
         }
       }
     }
@@ -6953,6 +7020,37 @@ function normalizeModelMessage(message) {
   };
 }
 
+async function consumeTextStream(response, options = {}) {
+  const { onContent } = options; // CODEx: Allow streaming updates for chunked JSON/text payloads.
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const fallback = await response.text();
+    if (typeof onContent === 'function') {
+      onContent(fallback); // CODEx: Emit fallback content when streaming is unavailable.
+    }
+    return { text: fallback, reasoning: '', truncated: false };
+  }
+  const decoder = new TextDecoder('utf-8');
+  let aggregated = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (value) {
+      aggregated += decoder.decode(value, { stream: true }); // CODEx: Accumulate streamed chunk.
+      if (typeof onContent === 'function') {
+        onContent(aggregated); // CODEx: Push incremental buffer to UI.
+      }
+    }
+  }
+  aggregated += decoder.decode(); // CODEx: Flush decoder state.
+  if (typeof onContent === 'function') {
+    onContent(aggregated); // CODEx: Emit finalized aggregation for completeness.
+  }
+  return { text: aggregated, reasoning: '', truncated: false };
+}
+
 function resolveRequestTimeout(modelId, preset, overrideTimeout) {
   if (Number.isFinite(overrideTimeout) && overrideTimeout > 0) {
     return overrideTimeout;
@@ -7001,15 +7099,20 @@ async function callModel(messages, overrides = {}) {
   const timeoutMs = resolveRequestTimeout(model, preset, overrides.timeoutMs);
   const connectionType = detectConnectionType(endpoint, preset);
   const reasoningActive = isReasoningModeActive({ model, providerPreset });
+  const streamCallback = typeof overrides.onStream === 'function' ? overrides.onStream : null; // CODEx: Capture optional streaming hook.
   const contextLimit = getProviderContextLimit(providerPreset);
   let effectiveMaxTokens = overrides.maxTokens ?? config.maxResponseTokens ?? contextLimit;
   if (!Number.isFinite(effectiveMaxTokens) || effectiveMaxTokens <= 0) {
     effectiveMaxTokens = contextLimit;
   }
   if (reasoningActive) {
-    effectiveMaxTokens = Math.max(4500, effectiveMaxTokens);
+    const reasoningCeiling = Math.min(contextLimit, 6000); // CODEx: Cap reasoning responses to a 6k token ceiling.
+    const reasoningFloor = Math.min(reasoningCeiling, 4500); // CODEx: Ensure at least 4.5k tokens when possible.
+    effectiveMaxTokens = Math.max(effectiveMaxTokens, reasoningFloor); // CODEx: Lift lower bound for reasoning mode.
+    effectiveMaxTokens = Math.min(effectiveMaxTokens, reasoningCeiling); // CODEx: Guard against runaway token budgets.
   }
   effectiveMaxTokens = Math.min(contextLimit, effectiveMaxTokens);
+  let plannedTokens = effectiveMaxTokens; // CODEx: Track requested token budget for telemetry.
 
   const callStarted = getTimestampMs();
   // CODEx: Collect model latency metrics for diagnostics output.
@@ -7018,6 +7121,22 @@ async function callModel(messages, overrides = {}) {
     modelCallMetrics.totalMs += duration;
     modelCallMetrics.count += 1;
   };
+  const logReasoningDiagnostics = () => {
+    if (!reasoningActive) {
+      return; // CODEx: Only emit telemetry for reasoning-enabled runs.
+    }
+    const turnDuration = Math.max(0, getTimestampMs() - callStarted); // CODEx: Derive latency for reporting.
+    console.table({
+      model, // CODEx: Report model identifier.
+      reasoningMode: reasoningActive, // CODEx: Confirm reasoning handshake state.
+      tokensUsed: plannedTokens, // CODEx: Surface negotiated token budget.
+      turnDuration, // CODEx: Highlight runtime in milliseconds.
+      entropyScore: Number.isFinite(currentEntropyScore)
+        ? Number(currentEntropyScore.toFixed(3))
+        : null, // CODEx: Snapshot current entropy loop score.
+      reflexTriggered: Boolean(lastReflexSummaryAt && lastReflexSummaryAt >= callStarted) // CODEx: Flag reflex overlap.
+    });
+  }; // CODEx: Emit structured diagnostics for debugging exports.
 
   if (connectionType !== 'openai') {
     try {
@@ -7028,9 +7147,11 @@ async function callModel(messages, overrides = {}) {
         messages,
         temperature,
         maxTokens: effectiveMaxTokens,
-        timeoutMs
+        timeoutMs,
+        onStream: streamCallback
       });
       finalizeMetrics();
+      logReasoningDiagnostics(); // CODEx: Mirror remote telemetry for local providers.
       return result;
     } catch (error) {
       finalizeMetrics();
@@ -7065,6 +7186,7 @@ async function callModel(messages, overrides = {}) {
         content: msg.content
       }))
     };
+    plannedTokens = payload.max_tokens; // CODEx: Record anthropic token ceiling for telemetry.
   } else if (isGoogle) {
     requestEndpoint = `${endpoint}${model}:generateContent?key=${apiKey}`;
     payload = {
@@ -7076,6 +7198,7 @@ async function callModel(messages, overrides = {}) {
         maxOutputTokens: Math.round(effectiveMaxTokens) || 2048
       }
     };
+    plannedTokens = payload.generationConfig.maxOutputTokens; // CODEx: Track Google token plan for telemetry output.
   } else {
     if (apiKey) {
       headers.Authorization = `Bearer ${apiKey}`;
@@ -7091,6 +7214,7 @@ async function callModel(messages, overrides = {}) {
     };
     if (Number.isFinite(effectiveMaxTokens) && effectiveMaxTokens > 0) {
       payload.max_tokens = Math.round(effectiveMaxTokens);
+      plannedTokens = payload.max_tokens; // CODEx: Persist adjusted max token budget for diagnostics.
     }
   }
 
@@ -7123,16 +7247,42 @@ async function callModel(messages, overrides = {}) {
     throw error;
   }
 
+  const contentType = response.headers.get('content-type') ?? ''; // CODEx: Capture response type for streaming selection.
+
   if (!response.ok) {
     const text = await response.text();
     finalizeMetrics();
     throw new Error(`HTTP ${response.status}: ${text}`);
   }
 
-  if (shouldStream && response.headers.get('content-type')?.includes('text/event-stream')) {
-    const streamed = await consumeOpenAiStream(response);
+  if (shouldStream && response.body) {
+    if (contentType.includes('text/event-stream')) {
+      const streamed = await consumeOpenAiStream(response, {
+        onContent: (text) => {
+          if (streamCallback) {
+            streamCallback({ type: 'content', text }); // CODEx: Surface incremental assistant text.
+          }
+        },
+        onReasoning: (text) => {
+          if (streamCallback) {
+            streamCallback({ type: 'reasoning', text }); // CODEx: Surface incremental reasoning trace.
+          }
+        }
+      });
+      finalizeMetrics();
+      logReasoningDiagnostics();
+      return { content: streamed.text, truncated: streamed.truncated, reasoning: streamed.reasoning };
+    }
+    const streamed = await consumeTextStream(response, {
+      onContent: (text) => {
+        if (streamCallback) {
+          streamCallback({ type: 'content', text }); // CODEx: Relay chunked text buffers for non-SSE streaming.
+        }
+      }
+    });
     finalizeMetrics();
-    return { content: streamed.text, truncated: streamed.truncated, reasoning: streamed.reasoning };
+    logReasoningDiagnostics();
+    return { content: streamed.text, truncated: streamed.truncated ?? false, reasoning: streamed.reasoning ?? '' };
   }
 
   const data = await response.json();
@@ -7152,6 +7302,12 @@ async function callModel(messages, overrides = {}) {
   }
 
   const { text, reasoning } = normalizeModelMessage(message);
+  if (streamCallback) {
+    streamCallback({ type: 'content', text }); // CODEx: Emit final consolidated content for UI sync.
+    if (reasoning) {
+      streamCallback({ type: 'reasoning', text: reasoning }); // CODEx: Share reasoning payload when available.
+    }
+  }
   const segments = [];
   if (reasoning) {
     segments.push(`Reasoning:\n${reasoning}`);
@@ -7162,16 +7318,19 @@ async function callModel(messages, overrides = {}) {
   const combined = segments.join('\n\n').trim();
   if (!combined) {
     finalizeMetrics();
+    logReasoningDiagnostics();
     return { content: '', truncated: false, reasoning: reasoning ?? '' };
   }
 
   if (!Number.isFinite(effectiveMaxTokens) || effectiveMaxTokens <= 0) {
     finalizeMetrics();
+    logReasoningDiagnostics();
     return { content: combined, truncated: false, reasoning };
   }
 
   const trimmedResult = trimResponseToTokenLimit(combined, Math.round(effectiveMaxTokens));
   finalizeMetrics();
+  logReasoningDiagnostics();
   return { ...trimmedResult, reasoning };
 }
 
@@ -7647,7 +7806,7 @@ function scheduleNextDualTurn() {
     elements.dualStatus.textContent = 'Dual chat running…';
     autoContinueTimer = setTimeout(() => {
       autoContinueTimer = undefined;
-      void advanceDualTurn();
+      void safeDualTurnInvocation(); // CODEx: Route through watchdog wrapper for error recovery.
     }, 0);
     return;
   }
@@ -7659,7 +7818,7 @@ function scheduleNextDualTurn() {
   autoContinueTimer = setTimeout(() => {
     autoContinueTimer = undefined;
     clearDualCountdownTimer();
-    void advanceDualTurn();
+    void safeDualTurnInvocation(); // CODEx: Protect auto loop from transient failures.
   }, delayMs);
 }
 
@@ -7670,6 +7829,16 @@ function resolveDualTurnDelaySeconds() {
     600,
     defaultConfig.dualTurnDelaySeconds
   );
+  const nextConnection = activeDualConnections[nextDualSpeaker] ?? getAgentConnection(nextDualSpeaker); // CODEx: Inspect next speaker handshake.
+  const reasoningLoop = isReasoningModeActive({
+    model: nextConnection?.model,
+    providerPreset: nextConnection?.providerPreset
+  }); // CODEx: Determine if adaptive reasoning delay applies.
+  const entropyScore = Number.isFinite(currentEntropyScore) ? currentEntropyScore : 0; // CODEx: Normalize entropy metric.
+  if (reasoningLoop) {
+    const target = entropyScore > 0.8 ? 25 : 12; // CODEx: Apply Phase II adaptive windowing.
+    return Math.min(45, Math.max(8, target));
+  }
   if (baseDelay === 0) {
     return 0;
   }
@@ -7683,6 +7852,27 @@ function resolveDualTurnDelaySeconds() {
     return Math.min(MAX_DYNAMIC_DELAY_SECONDS, Math.round(baseDelay * EXPLORE_DELAY_SCALE));
   }
   return baseDelay;
+}
+
+async function safeDualTurnInvocation() {
+  if (!isDualChatRunning) {
+    return; // CODEx: Avoid scheduling when arena is idle.
+  }
+  try {
+    await advanceDualTurn();
+  } catch (error) {
+    console.warn('Turn crash — retrying in 5 s', error); // CODEx: Surface watchdog retry notice.
+    if (!isDualChatRunning) {
+      return;
+    }
+    if (elements.dualStatus) {
+      elements.dualStatus.textContent = 'Recovering from model error…'; // CODEx: Inform operators about retry cycle.
+    }
+    autoContinueTimer = setTimeout(() => {
+      autoContinueTimer = undefined;
+      void safeDualTurnInvocation();
+    }, 5000);
+  }
 }
 
 function startDualAutosaveTimer() {
@@ -7917,6 +8107,7 @@ async function runReflexSummary(speaker, options = {}) {
       source: forced ? 'manual' : 'scheduled'
     });
     void recordLog('arena', `${agentName} posted Reflex summary #${reflexSummaryCount}`, { silent: true });
+    archiveOldArenaTurns(WATCHDOG_ARCHIVE_PERCENT, { reason: 'reflex', silent: false }); // CODEx: Keep floating memory below pressure threshold.
     updateReflexStatus();
   } catch (error) {
     console.error('Reflex summary failed', error);
@@ -8131,6 +8322,66 @@ async function maybeAdvancePhase() {
   }
 }
 
+function createDualStreamHandle(speaker, speakerName) {
+  if (!elements.dualMessageTemplate || !elements.dualChatWindow) {
+    return null; // CODEx: Skip placeholder when template is unavailable.
+  }
+  const node = elements.dualMessageTemplate.content.firstElementChild.cloneNode(true); // CODEx: Clone dual message template.
+  node.classList.add('dual-message--streaming'); // CODEx: Flag streaming placeholder.
+  node.dataset.streaming = 'true'; // CODEx: Surface state for styling/debugging.
+  const timestamp = Date.now(); // CODEx: Track placeholder creation time.
+  const speakerEl = node.querySelector('.dual-speaker');
+  if (speakerEl) {
+    speakerEl.textContent = speakerName; // CODEx: Render speaker name immediately.
+  }
+  const turnEl = node.querySelector('.dual-turn');
+  if (turnEl) {
+    turnEl.textContent = '';
+    turnEl.hidden = true; // CODEx: Hide turn index until final commit.
+  }
+  const badgeEl = node.querySelector('.dual-badge');
+  if (badgeEl) {
+    badgeEl.textContent = 'streaming…'; // CODEx: Indicate active stream state.
+    badgeEl.hidden = false;
+  }
+  const timeEl = node.querySelector('.dual-time');
+  if (timeEl) {
+    timeEl.textContent = formatTimestamp(timestamp); // CODEx: Timestamp placeholder for continuity.
+  }
+  const contentEl = node.querySelector('.dual-content');
+  if (contentEl) {
+    contentEl.textContent = '…'; // CODEx: Seed placeholder text.
+  }
+  elements.dualChatWindow.appendChild(node); // CODEx: Attach streaming placeholder to arena view.
+  scrollContainerToBottom(elements.dualChatWindow); // CODEx: Ensure placeholder is visible.
+  return { node, contentEl, badgeEl, timestamp, speaker }; // CODEx: Return handle for incremental updates.
+}
+
+function updateDualStreamHandle(handle, text) {
+  if (!handle || !handle.node) {
+    return; // CODEx: Guard against absent handles.
+  }
+  const payload = text && text.trim() ? text : '…';
+  if (handle.contentEl) {
+    handle.contentEl.textContent = payload; // CODEx: Update placeholder content text.
+  }
+  if (handle.badgeEl) {
+    handle.badgeEl.textContent = payload === '…' ? 'streaming…' : 'live'; // CODEx: Reflect stream progress.
+    handle.badgeEl.hidden = false;
+  }
+}
+
+function finalizeDualStreamHandle(handle) {
+  if (!handle || !handle.node) {
+    return; // CODEx: Nothing to finalize.
+  }
+  handle.node.classList.remove('dual-message--streaming'); // CODEx: Remove streaming styling.
+  handle.node.dataset.streaming = 'false'; // CODEx: Reset state flag.
+  if (handle.badgeEl) {
+    handle.badgeEl.hidden = true; // CODEx: Hide streaming badge once finalized.
+  }
+}
+
 async function generateDualTurn(speaker, seed, options = {}) {
   if (!isDualChatRunning) return;
   const partner = speaker === 'A' ? 'B' : 'A';
@@ -8139,6 +8390,10 @@ async function generateDualTurn(speaker, seed, options = {}) {
   const normalizedSeed = typeof seed === 'string' && seed.trim() ? seed : activeDualSeed || config.dualSeed || DEFAULT_DUAL_SEED;
   const persona = getAgentPersona(speaker);
   const connection = activeDualConnections[speaker] ?? getAgentConnection(speaker);
+  const reasoningActive = isReasoningModeActive({
+    model: connection.model,
+    providerPreset: connection.providerPreset
+  }); // CODEx: Detect reasoning mode per agent connection.
   clearDualCountdownTimer();
   if (elements.dualStatus) {
     elements.dualStatus.textContent = `${speakerName} is thinking…`;
@@ -8164,7 +8419,10 @@ async function generateDualTurn(speaker, seed, options = {}) {
     content: persona || `You are ${speakerName}, an autonomous AI who is collaborating with ${partnerName}. Reply as ${speakerName}.`
   });
 
-  for (const turn of dualChatHistory) {
+  const historyLookback = reasoningActive ? Math.min(dualChatHistory.length, 6) : dualChatHistory.length; // CODEx: Restrict history depth for reasoning safety.
+  const historySource = dualChatHistory.slice(-historyLookback); // CODEx: Extract relevant history window.
+
+  for (const turn of historySource) {
     if (!turn) continue;
     if (turn.speaker === 'system' || turn.marker === 'reflex' || turn.marker === 'phase') {
       historyMessages.push({ role: 'system', content: turn.content });
@@ -8194,20 +8452,32 @@ async function generateDualTurn(speaker, seed, options = {}) {
   const retrievalQuery = options.isInitial ? seed : latestPartnerTurn?.content ?? seed;
   let retrievedMemories = [];
   if (autoInjecting && retrievalQuery) {
-    retrievedMemories = await retrieveRelevantMemories(retrievalQuery, config.retrievalCount);
+    const retrievalCap = reasoningActive
+      ? Math.max(0, Math.min(2, config.retrievalCount || 2))
+      : config.retrievalCount; // CODEx: Lighten RAG load under reasoning pressure.
+    if (retrievalCap !== 0) {
+      retrievedMemories = await retrieveRelevantMemories(retrievalQuery, retrievalCap);
+    }
+    if (reasoningActive && retrievedMemories.length > 2) {
+      retrievedMemories = retrievedMemories.slice(0, 2); // CODEx: Cap inserted cues when reasoning.
+    }
     if (retrievedMemories.length) {
       const compiled = retrievedMemories
-        .map((item) => `${formatTimestamp(item.timestamp)} • ${item.role}: ${item.content}`)
-        .join('\n');
+        .map((item) => `• ${formatTimestamp(item.timestamp)} ${formatMemoryPreview(item.content, reasoningActive ? 140 : 220)}`)
+        .join('\n'); // CODEx: Compress cue payload for reasoning focus.
       historyMessages.push({
         role: 'system',
-        content: `Shared long-term memories:\n${compiled}`
+        content: reasoningActive
+          ? `Brief memory cues:\n${compiled}`
+          : `Shared long-term memories:\n${compiled}` // CODEx: Swap to light cue format when reasoning.
       });
     }
   }
   if (autoInjecting) {
     registerRetrieval(speaker, retrievedMemories.length);
   }
+
+  const streamHandle = createDualStreamHandle(speaker, speakerName); // CODEx: Prime arena UI for streaming output.
 
   try {
     updateProcessState(processKey, {
@@ -8219,7 +8489,15 @@ async function generateDualTurn(speaker, seed, options = {}) {
     } else {
       modelBInFlight = true;
     }
-    const { content: reply, truncated, reasoning } = await callModel(historyMessages, connection);
+    const { content: reply, truncated, reasoning } = await callModel(historyMessages, {
+      ...connection,
+      onStream: (payload) => {
+        if (!streamHandle) return; // CODEx: Skip when placeholder unavailable.
+        if (payload?.type === 'content') {
+          updateDualStreamHandle(streamHandle, payload.text ?? ''); // CODEx: Render incremental text.
+        }
+      }
+    });
     if (!reply) {
       addSystemMessage(`${speakerName} did not respond.`);
       stopDualChat();
@@ -8230,6 +8508,7 @@ async function generateDualTurn(speaker, seed, options = {}) {
         `${speakerName} reply trimmed to stay within the ~${config.maxResponseTokens} token response guard.`
       );
     }
+    finalizeDualStreamHandle(streamHandle); // CODEx: Remove streaming badge before committing history.
     const badgeParts = [];
     if (retrievedMemories.length) {
       badgeParts.push(`${retrievedMemories.length} memories`);
@@ -8242,7 +8521,10 @@ async function generateDualTurn(speaker, seed, options = {}) {
     }
     recordDualMessage(speaker, reply, {
       marker: truncated ? 'truncated' : undefined,
-      label: badgeParts.length ? badgeParts.join(' • ') : undefined
+      label: badgeParts.length ? badgeParts.join(' • ') : undefined,
+      existingNode: streamHandle?.node,
+      contentNode: streamHandle?.contentEl,
+      timestamp: streamHandle?.timestamp
     });
     updateProcessState(processKey, {
       status: 'Reply delivered',
@@ -8253,6 +8535,9 @@ async function generateDualTurn(speaker, seed, options = {}) {
     void maybeTriggerReflexSummary(speaker);
     updateEntropyMeter();
   } catch (error) {
+    if (streamHandle?.node?.isConnected) {
+      streamHandle.node.remove(); // CODEx: Clear placeholder on failure.
+    }
     const errorMessage = error.message || 'Unknown error occurred';
     addSystemMessage(`Dual chat error: ${errorMessage}`);
     updateProcessState(processKey, { status: 'Error', detail: errorMessage });
@@ -8279,10 +8564,18 @@ async function generateDualTurn(speaker, seed, options = {}) {
 }
 
 function recordDualMessage(speaker, content, options = {}) {
-  const { saveHistory = true, label, marker, turnNumber: providedTurn } = options;
+  const {
+    saveHistory = true,
+    label,
+    marker,
+    turnNumber: providedTurn,
+    existingNode,
+    contentNode,
+    timestamp: providedTimestamp
+  } = options; // CODEx: Support streaming placeholders when recording turns.
   const metadata = sanitizeMetadata(options.metadata);
   const countsOption = options.countsAsTurn;
-  const timestamp = Date.now();
+  const timestamp = Number.isFinite(providedTimestamp) ? providedTimestamp : Date.now(); // CODEx: Preserve streaming timestamps.
   let turnNumber = typeof providedTurn === 'number' ? providedTurn : null;
   const normalizedSpeaker = speaker === 'B' ? 'B' : speaker === 'system' ? 'system' : 'A';
   const countsAsTurn = typeof countsOption === 'boolean' ? countsOption : normalizedSpeaker !== 'system';
@@ -8338,7 +8631,15 @@ function recordDualMessage(speaker, content, options = {}) {
     void persistMessage(memoryEntry);
   }
 
-  const node = elements.dualMessageTemplate.content.firstElementChild.cloneNode(true);
+  const templateNode = elements.dualMessageTemplate?.content?.firstElementChild;
+  const node = existingNode ?? (templateNode ? templateNode.cloneNode(true) : null);
+  if (!node) {
+    return; // CODEx: Bail when template is missing and no placeholder provided.
+  }
+  if (existingNode) {
+    node.classList.remove('dual-message--streaming'); // CODEx: Ensure finalized styling.
+    node.dataset.streaming = 'false';
+  }
   const turnNode = node.querySelector('.dual-turn');
   if (turnNode) {
     if (turnNumber) {
@@ -8360,13 +8661,21 @@ function recordDualMessage(speaker, content, options = {}) {
     }
   }
   node.querySelector('.dual-speaker').textContent = speakerName;
-  node.querySelector('.dual-time').textContent = formatTimestamp(timestamp);
-  node.querySelector('.dual-content').textContent = content;
+  const timeNode = node.querySelector('.dual-time');
+  if (timeNode) {
+    timeNode.textContent = formatTimestamp(timestamp); // CODEx: Use supplied timestamp for continuity.
+  }
+  const contentTarget = contentNode ?? node.querySelector('.dual-content');
+  if (contentTarget) {
+    contentTarget.textContent = content; // CODEx: Finalize streamed content.
+  }
   if (marker) {
     node.classList.add(`dual-message--${marker}`);
   }
-  elements.dualChatWindow.appendChild(node);
-  scrollContainerToBottom(elements.dualChatWindow);
+  if (!existingNode) {
+    elements.dualChatWindow.appendChild(node); // CODEx: Append fresh entry when no placeholder exists.
+    scrollContainerToBottom(elements.dualChatWindow);
+  }
   void persistDualRagSnapshot();
   if (countsAsTurn && (normalizedSpeaker === 'A' || normalizedSpeaker === 'B')) {
     maybeTriggerReflexHooks();

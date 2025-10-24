@@ -36,6 +36,12 @@ contextBridge.exposeInMainWorld('standaloneFs', {
   }
 });
 
+contextBridge.exposeInMainWorld('standaloneRuntime', {
+  updateReasoningTimeout(value) {
+    ipcRenderer.send('standalone-reasoning-timeout', value); // CODEx: Relay reasoning timeout changes to the main process.
+  }
+});
+
 const WATCHDOG_SOURCE = 'sam-standalone-watchdog';
 const WATCHDOG_TYPE = 'check-arena-memory';
 const WATCHDOG_INTERVAL_MS = 3 * 60 * 1000;

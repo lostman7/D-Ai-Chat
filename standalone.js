@@ -6,6 +6,7 @@ const STORAGE_DIR_NAME = 'sam-storage';
 const ramStore = new Map();
 const APP_BASE_PATH = path.resolve(__dirname);
 const BINARY_EXTENSIONS = new Set(['.pdf']);
+let reasoningTimeoutSeconds = 300; // CODEx: Mirror renderer reasoning timeout for diagnostics.
 
 function normalizeRelativePath(input) {
   if (!input) return '';
@@ -277,6 +278,13 @@ function registerStorageHandlers() {
 
   ipcMain.on('standalone-store-clear', (event) => {
     event.returnValue = clearStorage();
+  });
+
+  ipcMain.on('standalone-reasoning-timeout', (event, value) => {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      reasoningTimeoutSeconds = numeric; // CODEx: Track renderer-driven timeout for watchdog tooling.
+    }
   });
 }
 
