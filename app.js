@@ -212,6 +212,32 @@ function storageClear() {
   }
 }
 
+function wait(ms) { // CODEx: Promise-based delay helper for retry backoff sequencing.
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0))); // CODEx: Clamp negatives.
+}
+
+function computeBackoffDelay(attempt, base = 400, cap = 5000) { // CODEx: Exponential backoff with an upper cap.
+  const order = Math.max(0, (Number(attempt) || 1) - 1); // CODEx: Normalize attempt index starting at zero.
+  const interval = Math.round((Number(base) || 400) * 2 ** order); // CODEx: Exponentially grow delays per attempt.
+  return Math.min(Math.max(0, interval), Number(cap) || 5000); // CODEx: Enforce non-negative durations within cap.
+}
+
+function shouldRetryStatus(status) { // CODEx: Identify HTTP statuses that merit automatic retry.
+  if (!Number.isFinite(status)) return false; // CODEx: Ignore non-numeric statuses.
+  if (status === 429) return true; // CODEx: Back off on rate limits.
+  return status >= 500 && status < 600; // CODEx: Retry server-side failures.
+}
+
+function isTransientNetworkError(error) { // CODEx: Detect network layer issues eligible for retry.
+  if (!error) return false; // CODEx: Guard nullish references.
+  if (error.name === 'AbortError') return false; // CODEx: Abort errors handled separately.
+  const message = String(error?.message || error || '').toLowerCase(); // CODEx: Normalize message for heuristics.
+  if (message.includes('network') || message.includes('fetch') || message.includes('failed to fetch')) {
+    return true; // CODEx: Treat generic fetch/network failures as transient.
+  }
+  return error instanceof TypeError; // CODEx: Browser fetch errors surface as TypeError and should be retried.
+}
+
 function getDirectoryPath(path) {
   if (typeof path !== 'string') {
     return '';
@@ -1309,6 +1335,7 @@ async function init() {
   ensureEmbeddingCacheManifest(); // CODEx: Hydrate embedding cache manifest before retrieval operations.
   await resolveActiveEmbeddingProvider(true); // CODEx: Probe embedding provider at startup for accurate status.
   primeRamDiskCache();
+  await ensurePhasePromptBaseline(); // CODEx: Confirm arena phase prompts are provisioned before debates begin.
   applyDebugSetting();
   updateConfigInputs();
   updateSpeakToggle();
@@ -7044,6 +7071,7 @@ async function callLocalModel({
   if (isEmbeddingModelId(model)) { // CODEx: Guard against embedding-only checkpoints.
     throw new Error(`Model ${model} does not support text generation`); // CODEx: Block embedding checkpoints from chat usage.
   }
+  const providerLabel = type === 'ollama' ? 'Ollama (Local)' : 'LM Studio'; // CODEx: Identify provider for telemetry messaging.
   let numCtx = getProviderContextLimit(type === 'ollama' ? 'ollama' : 'lmstudio'); // CODEx: Initialize local context budget.
   let attempt = 0; // CODEx: Track retry iteration count.
   const maxAttempts = 3; // CODEx: Allow retries for watchdog and context recovery.
@@ -7072,6 +7100,10 @@ async function callLocalModel({
           num_ctx: numCtx,
           num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx))
         };
+    if (!isOllamaLocal) {
+      payload.use_default_prompt_template = false; // CODEx: Disable LM Studio Jinja templates for raw JSON payloads.
+      payload.input_format = 'json'; // CODEx: Request LM Studio to interpret payload without prompt templating.
+    }
 
     const remaining = Math.max(0, deadline - Date.now()); // CODEx: Derive remaining overall budget in milliseconds.
     if (remaining <= 0) { // CODEx: Abort when the global timeout has elapsed.
@@ -7113,6 +7145,12 @@ async function callLocalModel({
         return { content: text, reasoning: data?.message?.reasoning || '', truncated: false };
       }
       const errorText = await response.text(); // CODEx: Capture response body for diagnostics.
+      if (shouldRetryStatus(response.status) && attempt < maxAttempts) {
+        const delayMs = computeBackoffDelay(attempt, 600); // CODEx: Exponential backoff for transient server errors.
+        console.warn(`[Bridge] ${providerLabel} HTTP ${response.status}; retrying in ${delayMs}ms (attempt ${attempt}/${maxAttempts}).`); // CODEx: Surface provider retry telemetry.
+        await wait(delayMs); // CODEx: Delay subsequent attempt to respect backoff.
+        return executeAttempt(); // CODEx: Re-run local request after cooldown.
+      }
       if (response.status >= 400 && response.status < 500) {
         if (/no context/i.test(errorText) && attempt < maxAttempts) {
           numCtx = Math.max(512, Math.floor(numCtx * 0.7)); // CODEx: Reduce context window on capacity errors.
@@ -7120,6 +7158,7 @@ async function callLocalModel({
         }
         if (/model not found/i.test(errorText) && type === 'ollama') {
           const fallbackEndpoint = `${stripTrailingSlashes(deriveBaseUrl(endpoint))}/api/generate`;
+          console.warn(`[Bridge] ${providerLabel} fallback to ${fallbackEndpoint} after HTTP ${response.status}.`); // CODEx: Log explicit provider fallback routing.
           const fallbackResponse = await fetch(fallbackEndpoint, { // CODEx: Retry using canonical generate endpoint.
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -7152,6 +7191,12 @@ async function callLocalModel({
         const timeoutError = new Error(`Local request timed out after ${Math.round(timeoutMs / 1000)}s.`);
         timeoutError.code = 'timeout';
         throw timeoutError;
+      }
+      if (attempt < maxAttempts && isTransientNetworkError(error)) {
+        const delayMs = computeBackoffDelay(attempt, 600); // CODEx: Compute exponential backoff for transient local failures.
+        console.warn(`[Bridge] ${providerLabel} transient error (${error.message || error}); retrying in ${delayMs}ms.`); // CODEx: Log retry decision for diagnostics.
+        await wait(delayMs); // CODEx: Pause before retrying to give the server breathing room.
+        return executeAttempt(); // CODEx: Attempt the request again after backoff interval.
       }
       throw error;
     }
@@ -7539,7 +7584,7 @@ async function callModel(messages, overrides = {}) {
     }
   }
 
-  const maxAttempts = 2; // CODEx: Allow one retry when watchdog intervenes.
+  const maxAttempts = 3; // CODEx: Allow exponential backoff retries for transient failures.
   let attempt = 0; // CODEx: Track remote retry attempts.
 
   async function issueRequest() {
@@ -7566,10 +7611,11 @@ async function callModel(messages, overrides = {}) {
     } catch (error) {
       clearTimeout(timeoutId); // CODEx: Ensure timers cleared on error path.
       clearTimeout(watchdogTimer); // CODEx: Ensure watchdog timer cleared on error path.
-      if (error.name === 'AbortError' && watchdogTriggered && attempt < maxAttempts) { // CODEx: Retry after watchdog abort.
-        return issueRequest(); // CODEx: Re-run request after watchdog abort.
-      }
       if (error.name === 'AbortError') {
+        if (watchdogTriggered) {
+          error.code = 'watchdog-abort'; // CODEx: Flag watchdog-driven abort for backoff handling.
+          throw error; // CODEx: Bubble to outer retry controller.
+        }
         if (reasoningActive) {
           modelCallMetrics.reasoningTimeouts += 1; // CODEx: Track reasoning timeout metrics.
         }
@@ -7583,12 +7629,39 @@ async function callModel(messages, overrides = {}) {
   }
 
   let response;
-  try {
-    const { response: resolvedResponse } = await issueRequest(); // CODEx: Execute request with watchdog handling.
-    response = resolvedResponse; // CODEx: Normalize response reference for downstream logic.
-  } catch (error) {
-    finalizeMetrics(); // CODEx: Preserve metrics on failure.
-    throw error; // CODEx: Propagate error to caller.
+  let lastError = null; // CODEx: Track last failure for final error reporting.
+  while (attempt < maxAttempts) {
+    try {
+      const { response: resolvedResponse } = await issueRequest(); // CODEx: Execute request with watchdog handling.
+      response = resolvedResponse; // CODEx: Normalize response reference for downstream logic.
+    } catch (error) {
+      lastError = error; // CODEx: Preserve error for diagnostics.
+      if (attempt < maxAttempts && (error.code === 'watchdog-abort' || isTransientNetworkError(error))) {
+        const delayMs = computeBackoffDelay(attempt, 600); // CODEx: Determine exponential backoff interval.
+        console.warn(`[Bridge] ${model} retry after ${error.code === 'watchdog-abort' ? 'watchdog abort' : error.message}; waiting ${delayMs}ms.`); // CODEx: Emit retry telemetry for remote providers.
+        await wait(delayMs); // CODEx: Pause before attempting again.
+        continue; // CODEx: Retry request after cooldown.
+      }
+      finalizeMetrics(); // CODEx: Preserve metrics on terminal failure.
+      throw error; // CODEx: Propagate non-retriable error to caller.
+    }
+    if (!response) {
+      break; // CODEx: Should not occur, but guard to avoid infinite loop.
+    }
+    if (!response.ok) {
+      if (attempt < maxAttempts && shouldRetryStatus(response.status)) {
+        const delayMs = computeBackoffDelay(attempt, 600); // CODEx: Compute retry interval for server failures.
+        console.warn(`[Bridge] HTTP ${response.status} at ${requestEndpoint}; retrying in ${delayMs}ms (attempt ${attempt}/${maxAttempts}).`); // CODEx: Log remote fallback path clearly.
+        await wait(delayMs); // CODEx: Delay before reissuing request.
+        continue; // CODEx: Attempt request again following backoff.
+      }
+    }
+    break; // CODEx: Exit loop when response obtained (success or terminal failure).
+  }
+
+  if (!response) {
+    finalizeMetrics(); // CODEx: Preserve metrics when no response obtained.
+    throw lastError || new Error('Model request failed without response.'); // CODEx: Report absence of response clearly.
   }
 
   const contentType = response.headers.get('content-type') ?? ''; // CODEx: Capture response type for streaming selection.
@@ -8589,6 +8662,41 @@ async function readPhasePromptFile(fileName) {
     console.warn('Failed to fetch phase prompt', relativePath, error);
   }
   return null;
+}
+
+async function ensurePhasePromptBaseline() { // CODEx: Guarantee the primary phase prompt exists for arena rotation.
+  const baselinePath = `${PHASE_PROMPT_DIR}phase1.txt`; // CODEx: Target baseline prompt path.
+  const directory = PHASE_PROMPT_DIR.replace(/\/$/, ''); // CODEx: Normalize directory path without trailing slash.
+  const existing = readStandaloneFile(baselinePath); // CODEx: Attempt to read from standalone bridge first.
+  if (existing?.content) {
+    return true; // CODEx: Baseline already provisioned.
+  }
+  let seeded = false; // CODEx: Track whether a file was created during this check.
+  if (ensureStandaloneDirectory(directory)) { // CODEx: Ensure directory exists when bridge available.
+    const defaultContent = [
+      '# Flow Dynamics Primer', // CODEx: Provide concise placeholder guidance for phase one.
+      'Use this phase to establish shared definitions, goals, and system constraints before diving deeper.', // CODEx: Explain the intent of the initial debate phase.
+      'Highlight any conflicting assumptions so later phases can resolve them efficiently.' // CODEx: Encourage surfacing disagreements early.
+    ].join('\n');
+    seeded = writeStandaloneFile(baselinePath, defaultContent, { contentType: 'text/plain' }) !== false; // CODEx: Seed file via bridge when possible.
+    if (seeded) {
+      console.log(`[RAG] Seeded baseline phase prompt at ${baselinePath}`); // CODEx: Log successful creation for diagnostics.
+      phasePromptCache.set('phase1.txt', defaultContent); // CODEx: Prime cache with seeded content.
+      return true; // CODEx: Early exit after successful creation.
+    }
+  }
+  try {
+    const response = await fetch(baselinePath, { cache: 'no-store' }); // CODEx: Probe bundled asset when filesystem write unavailable.
+    if (response.ok) {
+      return true; // CODEx: Asset already present on the server.
+    }
+  } catch (error) {
+    console.debug('[RAG] Phase prompt fetch fallback failed', error); // CODEx: Emit debug trace without interrupting startup.
+  }
+  if (!seeded) {
+    console.warn(`[RAG] Baseline phase prompt missing at ${baselinePath}.`); // CODEx: Surface absence so operators can provision it.
+  }
+  return false; // CODEx: Signal that prompt could not be confirmed.
 }
 
 async function activatePhase(index, options = {}) {
