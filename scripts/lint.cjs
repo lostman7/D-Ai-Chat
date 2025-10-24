@@ -32,7 +32,7 @@ try {
   verifyMarkers('index.html', [
     { pattern: 'id="optionsHandle"', description: 'options drawer handle' },
     { pattern: 'id="optionsDrawer"', description: 'options drawer panel' },
-    { pattern: 'id="providerSelect"', description: 'provider selector' },
+    { pattern: 'id="a_model_preset"', description: 'Agent A provider selector' },
     { pattern: 'id="memorySlider"', description: 'memory slider control' },
     { pattern: 'id="dualChatWindow"', description: 'dual agent transcript container' }
   ]);

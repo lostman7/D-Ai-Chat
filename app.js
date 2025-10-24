@@ -408,6 +408,10 @@ const defaultConfig = {
   systemPrompt: 'You are SAM, a helpful memory-augmented assistant who reflects on long-term memories when they are relevant.',
   temperature: 0.7,
   maxResponseTokens: 4500,
+  agentATemperature: 0.7, // CODEx: Agent A specific temperature default.
+  agentAMaxResponseTokens: 4500, // CODEx: Agent A specific max tokens default.
+  agentBTemperature: 0.7, // CODEx: Agent B specific temperature default.
+  agentBMaxResponseTokens: 4500, // CODEx: Agent B specific max tokens default.
   embeddingModel: 'text-embedding-3-large',
   embeddingEndpoint: '',
   embeddingApiKey: '',
@@ -1093,15 +1097,23 @@ function refreshEmbeddingStatusIndicator() { // CODEx: Update the memory drawer 
   indicator.textContent = `Embedding Active ✗ (Provider: ${providerLabel}, Cache: ${cacheLabel})${reason}`; // CODEx: Combine failure message with provider context.
 } // CODEx
 
-function toggleEmbeddingCard(cardElement, toggleButton) { // CODEx: Collapse or expand per-agent embedding cards.
-  if (!cardElement || !toggleButton) { // CODEx: Guard against missing DOM nodes.
-    return; // CODEx: Exit safely when elements are unavailable.
+function updateCardSectionState(cardElement, toggleButton, bodyElement, collapsed) { // CODEx: Apply collapse state to accordion cards.
+  if (!cardElement || !toggleButton || !bodyElement) { // CODEx: Guard against missing DOM nodes.
+    return; // CODEx: Bail when any element is unavailable.
   }
-  const collapsed = cardElement.getAttribute('data-collapsed') === 'true'; // CODEx: Inspect current collapsed state.
-  const nextState = !collapsed; // CODEx: Flip collapse boolean.
-  cardElement.setAttribute('data-collapsed', String(nextState)); // CODEx: Persist new state on the card container.
-  toggleButton.setAttribute('aria-expanded', String(!nextState)); // CODEx: Keep accessibility attributes in sync.
-  toggleButton.textContent = nextState ? '▸' : '▾'; // CODEx: Swap chevron indicator for collapsed/expanded state.
+  const nextCollapsed = Boolean(collapsed); // CODEx: Normalize boolean flag.
+  cardElement.setAttribute('data-collapsed', String(nextCollapsed)); // CODEx: Persist collapse attribute for styling.
+  toggleButton.textContent = nextCollapsed ? '▸' : '▾'; // CODEx: Reflect collapse state via chevron glyph.
+  toggleButton.setAttribute('aria-expanded', String(!nextCollapsed)); // CODEx: Maintain accessibility hint.
+  bodyElement.hidden = nextCollapsed; // CODEx: Toggle body visibility while retaining state.
+} // CODEx
+
+function toggleCardSection(cardElement, toggleButton, bodyElement) { // CODEx: Flip accordion state on demand.
+  if (!cardElement || !toggleButton || !bodyElement) { // CODEx: Skip when card parts are missing.
+    return; // CODEx: Avoid errors for incomplete markup.
+  }
+  const collapsed = cardElement.getAttribute('data-collapsed') === 'true'; // CODEx: Read current collapse flag.
+  updateCardSectionState(cardElement, toggleButton, bodyElement, !collapsed); // CODEx: Apply inverted state.
 } // CODEx
 
 async function runEmbeddingTest(agent) { // CODEx: Probe embedding health for a specific arena agent.
@@ -1506,8 +1518,13 @@ const elements = {
   arenaPanel: document.getElementById('arenaPanel'),
   switchToChatButton: document.getElementById('switchToChatButton'),
   switchToArenaButton: document.getElementById('switchToArenaButton'),
+  agentACard: document.getElementById('agentACard'), // CODEx: Agent A card container.
+  agentABody: document.getElementById('agentABody'), // CODEx: Agent A body panel.
+  toggleAgentA: document.getElementById('toggleAgentA'), // CODEx: Agent A collapse toggle.
+  agentBCard: document.getElementById('agentBCard'), // CODEx: Agent B card container.
+  agentBBody: document.getElementById('agentBBody'), // CODEx: Agent B body panel.
+  toggleAgentB: document.getElementById('toggleAgentB'), // CODEx: Agent B collapse toggle.
   agentBEnabled: document.getElementById('agentBEnabled'),
-  agentBConfig: document.getElementById('agentBConfig'),
   messageInput: document.getElementById('messageInput'),
   sendButton: document.getElementById('sendButton'),
   voiceButton: document.getElementById('voiceButton'),
@@ -1538,41 +1555,34 @@ const elements = {
   archiveUnpinnedButton: document.getElementById('archiveUnpinnedButton'),
   modelARetrievals: document.getElementById('modelARetrievals'),
   modelBRetrievals: document.getElementById('modelBRetrievals'),
-  endpointInput: document.getElementById('endpointInput'),
-  providerSelect: document.getElementById('providerSelect'),
-  providerNotes: document.getElementById('providerNotes'),
-  modelInput: document.getElementById('modelInput'),
-  apiKeyInput: document.getElementById('apiKeyInput'),
-  embeddingModelInput: document.getElementById('embeddingModelInput'),
-  embeddingEndpointInput: document.getElementById('embeddingEndpointInput'),
-  embeddingApiKeyInput: document.getElementById('embeddingApiKeyInput'),
-  embeddingProviderSelect: document.getElementById('embeddingProviderSelect'), // CODEx: Dropdown for provider selection.
-  embeddingContextLength: document.getElementById('embeddingContextLength'), // CODEx: Numeric input for embedding context window.
-  agentAEmbeddingProviderSelect: document.getElementById('agentAEmbeddingProvider'), // CODEx: SAM-A embedding provider select.
-  agentAEmbeddingModelInput: document.getElementById('agentAEmbeddingModel'), // CODEx: SAM-A embedding model input.
-  agentAEmbeddingEndpointInput: document.getElementById('agentAEmbeddingEndpoint'), // CODEx: SAM-A endpoint override input.
-  agentAEmbeddingApiKeyInput: document.getElementById('agentAEmbeddingApiKey'), // CODEx: SAM-A API key input.
-  agentAEmbeddingContextInput: document.getElementById('agentAEmbeddingContext'), // CODEx: SAM-A context input.
-  agentAEmbeddingTestButton: document.getElementById('agentAEmbeddingTestButton'), // CODEx: SAM-A embedding test trigger.
-  agentAEmbeddingStatus: document.getElementById('agentAEmbeddingStatus'), // CODEx: SAM-A test status label.
-  agentAEmbeddingCard: document.getElementById('agentAEmbeddingCard'), // CODEx: SAM-A card container reference.
-  agentAEmbeddingCollapse: document.getElementById('agentAEmbeddingCollapse'), // CODEx: SAM-A collapse toggle.
-  agentBEmbeddingProviderSelect: document.getElementById('agentBEmbeddingProvider'), // CODEx: SAM-B embedding provider select.
-  agentBEmbeddingModelInput: document.getElementById('agentBEmbeddingModel'), // CODEx: SAM-B embedding model input.
-  agentBEmbeddingEndpointInput: document.getElementById('agentBEmbeddingEndpoint'), // CODEx: SAM-B endpoint override input.
-  agentBEmbeddingApiKeyInput: document.getElementById('agentBEmbeddingApiKey'), // CODEx: SAM-B API key input.
-  agentBEmbeddingContextInput: document.getElementById('agentBEmbeddingContext'), // CODEx: SAM-B context input.
-  agentBEmbeddingTestButton: document.getElementById('agentBEmbeddingTestButton'), // CODEx: SAM-B embedding test trigger.
-  agentBEmbeddingStatus: document.getElementById('agentBEmbeddingStatus'), // CODEx: SAM-B test status label.
-  agentBEmbeddingCard: document.getElementById('agentBEmbeddingCard'), // CODEx: SAM-B card container reference.
-  agentBEmbeddingCollapse: document.getElementById('agentBEmbeddingCollapse'), // CODEx: SAM-B collapse toggle.
+  providerSelect: document.getElementById('a_model_preset'), // CODEx: Agent A provider preset selector.
+  providerNotes: document.getElementById('providerNotes'), // CODEx: Agent A provider notes output.
+  endpointInput: document.getElementById('a_model_endpoint'), // CODEx: Agent A endpoint input.
+  modelInput: document.getElementById('a_model_name'), // CODEx: Agent A model name input.
+  apiKeyInput: document.getElementById('a_model_key'), // CODEx: Agent A API key input.
+  temperatureInput: document.getElementById('a_temp'), // CODEx: Agent A temperature slider.
+  temperatureValueLabel: document.getElementById('a_temp_value'), // CODEx: Agent A temperature label.
+  maxTokensInput: document.getElementById('a_max_tokens'), // CODEx: Agent A max tokens input.
+  agentAEmbeddingProviderSelect: document.getElementById('a_embed_provider'), // CODEx: Agent A embedding provider select.
+  agentAEmbeddingModelInput: document.getElementById('a_embed_model'), // CODEx: Agent A embedding model input.
+  agentAEmbeddingEndpointInput: document.getElementById('a_embed_endpoint'), // CODEx: Agent A embedding endpoint input.
+  agentAEmbeddingApiKeyInput: document.getElementById('a_embed_key'), // CODEx: Agent A embedding key input.
+  agentAEmbeddingContextInput: document.getElementById('a_embed_ctx'), // CODEx: Agent A embedding context input.
+  agentAEmbeddingTestButton: document.getElementById('a_test_embed'), // CODEx: Agent A embedding test button.
+  agentAEmbeddingStatus: document.getElementById('a_embed_status'), // CODEx: Agent A embedding status label.
+  agentBEmbeddingProviderSelect: document.getElementById('b_embed_provider'), // CODEx: Agent B embedding provider select.
+  agentBEmbeddingModelInput: document.getElementById('b_embed_model'), // CODEx: Agent B embedding model input.
+  agentBEmbeddingEndpointInput: document.getElementById('b_embed_endpoint'), // CODEx: Agent B embedding endpoint input.
+  agentBEmbeddingApiKeyInput: document.getElementById('b_embed_key'), // CODEx: Agent B embedding key input.
+  agentBEmbeddingContextInput: document.getElementById('b_embed_ctx'), // CODEx: Agent B embedding context input.
+  agentBEmbeddingTestButton: document.getElementById('b_test_embed'), // CODEx: Agent B embedding test button.
+  agentBEmbeddingStatus: document.getElementById('b_embed_status'), // CODEx: Agent B embedding status label.
+  saveConfigButton: document.getElementById('saveOptions'), // CODEx: Manual save control.
+  saveStatus: document.getElementById('saveStatus'), // CODEx: Save feedback label.
   openRouterPolicyField: document.getElementById('openRouterPolicyField'),
   openRouterPolicyInput: document.getElementById('openRouterPolicyInput'),
   systemPromptInput: document.getElementById('systemPromptInput'),
-  temperatureInput: document.getElementById('temperatureInput'),
-  maxTokensInput: document.getElementById('maxTokensInput'),
   maxTokensHint: document.getElementById('maxTokensHint'),
-  saveConfigButton: document.getElementById('saveConfigButton'),
   diagnosticsButton: document.getElementById('diagnosticsButton'),
   dualStatus: document.getElementById('dualStatus'),
   startDualButton: document.getElementById('startDualButton'),
@@ -1593,11 +1603,13 @@ const elements = {
   agentBPrompt: document.getElementById('agentBPrompt'),
   requestTimeout: document.getElementById('requestTimeout'),
   reasoningTimeout: document.getElementById('reasoningTimeout'),
-  agentBProviderSelect: document.getElementById('agentBProviderSelect'),
-  agentBProviderNotes: document.getElementById('agentBProviderNotes'),
-  agentBEndpoint: document.getElementById('agentBEndpoint'),
-  agentBModel: document.getElementById('agentBModel'),
-  agentBApiKey: document.getElementById('agentBApiKey'),
+  agentBProviderSelect: document.getElementById('b_model_preset'), // CODEx: Agent B provider preset selector.
+  agentBEndpoint: document.getElementById('b_model_endpoint'), // CODEx: Agent B endpoint input.
+  agentBModel: document.getElementById('b_model_name'), // CODEx: Agent B model input.
+  agentBApiKey: document.getElementById('b_model_key'), // CODEx: Agent B API key input.
+  agentBTemperatureInput: document.getElementById('b_temp'), // CODEx: Agent B temperature slider.
+  agentBTemperatureLabel: document.getElementById('b_temp_value'), // CODEx: Agent B temperature value label.
+  agentBMaxTokensInput: document.getElementById('b_max_tokens'), // CODEx: Agent B max tokens input.
   ttsPresetSelect: document.getElementById('ttsPresetSelect'),
   ttsPresetDetails: document.getElementById('ttsPresetDetails'),
   ttsPresetList: document.getElementById('ttsPresetList'),
@@ -1767,7 +1779,36 @@ function loadConfig() {
       contextLimit,
       defaultConfig.maxResponseTokens
     );
-    config.maxResponseTokens = Math.round(clampedMaxTokens);
+    const normalizedAgentAMax = Math.round(clampedMaxTokens);
+    config.agentAMaxResponseTokens = normalizedAgentAMax;
+    config.maxResponseTokens = normalizedAgentAMax;
+    const agentAPresetTemperature = clampNumber(
+      config.agentATemperature ?? config.temperature ?? defaultConfig.agentATemperature,
+      0,
+      2,
+      defaultConfig.agentATemperature
+    );
+    config.agentATemperature = agentAPresetTemperature;
+    config.temperature = agentAPresetTemperature;
+    const agentBTempFallback = clampNumber(
+      config.agentBTemperature ?? agentAPresetTemperature,
+      0,
+      2,
+      agentAPresetTemperature
+    );
+    config.agentBTemperature = agentBTempFallback;
+    const agentBContextLimit = getProviderContextLimit(
+      config.agentBProviderPreset === 'inherit' ? config.providerPreset : config.agentBProviderPreset
+    );
+    const normalizedAgentBMax = Math.round(
+      clampNumber(
+        config.agentBMaxResponseTokens ?? normalizedAgentAMax,
+        16,
+        agentBContextLimit,
+        normalizedAgentAMax
+      )
+    );
+    config.agentBMaxResponseTokens = normalizedAgentBMax;
     config.reasoningModeEnabled = Boolean(config.reasoningModeEnabled);
     config.useEmbeddingRetrieval = typeof config.useEmbeddingRetrieval === 'boolean' ? config.useEmbeddingRetrieval : defaultConfig.useEmbeddingRetrieval; // CODEx: Normalize embedding toggle with sane default.
     if (!config.embeddingModel || typeof config.embeddingModel !== 'string') {
@@ -2269,9 +2310,28 @@ function updateConfigInputs() {
     elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
   }
   elements.systemPromptInput.value = config.systemPrompt;
-  elements.temperatureInput.value = config.temperature;
+  const agentATemperature = config.agentATemperature ?? config.temperature ?? defaultConfig.agentATemperature; // CODEx: Resolve Agent A temperature.
+  if (elements.temperatureInput) { // CODEx: Sync Agent A temperature slider.
+    elements.temperatureInput.value = String(agentATemperature);
+  }
+  if (elements.temperatureValueLabel) { // CODEx: Update Agent A temperature label.
+    elements.temperatureValueLabel.textContent = Number(agentATemperature).toFixed(2);
+  }
+  const agentAMaxTokens = config.agentAMaxResponseTokens ?? config.maxResponseTokens ?? defaultConfig.agentAMaxResponseTokens; // CODEx: Resolve Agent A max tokens.
   if (elements.maxTokensInput) {
+    elements.maxTokensInput.value = String(agentAMaxTokens);
     updateMaxTokensCeiling();
+  }
+  const agentBTemperature = config.agentBTemperature ?? agentATemperature; // CODEx: Resolve Agent B temperature fallback.
+  if (elements.agentBTemperatureInput) { // CODEx: Sync Agent B temperature slider.
+    elements.agentBTemperatureInput.value = String(agentBTemperature);
+  }
+  if (elements.agentBTemperatureLabel) { // CODEx: Update Agent B temperature label.
+    elements.agentBTemperatureLabel.textContent = Number(agentBTemperature).toFixed(2);
+  }
+  const agentBMaxTokens = config.agentBMaxResponseTokens ?? config.maxResponseTokens ?? defaultConfig.agentBMaxResponseTokens; // CODEx: Resolve Agent B max tokens.
+  if (elements.agentBMaxTokensInput) { // CODEx: Sync Agent B max tokens input.
+    elements.agentBMaxTokensInput.value = String(agentBMaxTokens);
   }
   updateAgentConnectionInputs('B');
   if (elements.dualSeedInput) {
@@ -2407,10 +2467,6 @@ function applyAgentBEnabledState() {
   if (elements.agentBEnabled) {
     elements.agentBEnabled.checked = enabled;
   }
-  if (elements.agentBConfig) {
-    elements.agentBConfig.hidden = !enabled;
-    elements.agentBConfig.setAttribute('aria-hidden', String(!enabled));
-  }
   const toggledFields = [
     'agentBProviderSelect',
     'agentBEndpoint',
@@ -2418,6 +2474,8 @@ function applyAgentBEnabledState() {
     'agentBApiKey',
     'agentBName',
     'agentBPrompt',
+    'agentBTemperatureInput',
+    'agentBMaxTokensInput',
     'agentBEmbeddingProviderSelect', // CODEx: Disable SAM-B embedding provider when Model B is off.
     'agentBEmbeddingModelInput', // CODEx: Disable SAM-B embedding model input when Model B is off.
     'agentBEmbeddingEndpointInput', // CODEx: Disable SAM-B endpoint override when Model B is off.
@@ -2435,12 +2493,8 @@ function applyAgentBEnabledState() {
       }
     }
   }
-  if (!enabled && elements.agentBProviderNotes) {
-    elements.agentBProviderNotes.textContent = 'Enable Model B to configure a separate connection.';
-  }
-  if (elements.agentBEmbeddingCard) {
-    elements.agentBEmbeddingCard.hidden = !enabled; // CODEx: Hide SAM-B embedding controls when disabled.
-    elements.agentBEmbeddingCard.setAttribute('aria-hidden', String(!enabled)); // CODEx: Maintain accessibility state.
+  if (elements.agentBBody) {
+    elements.agentBBody.setAttribute('aria-disabled', String(!enabled)); // CODEx: Mark Agent B body disabled state.
   }
   if (enabled) {
     updateAgentConnectionInputs('B');
@@ -2480,8 +2534,8 @@ function getAgentConnection(agent) {
       endpoint: config.endpoint,
       model: config.model,
       apiKey: config.apiKey,
-      temperature: config.temperature,
-      maxTokens: config.maxResponseTokens,
+      temperature: config.agentATemperature ?? config.temperature ?? defaultConfig.agentATemperature,
+      maxTokens: config.agentAMaxResponseTokens ?? config.maxResponseTokens ?? defaultConfig.agentAMaxResponseTokens,
       providerPreset: basePreset?.id ?? 'custom',
       providerLabel: basePreset ? `${basePreset.label} (main)` : 'Custom',
       presetDescription: basePreset?.description ?? '',
@@ -2501,13 +2555,17 @@ function getAgentConnection(agent) {
   const endpoint = inherits ? config.endpoint : config.agentBEndpoint || preset?.endpoint || '';
   const model = inherits ? config.model : config.agentBModel || preset?.model || '';
   const apiKey = inherits ? config.apiKey : config.agentBApiKey || '';
+  const aTemperature = config.agentATemperature ?? config.temperature ?? defaultConfig.agentATemperature;
+  const aMaxTokens = config.agentAMaxResponseTokens ?? config.maxResponseTokens ?? defaultConfig.agentAMaxResponseTokens;
+  const bTemperature = config.agentBTemperature ?? aTemperature;
+  const bMaxTokens = config.agentBMaxResponseTokens ?? aMaxTokens;
 
   return {
     endpoint,
     model,
     apiKey,
-    temperature: config.temperature,
-    maxTokens: config.maxResponseTokens,
+    temperature: bTemperature,
+    maxTokens: bMaxTokens,
     providerPreset: preset?.id ?? 'custom',
     providerLabel: inherits && basePreset ? `${basePreset.label} (main)` : preset?.label ?? 'Custom',
     presetDescription: preset?.description ?? '',
@@ -2679,6 +2737,22 @@ function bindEvents() {
     }
   };
 
+  if (elements.agentACard && elements.toggleAgentA && elements.agentABody) { // CODEx: Initialize Agent A accordion state.
+    const collapsed = elements.agentACard.getAttribute('data-collapsed') === 'true'; // CODEx: Determine default collapse value.
+    updateCardSectionState(elements.agentACard, elements.toggleAgentA, elements.agentABody, collapsed); // CODEx: Sync visuals.
+    addListener(elements.toggleAgentA, 'click', () => { // CODEx: Toggle Agent A card on demand.
+      toggleCardSection(elements.agentACard, elements.toggleAgentA, elements.agentABody); // CODEx: Apply flip state.
+    });
+  }
+
+  if (elements.agentBCard && elements.toggleAgentB && elements.agentBBody) { // CODEx: Initialize Agent B accordion state.
+    const collapsed = elements.agentBCard.getAttribute('data-collapsed') === 'true'; // CODEx: Determine default collapse value.
+    updateCardSectionState(elements.agentBCard, elements.toggleAgentB, elements.agentBBody, collapsed); // CODEx: Sync visuals.
+    addListener(elements.toggleAgentB, 'click', () => { // CODEx: Toggle Agent B card on demand.
+      toggleCardSection(elements.agentBCard, elements.toggleAgentB, elements.agentBBody); // CODEx: Apply flip state.
+    });
+  }
+
   addListener(elements.enterChatButton, 'click', () => {
     setActiveMode(MODE_CHAT);
   });
@@ -2765,6 +2839,22 @@ function bindEvents() {
 
   addListener(elements.agentBProviderSelect, 'change', (event) => {
     applyArenaProviderPreset('B', event.target.value);
+  });
+
+  const autosaveTargets = document.querySelectorAll(
+    '#agentABody input, #agentABody select, #agentABody textarea, #agentBBody input, #agentBBody select, #agentBBody textarea'
+  ); // CODEx: Aggregate Agent card form fields for blur autosave.
+  autosaveTargets.forEach((node) => {
+    addListener(node, 'blur', () => {
+      saveConfig();
+      if (elements.saveStatus) {
+        elements.saveStatus.textContent = 'Saved.';
+        window.clearTimeout(elements.saveStatus._clearTimer);
+        elements.saveStatus._clearTimer = window.setTimeout(() => {
+          elements.saveStatus.textContent = '';
+        }, 1500);
+      }
+    });
   });
 
   addListener(elements.agentBEnabled, 'change', (event) => {
@@ -2944,18 +3034,6 @@ function bindEvents() {
     });
   }
 
-  if (elements.agentAEmbeddingCollapse) {
-    addListener(elements.agentAEmbeddingCollapse, 'click', () => {
-      toggleEmbeddingCard(elements.agentAEmbeddingCard, elements.agentAEmbeddingCollapse); // CODEx: Toggle SAM-A embedding card collapse state.
-    });
-  }
-
-  if (elements.agentBEmbeddingCollapse) {
-    addListener(elements.agentBEmbeddingCollapse, 'click', () => {
-      toggleEmbeddingCard(elements.agentBEmbeddingCard, elements.agentBEmbeddingCollapse); // CODEx: Toggle SAM-B embedding card collapse state.
-    });
-  }
-
   if (elements.openRouterPolicyInput) {
     addListener(elements.openRouterPolicyInput, 'input', (event) => {
       config.openRouterPolicy = event.target.value.trim();
@@ -3028,41 +3106,112 @@ function bindEvents() {
     config.systemPrompt = event.target.value;
   });
 
-  addListener(elements.temperatureInput, 'change', (event) => {
-    const parsed = Number.parseFloat(event.target.value);
-    if (!Number.isNaN(parsed)) {
-      config.temperature = clampNumber(parsed, 0, 2, config.temperature);
+  const applyAgentATemperature = (value) => { // CODEx: Normalize Agent A temperature updates.
+    const parsed = Number.parseFloat(value);
+    const clamped = clampNumber(Number.isNaN(parsed) ? config.agentATemperature ?? defaultConfig.agentATemperature : parsed, 0, 2, config.agentATemperature ?? defaultConfig.agentATemperature);
+    config.agentATemperature = clamped;
+    config.temperature = clamped; // CODEx: Maintain legacy temperature field for compatibility.
+    if (elements.temperatureInput) {
+      elements.temperatureInput.value = String(clamped);
     }
-    elements.temperatureInput.value = config.temperature.toString();
+    if (elements.temperatureValueLabel) {
+      elements.temperatureValueLabel.textContent = clamped.toFixed(2);
+    }
+    if (activeDualConnections.A) {
+      activeDualConnections.A.temperature = clamped;
+    }
+    saveConfig();
+  };
+
+  const applyAgentBTemperature = (value) => { // CODEx: Normalize Agent B temperature updates.
+    const parsed = Number.parseFloat(value);
+    const base = config.agentATemperature ?? config.temperature ?? defaultConfig.agentATemperature;
+    const clamped = clampNumber(Number.isNaN(parsed) ? config.agentBTemperature ?? base : parsed, 0, 2, config.agentBTemperature ?? base);
+    config.agentBTemperature = clamped;
+    if (elements.agentBTemperatureInput) {
+      elements.agentBTemperatureInput.value = String(clamped);
+    }
+    if (elements.agentBTemperatureLabel) {
+      elements.agentBTemperatureLabel.textContent = clamped.toFixed(2);
+    }
+    if (activeDualConnections.B) {
+      activeDualConnections.B.temperature = clamped;
+    }
+    saveConfig();
+  };
+
+  addListener(elements.temperatureInput, 'input', (event) => {
+    applyAgentATemperature(event.target.value);
   });
+
+  addListener(elements.temperatureInput, 'change', (event) => {
+    applyAgentATemperature(event.target.value);
+  });
+
+  if (elements.agentBTemperatureInput) {
+    addListener(elements.agentBTemperatureInput, 'input', (event) => {
+      applyAgentBTemperature(event.target.value);
+    });
+    addListener(elements.agentBTemperatureInput, 'change', (event) => {
+      applyAgentBTemperature(event.target.value);
+    });
+  }
 
   addListener(elements.maxTokensInput, 'change', (event) => {
     const parsed = Number.parseInt(event.target.value, 10);
     const limit = getProviderContextLimit(config.providerPreset);
     if (Number.isNaN(parsed) || parsed <= 0) {
-      config.maxResponseTokens = Math.round(
-        clampNumber(defaultConfig.maxResponseTokens, 16, limit, defaultConfig.maxResponseTokens)
-      );
+      const fallback = clampNumber(defaultConfig.agentAMaxResponseTokens, 16, limit, defaultConfig.agentAMaxResponseTokens);
+      config.agentAMaxResponseTokens = Math.round(fallback);
     } else {
-      config.maxResponseTokens = Math.round(
-        clampNumber(parsed, 16, limit, config.maxResponseTokens ?? defaultConfig.maxResponseTokens)
+      config.agentAMaxResponseTokens = Math.round(
+        clampNumber(parsed, 16, limit, config.agentAMaxResponseTokens ?? defaultConfig.agentAMaxResponseTokens)
       );
     }
+    config.maxResponseTokens = config.agentAMaxResponseTokens; // CODEx: Maintain legacy max tokens mirror.
     updateMaxTokensCeiling();
     if (activeDualConnections.A) {
-      activeDualConnections.A.maxTokens = config.maxResponseTokens;
+      activeDualConnections.A.maxTokens = config.agentAMaxResponseTokens;
     }
     if (activeDualConnections.B) {
-      activeDualConnections.B.maxTokens = config.maxResponseTokens;
+      activeDualConnections.B.maxTokens = config.agentBMaxResponseTokens ?? config.agentAMaxResponseTokens;
     }
     saveConfig();
   });
+
+  if (elements.agentBMaxTokensInput) {
+    addListener(elements.agentBMaxTokensInput, 'change', (event) => {
+      const parsed = Number.parseInt(event.target.value, 10);
+      const presetId = config.agentBProviderPreset === 'inherit' || !config.agentBProviderPreset
+        ? config.providerPreset
+        : config.agentBProviderPreset;
+      const limit = getProviderContextLimit(presetId);
+      const fallback = config.agentAMaxResponseTokens ?? config.maxResponseTokens ?? defaultConfig.agentAMaxResponseTokens;
+      config.agentBMaxResponseTokens = Math.round(
+        clampNumber(Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed, 16, limit, fallback)
+      );
+      if (elements.agentBMaxTokensInput) {
+        elements.agentBMaxTokensInput.value = String(config.agentBMaxResponseTokens);
+      }
+      if (activeDualConnections.B) {
+        activeDualConnections.B.maxTokens = config.agentBMaxResponseTokens;
+      }
+      saveConfig();
+    });
+  }
 
   addListener(elements.saveConfigButton, 'click', () => {
     saveConfig();
     updateModelConnectionStatus();
     if (document.body.classList.contains('options-open')) {
       closeOptionsPanel();
+    }
+    if (elements.saveStatus) {
+      elements.saveStatus.textContent = 'Saved.';
+      window.clearTimeout(elements.saveStatus._clearTimer);
+      elements.saveStatus._clearTimer = window.setTimeout(() => {
+        elements.saveStatus.textContent = '';
+      }, 1500);
     }
   });
 
@@ -3371,9 +3520,10 @@ function updateMaxTokensCeiling() {
   if (!elements.maxTokensInput) return;
   const limit = getProviderContextLimit(config.providerPreset);
   elements.maxTokensInput.max = String(limit);
-  const current = config.maxResponseTokens ?? defaultConfig.maxResponseTokens;
+  const current = config.agentAMaxResponseTokens ?? config.maxResponseTokens ?? defaultConfig.agentAMaxResponseTokens;
   const normalized = Math.round(clampNumber(current, 16, limit, current));
-  config.maxResponseTokens = normalized;
+  config.agentAMaxResponseTokens = normalized;
+  config.maxResponseTokens = normalized; // CODEx: Keep legacy max token mirror updated.
   elements.maxTokensInput.value = String(normalized);
   if (elements.maxTokensHint) {
     elements.maxTokensHint.textContent = `Provider limit: up to ${limit.toLocaleString()} tokens.`;

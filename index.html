@@ -268,165 +268,166 @@
       </section>
 
       <section class="side-card" aria-labelledby="dual-heading">
-        <h2 id="dual-heading">Model workbench</h2>
-        <p class="hint-text">Configure SAM&apos;s primary brain and the optional partner it debates inside the arena.</p>
+        <h2 id="dual-heading">Agent routing &amp; models</h2>
+        <p class="hint-text">Tune each agent&apos;s model and embedding pipeline with collapse-friendly cards.</p>
 
-        <h3 class="side-card-subheading">Model A (primary SAM)</h3>
-        <div class="field">
-          <label for="providerSelect">Provider preset</label>
-          <select id="providerSelect">
-            <option value="custom">Custom / bring your own</option>
-          </select>
-          <p id="providerNotes" class="field-hint" role="note"></p>
-        </div>
-        <div class="field">
-          <label for="endpointInput">Endpoint URL</label>
-          <input id="endpointInput" type="url" placeholder="http://localhost:1234/v1/chat/completions">
-        </div>
-        <div class="field">
-          <label for="modelInput">Model name</label>
-          <input id="modelInput" type="text" placeholder="lmstudio-community/Meta-Llama-3-8B-Instruct">
-        </div>
-        <div class="field">
-          <label for="apiKeyInput">API key (optional)</label>
-          <input id="apiKeyInput" type="password" autocomplete="off">
-        </div>
-        <div class="field">
-          <label for="embeddingProviderSelect">Embedding provider</label> <!-- // CODEx: Provider preference dropdown label -->
-          <select id="embeddingProviderSelect"> <!-- // CODEx: Embedding provider preference control -->
-            <option value="auto">Auto detect</option> <!-- // CODEx: Automatic provider detection option -->
-            <option value="openai">OpenAI / remote</option> <!-- // CODEx: Force remote embedding provider -->
-            <option value="lmstudio">LM Studio</option> <!-- // CODEx: Force LM Studio local embeddings -->
-            <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Force Ollama local embeddings -->
-            <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Force Ollama cloud embeddings -->
-          </select>
-          <p class="field-hint">Auto probes LM Studio, Ollama Local, or Ollama Cloud before falling back to remote embeddings.</p> <!-- // CODEx: Provider hint copy -->
-        </div>
-        <div class="field">
-          <label for="embeddingModelInput">Embedding model</label>
-          <input id="embeddingModelInput" type="text" placeholder="text-embedding-3-large">
-          <p class="field-hint">Controls vector retrieval quality. Leave blank to restore the default.</p>
-        </div>
-        <div class="field">
-          <label for="embeddingEndpointInput">Embedding endpoint</label>
-          <input id="embeddingEndpointInput" type="url" placeholder="Optional override e.g. http://localhost:11434/api/embeddings">
-          <p class="field-hint">Blank = auto-detect from the selected provider.</p>
-        </div>
-        <div class="field">
-          <label for="embeddingApiKeyInput">Embedding API key</label>
-          <input id="embeddingApiKeyInput" type="password" autocomplete="off" placeholder="Optional unless required by the service">
-        </div>
-        <div class="field">
-          <label for="embeddingContextLength">Embedding context length</label> <!-- // CODEx: Context slider label -->
-          <input id="embeddingContextLength" type="number" min="512" max="4096" step="128" value="1024"> <!-- // CODEx: Numeric input for embedding context window -->
-          <p class="field-hint">Controls the token window sent to embedding models (512–4096). Defaults to 1024.</p> <!-- // CODEx: Context hint copy -->
-        </div>
-        <h3 class="side-card-subheading">Arena embedding channels</h3> <!-- // CODEx: Subheading for per-agent embeddings -->
-        <section class="embed-card" id="agentAEmbeddingCard" data-collapsed="false"> <!-- // CODEx: Container for SAM-A embedding controls -->
-          <header class="embed-card__header"> <!-- // CODEx: Header with collapse toggle for SAM-A -->
-            <h4>SAM-A embeddings</h4> <!-- // CODEx: SAM-A embedding heading -->
-            <button id="agentAEmbeddingCollapse" class="ghost ghost--icon" type="button" aria-expanded="true" aria-controls="agentAEmbeddingBody">▾</button> <!-- // CODEx: Collapse toggle -->
+        <!-- Agent A -->
+        <section class="side-card" id="agentACard" data-collapsed="false">
+          <header class="embed-card__header">
+            <h2>Agent A (primary SAM)</h2>
+            <button class="ghost ghost--icon" id="toggleAgentA" aria-expanded="true">▾</button>
           </header>
-          <div class="embed-card__body" id="agentAEmbeddingBody"> <!-- // CODEx: Collapsible region for SAM-A inputs -->
-            <div class="field">
-              <label for="agentAEmbeddingProvider">Provider preset</label> <!-- // CODEx: SAM-A provider label -->
-              <select id="agentAEmbeddingProvider"> <!-- // CODEx: SAM-A provider select -->
-                <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Default SAM-A provider option -->
-                <option value="lmstudio">LM Studio</option> <!-- // CODEx: Alternate local provider -->
-                <option value="openai">OpenAI / remote</option> <!-- // CODEx: Remote fallback -->
-                <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Cloud provider option -->
-              </select>
-              <p class="field-hint">Flowfield advocate prefers fast local vectors. Override for remote caches.</p> <!-- // CODEx: SAM-A hint -->
+          <div class="embed-card__body" id="agentABody">
+            <!-- Model block -->
+            <div class="embed-card">
+              <div class="embed-card__header">
+                <h4>Model</h4>
+              </div>
+              <div class="embed-card__body">
+                <label class="field">Provider preset
+                  <select id="a_model_preset"></select>
+                </label>
+                <p id="providerNotes" class="field-hint" role="note"></p>
+                <label class="field">Endpoint URL
+                  <input id="a_model_endpoint" placeholder="http://localhost:11434/api/generate" />
+                </label>
+                <label class="field">Model name
+                  <input id="a_model_name" placeholder="llama3.2:3b" />
+                </label>
+                <label class="field">API key (optional)
+                  <input id="a_model_key" />
+                </label>
+                <div class="field field--range">
+                  <span class="slider-label"><span>Temperature</span><span class="range-value" id="a_temp_value">0.7</span></span>
+                  <input type="range" id="a_temp" min="0" max="2" step="0.05" value="0.7" />
+                </div>
+                <label class="field">Max tokens
+                  <input id="a_max_tokens" type="number" min="64" max="8192" value="1024" />
+                </label>
+                <p id="maxTokensHint" class="field-hint">Provider limit: up to 262,144 tokens.</p>
+                <label class="field">Model A display name
+                  <input id="agentAName" type="text" placeholder="SAM-A">
+                </label>
+                <label class="field">Persona / system prompt
+                  <textarea id="systemPromptInput" rows="4" placeholder="You are SAM, a helpful memory-augmented assistant."></textarea>
+                </label>
+              </div>
             </div>
-            <div class="field">
-              <label for="agentAEmbeddingModel">Embedding model</label> <!-- // CODEx: SAM-A model label -->
-              <input id="agentAEmbeddingModel" type="text" placeholder="mxbai-embed-large"> <!-- // CODEx: SAM-A model input -->
+            <!-- Embedding block -->
+            <div class="embed-card">
+              <div class="embed-card__header">
+                <h4>Embeddings</h4>
+              </div>
+              <div class="embed-card__body">
+                <label class="field">Embedding provider
+                  <select id="a_embed_provider"></select>
+                </label>
+                <label class="field">Embedding model
+                  <input id="a_embed_model" placeholder="mxbai-embed-large:latest" />
+                </label>
+                <label class="field">Embedding endpoint
+                  <input id="a_embed_endpoint" placeholder="POST http://localhost:11434/api/embed" />
+                </label>
+                <label class="field">Embedding API key
+                  <input id="a_embed_key" />
+                </label>
+                <label class="field">Context length
+                  <input id="a_embed_ctx" type="number" min="512" max="4096" value="1024" />
+                </label>
+                <div class="embed-card__actions">
+                  <button class="ghost" id="a_test_embed">Test embedding</button>
+                  <span id="a_embed_status" class="status-text"></span>
+                </div>
+              </div>
             </div>
-            <div class="field">
-              <label for="agentAEmbeddingEndpoint">Endpoint</label> <!-- // CODEx: SAM-A endpoint label -->
-              <input id="agentAEmbeddingEndpoint" type="url" placeholder="http://localhost:11434/api/embed"> <!-- // CODEx: SAM-A endpoint input -->
-            </div>
-            <div class="field">
-              <label for="agentAEmbeddingApiKey">API key</label> <!-- // CODEx: SAM-A key label -->
-              <input id="agentAEmbeddingApiKey" type="password" autocomplete="off"> <!-- // CODEx: SAM-A key input -->
-            </div>
-            <div class="field">
-              <label for="agentAEmbeddingContext">Context length</label> <!-- // CODEx: SAM-A context label -->
-              <input id="agentAEmbeddingContext" type="number" min="512" max="4096" step="128" value="1024"> <!-- // CODEx: SAM-A context input -->
-            </div>
-            <div class="embed-card__actions"> <!-- // CODEx: Actions row for SAM-A -->
-              <button id="agentAEmbeddingTestButton" class="ghost" type="button">Test embedding</button> <!-- // CODEx: SAM-A test trigger -->
-              <span id="agentAEmbeddingStatus" class="hint-text" role="status"></span> <!-- // CODEx: SAM-A status output -->
+            <div class="field" id="openRouterPolicyField">
+              <label for="openRouterPolicyInput">OpenRouter data policy</label>
+              <input id="openRouterPolicyInput" type="text" placeholder="e.g. default, opt-out, free">
+              <p class="field-hint">Match your OpenRouter privacy mode to avoid 404 data-policy errors.</p>
             </div>
           </div>
         </section>
-        <section class="embed-card" id="agentBEmbeddingCard" data-collapsed="false"> <!-- // CODEx: Container for SAM-B embedding controls -->
-          <header class="embed-card__header"> <!-- // CODEx: Header with collapse toggle for SAM-B -->
-            <h4>SAM-B embeddings</h4> <!-- // CODEx: SAM-B embedding heading -->
-            <button id="agentBEmbeddingCollapse" class="ghost ghost--icon" type="button" aria-expanded="true" aria-controls="agentBEmbeddingBody">▾</button> <!-- // CODEx: Collapse toggle -->
+
+        <!-- Agent B (skeptic) -->
+        <section class="side-card" id="agentBCard" data-collapsed="true">
+          <header class="embed-card__header">
+            <h2>Agent B (skeptic)</h2>
+            <button class="ghost ghost--icon" id="toggleAgentB" aria-expanded="false">▸</button>
           </header>
-          <div class="embed-card__body" id="agentBEmbeddingBody"> <!-- // CODEx: Collapsible region for SAM-B inputs -->
-            <div class="field">
-              <label for="agentBEmbeddingProvider">Provider preset</label> <!-- // CODEx: SAM-B provider label -->
-              <select id="agentBEmbeddingProvider"> <!-- // CODEx: SAM-B provider select -->
-                <option value="lmstudio">LM Studio</option> <!-- // CODEx: Default SAM-B provider option -->
-                <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Alternate local provider -->
-                <option value="openai">OpenAI / remote</option> <!-- // CODEx: Remote fallback -->
-                <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Cloud provider option -->
-              </select>
-              <p class="field-hint">Skeptic prefers LM Studio for contrastive recall. Adjust as needed.</p> <!-- // CODEx: SAM-B hint -->
+          <div class="embed-card__body" id="agentBBody" hidden>
+            <label class="toggle">
+              <input id="agentBEnabled" type="checkbox">
+              <span>Enable Model B for dual debates</span>
+            </label>
+            <label class="field">Model B display name
+              <input id="agentBName" type="text" placeholder="SAM-B">
+            </label>
+            <label class="field">Model B arena persona
+              <textarea id="agentBPrompt" rows="3" placeholder="You are SAM-B, a creative explorer."></textarea>
+            </label>
+            <!-- Model block -->
+            <div class="embed-card">
+              <div class="embed-card__header">
+                <h4>Model</h4>
+              </div>
+              <div class="embed-card__body">
+                <label class="field">Provider preset
+                  <select id="b_model_preset"></select>
+                </label>
+                <label class="field">Endpoint URL
+                  <input id="b_model_endpoint" placeholder="http://127.0.0.1:1234/v1/chat/completions" />
+                </label>
+                <label class="field">Model name
+                  <input id="b_model_name" placeholder="qwen2.5-7b-instruct" />
+                </label>
+                <label class="field">API key (optional)
+                  <input id="b_model_key" />
+                </label>
+                <div class="field field--range">
+                  <span class="slider-label"><span>Temperature</span><span class="range-value" id="b_temp_value">0.7</span></span>
+                  <input type="range" id="b_temp" min="0" max="2" step="0.05" value="0.7" />
+                </div>
+                <label class="field">Max tokens
+                  <input id="b_max_tokens" type="number" min="64" max="8192" value="1024" />
+                </label>
+              </div>
             </div>
-            <div class="field">
-              <label for="agentBEmbeddingModel">Embedding model</label> <!-- // CODEx: SAM-B model label -->
-              <input id="agentBEmbeddingModel" type="text" placeholder="text-embedding-3-large"> <!-- // CODEx: SAM-B model input -->
-            </div>
-            <div class="field">
-              <label for="agentBEmbeddingEndpoint">Endpoint</label> <!-- // CODEx: SAM-B endpoint label -->
-              <input id="agentBEmbeddingEndpoint" type="url" placeholder="http://localhost:1234/v1/embeddings"> <!-- // CODEx: SAM-B endpoint input -->
-            </div>
-            <div class="field">
-              <label for="agentBEmbeddingApiKey">API key</label> <!-- // CODEx: SAM-B key label -->
-              <input id="agentBEmbeddingApiKey" type="password" autocomplete="off"> <!-- // CODEx: SAM-B key input -->
-            </div>
-            <div class="field">
-              <label for="agentBEmbeddingContext">Context length</label> <!-- // CODEx: SAM-B context label -->
-              <input id="agentBEmbeddingContext" type="number" min="512" max="4096" step="128" value="1024"> <!-- // CODEx: SAM-B context input -->
-            </div>
-            <div class="embed-card__actions"> <!-- // CODEx: Actions row for SAM-B -->
-              <button id="agentBEmbeddingTestButton" class="ghost" type="button">Test embedding</button> <!-- // CODEx: SAM-B test trigger -->
-              <span id="agentBEmbeddingStatus" class="hint-text" role="status"></span> <!-- // CODEx: SAM-B status output -->
+            <!-- Embedding block -->
+            <div class="embed-card">
+              <div class="embed-card__header">
+                <h4>Embeddings</h4>
+              </div>
+              <div class="embed-card__body">
+                <label class="field">Embedding provider
+                  <select id="b_embed_provider"></select>
+                </label>
+                <label class="field">Embedding model
+                  <input id="b_embed_model" placeholder="text-embedding-3-large" />
+                </label>
+                <label class="field">Embedding endpoint
+                  <input id="b_embed_endpoint" placeholder="http://127.0.0.1:1234/v1/embeddings" />
+                </label>
+                <label class="field">Embedding API key
+                  <input id="b_embed_key" />
+                </label>
+                <label class="field">Context length
+                  <input id="b_embed_ctx" type="number" min="512" max="4096" value="1536" />
+                </label>
+                <div class="embed-card__actions">
+                  <button class="ghost" id="b_test_embed">Test embedding</button>
+                  <span id="b_embed_status" class="status-text"></span>
+                </div>
+              </div>
             </div>
           </div>
         </section>
-        <div class="field" id="openRouterPolicyField">
-          <label for="openRouterPolicyInput">OpenRouter data policy</label>
-          <input id="openRouterPolicyInput" type="text" placeholder="e.g. default, opt-out, free">
-          <p class="field-hint">Match your OpenRouter privacy mode to avoid 404 data-policy errors.</p>
-        </div>
-        <div class="field">
-          <label for="agentAName">Model A display name</label>
-          <input id="agentAName" type="text" placeholder="SAM-A">
-        </div>
-        <div class="field">
-          <label for="systemPromptInput">Persona / system prompt</label>
-          <textarea id="systemPromptInput" rows="4" placeholder="You are SAM, a helpful memory-augmented assistant."></textarea>
-        </div>
-        <div class="field field--inline">
-          <label for="temperatureInput">Temperature</label>
-          <input id="temperatureInput" type="number" step="0.1" min="0" max="2" value="0.7">
+
+        <!-- Save controls -->
+        <div class="memory-actions">
+          <button id="saveOptions" class="primary">Save</button>
+          <span id="saveStatus" class="status-text"></span>
         </div>
 
-        <div class="field">
-          <label for="maxTokensInput">Max response tokens</label>
-          <input id="maxTokensInput" type="number" min="16" max="262144" value="512">
-          <p id="maxTokensHint" class="field-hint">Provider limit: up to 262,144 tokens.</p>
-        </div>
-
-        <h3 class="side-card-subheading">Model B (arena partner)</h3>
-        <label class="toggle">
-          <input id="agentBEnabled" type="checkbox">
-          <span>Enable Model B for dual debates</span>
-        </label>
         <div class="field field--inline">
           <label for="requestTimeout">Request timeout (seconds)</label>
           <input id="requestTimeout" type="number" min="10" max="600" value="30">
@@ -436,36 +437,6 @@
           <input id="reasoningTimeout" type="number" min="30" max="900" value="120">
           <p class="field-hint">Used whenever a model or preset signals extended thinking time.</p>
         </div>
-        <div id="agentBConfig" class="agent-b-config" hidden aria-hidden="true">
-          <div class="field">
-            <label for="agentBName">Model B display name</label>
-            <input id="agentBName" type="text" placeholder="SAM-B">
-          </div>
-          <div class="field">
-            <label for="agentBPrompt">Model B arena persona</label>
-            <textarea id="agentBPrompt" rows="3" placeholder="You are SAM-B, a creative explorer."></textarea>
-          </div>
-          <div class="field">
-            <label for="agentBProviderSelect">Model B preset</label>
-            <select id="agentBProviderSelect">
-              <option value="inherit">Share Model A settings</option>
-            </select>
-            <p id="agentBProviderNotes" class="field-hint" role="note"></p>
-          </div>
-          <div class="field">
-            <label for="agentBEndpoint">Model B endpoint</label>
-            <input id="agentBEndpoint" type="url" placeholder="https://openrouter.ai/api/v1/chat/completions">
-          </div>
-          <div class="field">
-            <label for="agentBModel">Model B name</label>
-            <input id="agentBModel" type="text" placeholder="openrouter/google/gemma-2-9b-it">
-          </div>
-          <div class="field">
-            <label for="agentBApiKey">Model B API key</label>
-            <input id="agentBApiKey" type="password" autocomplete="off" placeholder="Optional unless required by the service">
-          </div>
-        </div>
-
         <div class="field field--inline">
           <label for="dualTurnLimit">Max turns (0 = unlimited)</label>
           <input id="dualTurnLimit" type="number" min="0" max="50" value="0" placeholder="0">
@@ -479,7 +450,6 @@
           <input id="dualAutoContinue" type="checkbox" checked>
           <span>Auto-continue conversation</span>
         </label>
-        <button id="saveConfigButton" class="primary">Save model settings</button>
       </section>
 
       <section class="side-card" aria-labelledby="reflex-heading">
