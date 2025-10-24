@@ -297,9 +297,10 @@
             <option value="auto">Auto detect</option> <!-- // CODEx: Automatic provider detection option -->
             <option value="openai">OpenAI / remote</option> <!-- // CODEx: Force remote embedding provider -->
             <option value="lmstudio">LM Studio</option> <!-- // CODEx: Force LM Studio local embeddings -->
-            <option value="ollama">Ollama</option> <!-- // CODEx: Force Ollama local embeddings -->
+            <option value="ollama-local">Ollama (Local)</option> <!-- // CODEx: Force Ollama local embeddings -->
+            <option value="ollama-cloud">Ollama (Cloud)</option> <!-- // CODEx: Force Ollama cloud embeddings -->
           </select>
-          <p class="field-hint">Auto probes LM Studio or Ollama before falling back to remote embeddings.</p> <!-- // CODEx: Provider hint copy -->
+          <p class="field-hint">Auto probes LM Studio, Ollama Local, or Ollama Cloud before falling back to remote embeddings.</p> <!-- // CODEx: Provider hint copy -->
         </div>
         <div class="field">
           <label for="embeddingModelInput">Embedding model</label>

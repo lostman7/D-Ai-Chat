@@ -478,6 +478,16 @@ const providerPresets = [
     contextLimit: 65536
   },
   {
+    id: 'ollama-cloud', // CODEx: Expose Ollama Cloud as a provider preset.
+    label: 'Ollama Cloud', // CODEx: UI label for Ollama Cloud connections.
+    description:
+      'Route SAM through Ollama Cloud. Provide your OLLAMA_API_KEY and the service will mirror OpenAI-compatible chat completions.', // CODEx: Explain Ollama Cloud usage.
+    endpoint: 'https://api.ollama.ai/v1/chat/completions', // CODEx: Default Ollama Cloud chat endpoint.
+    model: 'llama3.1', // CODEx: Reasonable default model identifier for cloud usage.
+    requiresKey: true, // CODEx: Ollama Cloud requires an API key.
+    contextLimit: 65536 // CODEx: Estimated context limit for Ollama Cloud.
+  },
+  {
     id: 'openrouter',
     label: 'OpenRouter (cloud hub)',
     description:
@@ -848,8 +858,10 @@ function getActiveEmbeddingProviderLabel() { // CODEx: Present user-friendly pro
   switch (embeddingProviderState.active) { // CODEx: Branch on current provider value.
     case EMBEDDING_PROVIDERS.LM_STUDIO:
       return 'LMStudio'; // CODEx: Normalize LM Studio label casing.
-    case EMBEDDING_PROVIDERS.OLLAMA:
-      return 'Ollama'; // CODEx: Standardize Ollama label.
+    case EMBEDDING_PROVIDERS.OLLAMA_LOCAL:
+      return 'Ollama-Local'; // CODEx: Standardize Ollama local label.
+    case EMBEDDING_PROVIDERS.OLLAMA_CLOUD:
+      return 'Ollama-Cloud'; // CODEx: Standardize Ollama cloud label.
     case EMBEDDING_PROVIDERS.OPENAI:
       return 'OpenAI'; // CODEx: Remote provider label.
     default:
@@ -1054,6 +1066,7 @@ async function resolveActiveEmbeddingProvider(force = false) { // CODEx: Probe e
       preference,
       embeddingEndpoint: config.embeddingEndpoint,
       modelEndpoint: config.endpoint,
+      embeddingApiKey: (config.embeddingApiKey || config.apiKey || '').trim(), // CODEx: Pass configured API keys for provider detection.
       fetchImpl: (url, options) => fetch(url, options),
       logger: console
     });
@@ -1415,8 +1428,11 @@ function loadConfig() {
     const storedPreference = typeof config.embeddingProviderPreference === 'string'
       ? config.embeddingProviderPreference.toLowerCase().trim()
       : '';
-    config.embeddingProviderPreference = allowedEmbeddingProviders.has(storedPreference)
-      ? storedPreference
+    const normalizedPreference = storedPreference === 'ollama'
+      ? EMBEDDING_PROVIDERS.OLLAMA_LOCAL
+      : storedPreference; // CODEx: Migrate legacy Ollama preference to explicit local variant.
+    config.embeddingProviderPreference = allowedEmbeddingProviders.has(normalizedPreference)
+      ? normalizedPreference
       : defaultConfig.embeddingProviderPreference; // CODEx: Default to auto when preference invalid.
     if (typeof config.dualTurnLimit !== 'number' || config.dualTurnLimit < 0) {
       config.dualTurnLimit = defaultConfig.dualTurnLimit;
@@ -2299,6 +2315,7 @@ function bindEvents() {
   addListener(elements.apiKeyInput, 'input', (event) => {
     config.apiKey = event.target.value;
     updateAgentConnectionInputs('B');
+    void resolveActiveEmbeddingProvider(true); // CODEx: Re-evaluate embedding provider when shared API key updates.
   });
 
   if (elements.embeddingModelInput) {
@@ -2323,6 +2340,7 @@ function bindEvents() {
       config.embeddingApiKey = event.target.value.trim();
       saveConfig();
       clearCachedEmbeddings();
+      void resolveActiveEmbeddingProvider(true); // CODEx: Trigger provider probe to reflect new embedding key.
     });
   }
 
@@ -6734,8 +6752,23 @@ function resolveEmbeddingEndpoint() {
   if (!endpoint) {
     return '';
   }
-  if (isLikelyOllama(endpoint)) {
-    return `${stripTrailingSlashes(deriveBaseUrl(endpoint))}/api/embeddings`;
+  if (isOllamaCloud(endpoint)) { // CODEx: Map Ollama Cloud chat endpoints to embeddings path.
+    if (/\/v1\/chat\/completions$/i.test(endpoint)) { // CODEx: Handle OpenAI-compatible pathing.
+      return endpoint.replace(/\/v1\/chat\/completions$/i, '/v1/embeddings'); // CODEx: Swap chat completions with embeddings endpoint.
+    }
+    if (/\/v1\/chat$/i.test(endpoint)) { // CODEx: Support condensed chat route.
+      return endpoint.replace(/\/v1\/chat$/i, '/v1/embeddings'); // CODEx: Normalize to embeddings endpoint.
+    }
+    return `${stripTrailingSlashes(endpoint)}/v1/embeddings`; // CODEx: Default cloud embeddings suffix.
+  }
+  if (isOllamaLocal(endpoint)) { // CODEx: Map Ollama local chat endpoints to embeddings path.
+    if (/\/v1\/chat\/completions$/i.test(endpoint)) { // CODEx: Handle OpenAI-style local endpoints.
+      return endpoint.replace(/\/v1\/chat\/completions$/i, '/api/embeddings'); // CODEx: Translate to native /api/embeddings path.
+    }
+    if (/\/api\/chat$/i.test(endpoint)) { // CODEx: Handle /api/chat local endpoints.
+      return endpoint.replace(/\/api\/chat$/i, '/api/embeddings'); // CODEx: Swap chat route for embeddings route.
+    }
+    return `${stripTrailingSlashes(endpoint)}/api/embeddings`; // CODEx: Append embeddings suffix for custom bases.
   }
   if (isLikelyLmStudio(endpoint)) {
     return endpoint.replace(/\/v1\/chat\/completions/, '/api/embeddings').replace(/\/api\/chat$/, '/api/embeddings');
@@ -6749,9 +6782,22 @@ function resolveEmbeddingEndpoint() {
   return `${stripTrailingSlashes(endpoint)}/embeddings`;
 }
 
+// CODEx: Detect Ollama Cloud endpoints for schema adjustments.
+function isOllamaCloud(endpoint) {
+  return /api\.ollama\.ai/i.test(endpoint || '');
+}
+
+// CODEx: Detect Ollama local endpoints for schema adjustments.
+function isOllamaLocal(endpoint) {
+  if (!endpoint) {
+    return false;
+  }
+  return /11434/.test(endpoint) || (/ollama/i.test(endpoint) && /localhost|127\.0\.0\.1/i.test(endpoint));
+}
+
 // CODEx: Detect Ollama endpoints for schema adjustments.
 function isLikelyOllama(endpoint) {
-  return /ollama/i.test(endpoint) || /11434/.test(endpoint);
+  return isOllamaCloud(endpoint) || isOllamaLocal(endpoint);
 }
 
 // CODEx: Detect LM Studio endpoints for schema adjustments.
@@ -6830,7 +6876,7 @@ async function requestEmbeddingFromProvider(text, model, { signal } = {}) {
     setEmbeddingServiceHealth(true); // CODEx: Mark provider healthy on success.
     return vector; // CODEx: Return resolved embedding vector.
   } catch (error) {
-    console.warn('[RAG] Local embed failed, falling back to remote', error); // CODEx: Log failure for diagnostics.
+    console.warn('[RAG Provider] fallback triggered', { provider: providerSnapshot.active, error }); // CODEx: Log failure for diagnostics with provider context.
     setEmbeddingServiceHealth(false, error?.message || 'offline'); // CODEx: Update health indicator with failure reason.
     if (providerSnapshot.active !== EMBEDDING_PROVIDERS.OPENAI) { // CODEx: Only fallback when starting from local provider.
       try {
@@ -6917,7 +6963,10 @@ function hashString(value) {
 // CODEx: Identify the connection strategy for the active endpoint.
 function detectConnectionType(endpoint, preset) {
   const presetId = preset?.id ?? config.providerPreset;
-  if (presetId === 'ollama' || isLikelyOllama(endpoint)) {
+  if (presetId === 'ollama-cloud' || isOllamaCloud(endpoint)) { // CODEx: Treat Ollama Cloud as OpenAI-compatible remote API.
+    return 'openai';
+  }
+  if (presetId === 'ollama' || isOllamaLocal(endpoint)) {
     return 'ollama';
   }
   if (presetId === 'lmstudio' || isLikelyLmStudio(endpoint)) {
