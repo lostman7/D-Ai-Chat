@@ -6392,7 +6392,7 @@ async function retrieveRelevantMemories(query, limit) {
     queryVector, // CODEx: Provide precomputed query embedding when available.
     ensureEmbedding: (entry) => ensureEntryEmbedding(entry), // CODEx: Resolve candidate embeddings lazily.
     lexicalScorer: (entry) => cosineSimilarity(tokens, tokenize(entry.content)), // CODEx: Compute lexical overlap per entry.
-    similarity: cosineSimilarityVectors, // CODEx: Apply cosine similarity for vector comparison.
+    similarity: cosineSimilarity, // CODEx: Apply unified cosine similarity for vector comparison.
     debugHook: (error, entry) => console.debug('Embedding match fallback', { error, id: entry.id }) // CODEx: Surface embedding failures for debugging.
   });
 
@@ -6425,31 +6425,24 @@ function tokenize(text) {
     ?.filter((token) => token.length > 1) || [];
 }
 
-// CODEx: Fallback cosine similarity for lexical retrieval when embeddings are unavailable.
-function cosineSimilarity(queryTokens, docTokens) {
-  if (!docTokens.length) return 0;
-  const tf = new Map();
-  for (const token of docTokens) {
-    tf.set(token, (tf.get(token) || 0) + 1);
-  }
-  let dotProduct = 0;
-  let queryMagnitude = 0;
-  let docMagnitude = 0;
-  const queryCounts = new Map();
-  for (const token of queryTokens) {
-    queryCounts.set(token, (queryCounts.get(token) || 0) + 1);
-  }
-  queryCounts.forEach((count, token) => {
-    queryMagnitude += count * count;
-    if (tf.has(token)) {
-      dotProduct += count * tf.get(token);
+// CODEx: Unified cosine similarity hot-fix supporting numeric vectors and lexical token sets.
+function cosineSimilarity(a, b) {
+  if (Array.isArray(a) && typeof a[0] === 'number') {
+    const dot = a.reduce((sum, value, index) => sum + value * (b?.[index] ?? 0), 0);
+    const magA = Math.sqrt(a.reduce((sum, value) => sum + value * value, 0));
+    const magB = Math.sqrt((Array.isArray(b) ? b : []).reduce((sum, value) => sum + value * value, 0));
+    if (!magA || !magB) {
+      return 0;
     }
-  });
-  tf.forEach((count) => {
-    docMagnitude += count * count;
-  });
-  if (!queryMagnitude || !docMagnitude) return 0;
-  return dotProduct / Math.sqrt(queryMagnitude * docMagnitude);
+    return dot / (magA * magB);
+  }
+  const setA = new Set(Array.isArray(a) ? a : []);
+  const setB = new Set(Array.isArray(b) ? b : []);
+  if (!setA.size || !setB.size) {
+    return 0;
+  }
+  const overlap = [...setA].filter((token) => setB.has(token)).length;
+  return overlap / Math.sqrt(setA.size * setB.size);
 }
 
 // CODEx: Generate or reuse embeddings for the active query text.
@@ -6622,31 +6615,6 @@ async function requestEmbeddingFromProvider(text, model, { signal } = {}) {
   }
   const vector = data?.data?.[0]?.embedding ?? data?.embedding ?? null;
   return Array.isArray(vector) ? vector : null;
-}
-
-// CODEx: Cosine similarity for numeric vectors.
-function cosineSimilarityVectors(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || !a.length || !b.length) {
-    return 0;
-  }
-  const length = Math.min(a.length, b.length);
-  let dot = 0;
-  let magA = 0;
-  let magB = 0;
-  for (let index = 0; index < length; index += 1) {
-    const x = a[index];
-    const y = b[index];
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      continue;
-    }
-    dot += x * y;
-    magA += x * x;
-    magB += y * y;
-  }
-  if (!magA || !magB) {
-    return 0;
-  }
-  return dot / Math.sqrt(magA * magB);
 }
 
 // CODEx: Produce hashed lexical embeddings as an offline fallback.
@@ -7905,32 +7873,7 @@ function tokenizeForEntropy(content) {
 }
 
 function buildEntropyVector(content) {
-  const tokens = tokenizeForEntropy(content);
-  const weights = new Map();
-  for (const token of tokens) {
-    const nextCount = (weights.get(token) ?? 0) + 1;
-    weights.set(token, nextCount);
-  }
-  let magnitudeSquared = 0;
-  for (const value of weights.values()) {
-    magnitudeSquared += value * value;
-  }
-  return { weights, magnitude: magnitudeSquared > 0 ? Math.sqrt(magnitudeSquared) : 0 };
-}
-
-function cosineSimilarity(vecA, vecB) {
-  if (!vecA || !vecB || vecA.magnitude === 0 || vecB.magnitude === 0) {
-    return 0;
-  }
-  const [smaller, larger] = vecA.weights.size <= vecB.weights.size ? [vecA, vecB] : [vecB, vecA];
-  let dot = 0;
-  for (const [token, weight] of smaller.weights.entries()) {
-    const other = larger.weights.get(token);
-    if (other) {
-      dot += weight * other;
-    }
-  }
-  return dot / (vecA.magnitude * vecB.magnitude);
+  return tokenizeForEntropy(content); // CODEx: Reuse lexical tokens for unified cosine similarity.
 }
 
 function computeEntropyScore(history, windowSize) {

@@ -340,7 +340,7 @@ function createWindow() {
     width: 1280,
     height: 840,
     webPreferences: {
-      preload: path.join(__dirname, 'standalone-preload.js'),
+      preload: path.join(__dirname, 'standalone-preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false
