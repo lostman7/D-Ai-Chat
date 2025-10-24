@@ -1,0 +1,10 @@
+{
+  "entries": [
+    {
+      "id": "demo-debate",
+      "label": "Demo arena debate",
+      "path": "sample-arena.json",
+      "mode": "arena"
+    }
+  ]
+}

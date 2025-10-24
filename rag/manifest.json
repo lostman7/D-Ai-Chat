@@ -1,0 +1,12 @@
+{
+  "entries": [
+    {
+      "id": "foundational-notes",
+      "label": "Foundational SAM notes",
+      "path": "notes/primer.md",
+      "role": "system",
+      "mode": "chat",
+      "pinned": true
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "seed": "Debate whether persistent memory makes assistants more helpful.",
+  "mode": "arena",
+  "messages": [
+    {
+      "id": "demo-1",
+      "role": "SAM-A",
+      "content": "I argue that anchored memories reduce repetition and unlock richer follow-ups.",
+      "turnNumber": 1,
+      "origin": "rag-arena"
+    },
+    {
+      "id": "demo-2",
+      "role": "SAM-B",
+      "content": "Continuity matters, but memories must stay fresh—otherwise stale context slows reasoning.",
+      "turnNumber": 1,
+      "origin": "rag-arena"
+    }
+  ]
+}

@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SAM • Memory-Augmented Chat</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <button
+    id="optionsHandle"
+    class="options-handle"
+    type="button"
+    aria-haspopup="true"
+    aria-expanded="false"
+    aria-controls="optionsDrawer"
+  >
+    <span class="options-handle__chevron" aria-hidden="true">▸</span>
+    <span class="sr-only">Toggle SAM options</span>
+  </button>
+  <div id="optionsBackdrop" class="options-backdrop" hidden></div>
+  <div id="modeOverlay" class="mode-overlay" role="dialog" aria-modal="true" aria-labelledby="mode-heading">
+    <div class="mode-card">
+      <h2 id="mode-heading">Choose how to run SAM</h2>
+      <p>Start in human chat mode or let SAM debate itself to grow long-term memories.</p>
+      <div class="mode-actions">
+        <button id="enterChatButton" class="primary" type="button">Chat with SAM</button>
+        <button id="enterArenaButton" class="ghost" type="button">Launch dual agents</button>
+      </div>
+    </div>
+  </div>
+  <main class="layout">
+    <div id="statusDock" class="status-dock" role="region" aria-live="polite">
+      <div class="status-row">
+        <span id="modelStatus" class="status-pill status-pill--alert" role="status">Model A: Not connected</span>
+        <span id="modelBStatus" class="status-pill status-pill--alert" role="status">Model B: Disabled</span>
+        <span id="ragStatusFlag" class="status-pill status-pill--alert" role="status">RAG: Not loaded</span>
+        <span id="memoryStatus" class="status-pill">Floating memory: 0 / 500&nbsp;MB</span>
+      </div>
+      <div class="status-row status-row--actions">
+        <span id="systemResourceStatus" class="status-note">Detecting system memory and GPU…</span>
+        <div class="status-actions">
+          <button id="diagnosticsButton" class="ghost ghost--small" type="button">Run diagnostics</button>
+          <button id="switchToArenaButton" class="ghost ghost--small" type="button">Open SAM arena</button>
+          <button id="switchToChatButton" class="ghost ghost--small" type="button">Return to single agent chat</button>
+        </div>
+      </div>
+    </div>
+
+    <section id="chatPanel" class="chat-panel" aria-labelledby="chat-heading" hidden>
+      <header class="panel-header">
+        <div>
+          <h1 id="chat-heading">SAM</h1>
+          <p class="subtitle">Memory-augmented assistant with local RAG</p>
+        </div>
+      </header>
+
+      <div id="chatWindow" class="chat-window" aria-live="polite" data-scroll-container="true"></div>
+
+      <footer class="chat-footer">
+        <div class="input-row">
+          <label class="sr-only" for="messageInput">Message</label>
+          <textarea id="messageInput" rows="2" placeholder="Ask SAM anything…"></textarea>
+          <div class="input-actions">
+            <button id="sendButton" class="primary">Send</button>
+            <button id="voiceButton" class="ghost" aria-pressed="false" title="Toggle speech recognition">🎙 Voice</button>
+            <label class="toggle">
+              <input id="speakToggle" type="checkbox">
+              <span>Auto speak replies</span>
+            </label>
+          </div>
+        </div>
+        <div class="memory-tools">
+          <button id="retrieveButton" class="ghost">Promote relevant memories</button>
+          <button id="clearChatButton" class="ghost danger">Clear chat window</button>
+        </div>
+      </footer>
+    </section>
+
+    <section id="arenaPanel" class="arena-panel" aria-labelledby="arena-heading" hidden>
+      <header class="panel-header">
+        <div>
+          <h1 id="arena-heading">SAM Arena</h1>
+          <p class="subtitle">Let SAM debate itself and archive the dialogue automatically.</p>
+        </div>
+      </header>
+
+      <div class="arena-body">
+        <div id="dualChatWindow" class="chat-window chat-window--arena" aria-live="polite" data-scroll-container="true"></div>
+        <div class="arena-telemetry" role="status">
+          <div class="entropy-meter" aria-live="polite">
+            <span class="entropy-label">ENTROPY</span>
+            <div class="entropy-bar" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div id="entropyBarFill" class="entropy-bar__fill"></div>
+            </div>
+            <span id="entropyStatus" class="entropy-status">Calibrating…</span>
+          </div>
+          <div id="reflexStatus" class="reflex-status">Reflex idle</div>
+        </div>
+        <div class="arena-footer">
+          <label class="field" for="dualSeedInput">
+            <span>Conversation starter</span>
+            <textarea id="dualSeedInput" rows="2" placeholder="Debate whether persistent memories make AI more helpful."></textarea>
+          </label>
+          <div class="arena-actions">
+            <button id="startDualButton" class="primary" type="button">Start conversation</button>
+            <button id="nextDualButton" class="ghost" type="button">Step turn</button>
+            <button id="stopDualButton" class="ghost danger" type="button">Stop</button>
+            <button id="exportDualButton" class="ghost" type="button">Export transcript</button>
+          </div>
+          <div id="dualStatus" class="status-text" role="status">Awaiting start…</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <aside id="optionsDrawer" class="side-panel" aria-labelledby="memory-heading" tabindex="-1" aria-hidden="true" inert>
+      <section class="side-card">
+        <h2 id="memory-heading">Memory &amp; Retrieval</h2>
+        <label class="slider-label" for="memorySlider">Floating memory budget <span id="memorySliderValue">500&nbsp;MB</span></label>
+        <input id="memorySlider" type="range" min="50" max="1024" step="50" value="500">
+
+        <div class="field">
+          <label for="retrievalCount">Memories per retrieval (0 = unlimited)</label>
+          <input id="retrievalCount" type="number" min="0" max="200" value="0">
+        </div>
+
+        <div class="field">
+          <label for="contextTurns">Recent turns in context</label>
+          <input id="contextTurns" type="number" min="2" max="40" value="12">
+        </div>
+
+        <button id="exportMemoryButton" class="ghost">Export conversation log</button>
+      </section>
+
+      <section class="side-card" aria-labelledby="workbench-heading">
+        <h2 id="workbench-heading">Floating memory workbench</h2>
+        <p class="hint-text">See what&apos;s on SAM&apos;s mental desk and pin critical memories.</p>
+        <dl class="memory-stats">
+          <div class="memory-stat">
+            <dt>Messages afloat</dt>
+            <dd id="floatingMemoryCount">0</dd>
+          </div>
+          <div class="memory-stat">
+            <dt>Pinned</dt>
+            <dd id="pinnedMemoryCount">0</dd>
+          </div>
+          <div class="memory-stat">
+            <dt>Recovered from RAG</dt>
+            <dd id="ragMemoryCount">0</dd>
+          </div>
+          <div class="memory-stat">
+            <dt>RAG snapshots loaded</dt>
+            <dd id="ragSnapshotCount">0</dd>
+          </div>
+          <div class="memory-stat">
+            <dt>RAG footprint</dt>
+            <dd id="ragFootprint">0 MB</dd>
+          </div>
+        </dl>
+        <dl class="memory-stats memory-stats--retrieval" aria-live="polite">
+          <div class="memory-stat">
+            <dt>Model&nbsp;A retrievals</dt>
+            <dd id="modelARetrievals">0</dd>
+          </div>
+          <div class="memory-stat">
+            <dt>Model&nbsp;B retrievals</dt>
+            <dd id="modelBRetrievals">0</dd>
+          </div>
+        </dl>
+        <p id="ragImportStatus" class="hint-text" role="status">RAG archives not loaded yet.</p>
+        <div id="floatingMemoryList" class="memory-list" role="list"></div>
+        <div class="memory-actions">
+          <button id="loadRagButton" class="ghost" type="button">Load RAG archives</button>
+          <button id="refreshFloatingButton" class="ghost" type="button">Refresh view</button>
+          <button id="archiveUnpinnedButton" class="ghost danger" type="button">Archive unpinned</button>
+        </div>
+      </section>
+
+      <section class="side-card" aria-labelledby="chunker-heading">
+        <h2 id="chunker-heading">File Chunker</h2>
+        <p class="hint-text">Optimize RAG performance by chunking large files into smaller, more retrievable pieces.</p>
+        <div class="field field--inline">
+          <label for="chunkSizeInput">Chunk size (tokens)</label>
+          <input id="chunkSizeInput" type="number" min="100" max="2000" value="500" step="50">
+        </div>
+        <div class="field field--inline">
+          <label for="chunkOverlapInput">Overlap (tokens)</label>
+          <input id="chunkOverlapInput" type="number" min="0" max="200" value="50" step="10">
+        </div>
+        <dl class="memory-stats memory-stats--chunker" aria-live="polite">
+          <div class="memory-stat">
+            <dt>Unchunked files</dt>
+            <dd id="unchunkedFileCount">0</dd>
+          </div>
+          <div class="memory-stat">
+            <dt>Chunked files</dt>
+            <dd id="chunkedFileCount">0</dd>
+          </div>
+          <div class="memory-stat">
+            <dt>Total chunks</dt>
+            <dd id="totalChunkCount">0</dd>
+          </div>
+        </dl>
+        <p id="chunkerStatus" class="hint-text" role="status">No files to chunk. Scan the rag/ folder first.</p>
+        <div class="chunker-actions">
+          <button id="scanChunkerButton" class="ghost" type="button">Scan for files</button>
+          <button id="chunkFilesButton" class="ghost" type="button">Chunk all files</button>
+          <button id="clearChunksButton" class="ghost danger" type="button">Clear chunks</button>
+        </div>
+      </section>
+
+      <section class="side-card" aria-labelledby="tts-heading">
+        <h2 id="tts-heading">Speech synthesis</h2>
+        <div class="field">
+          <label for="ttsPresetSelect">Voice preset</label>
+          <select id="ttsPresetSelect"></select>
+        </div>
+        <div class="field field--inline field--range">
+          <label for="ttsVolume">Playback volume</label>
+          <input id="ttsVolume" type="range" min="0" max="200" value="100">
+          <span id="ttsVolumeValue" class="range-value">100%</span>
+        </div>
+        <div class="field" data-tts-field="server">
+          <label for="ttsServerUrl">Server URL</label>
+          <input id="ttsServerUrl" type="url" placeholder="http://localhost:5002">
+          <p class="field-hint">Point to your Piper, Coqui, Bark, or custom TTS HTTP server.</p>
+        </div>
+        <div class="field" data-tts-field="voice">
+          <label for="ttsVoiceId">Voice or speaker ID</label>
+          <input id="ttsVoiceId" type="text" list="ttsVoiceCatalog" placeholder="en_US-amy-low">
+          <datalist id="ttsVoiceCatalog"></datalist>
+        </div>
+        <div class="field" data-tts-field="apiKey">
+          <label for="ttsApiKeyInput">API key</label>
+          <input id="ttsApiKeyInput" type="password" autocomplete="off" placeholder="Optional unless required by the service">
+        </div>
+        <div class="tts-actions">
+          <button id="testTtsButton" class="ghost" type="button">Test voice</button>
+        </div>
+        <p id="ttsPresetDetails" class="hint-text" role="note"></p>
+        <details class="tts-notes">
+          <summary>AMD-friendly community favorites</summary>
+          <ul id="ttsPresetList" class="preset-list"></ul>
+        </details>
+      </section>
+
+      <section class="side-card" aria-labelledby="dual-heading">
+        <h2 id="dual-heading">Model workbench</h2>
+        <p class="hint-text">Configure SAM&apos;s primary brain and the optional partner it debates inside the arena.</p>
+
+        <h3 class="side-card-subheading">Model A (primary SAM)</h3>
+        <div class="field">
+          <label for="providerSelect">Provider preset</label>
+          <select id="providerSelect">
+            <option value="custom">Custom / bring your own</option>
+          </select>
+          <p id="providerNotes" class="field-hint" role="note"></p>
+        </div>
+        <div class="field">
+          <label for="endpointInput">Endpoint URL</label>
+          <input id="endpointInput" type="url" placeholder="http://localhost:1234/v1/chat/completions">
+        </div>
+        <div class="field">
+          <label for="modelInput">Model name</label>
+          <input id="modelInput" type="text" placeholder="lmstudio-community/Meta-Llama-3-8B-Instruct">
+        </div>
+        <div class="field">
+          <label for="apiKeyInput">API key (optional)</label>
+          <input id="apiKeyInput" type="password" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="systemPromptInput">Persona / system prompt</label>
+          <textarea id="systemPromptInput" rows="4" placeholder="You are SAM, a helpful memory-augmented assistant."></textarea>
+        </div>
+        <div class="field field--inline">
+          <label for="temperatureInput">Temperature</label>
+          <input id="temperatureInput" type="number" step="0.1" min="0" max="2" value="0.7">
+        </div>
+
+        <div class="field">
+          <label for="maxTokensInput">Max response tokens</label>
+          <input id="maxTokensInput" type="number" min="16" max="262144" value="512">
+          <p id="maxTokensHint" class="field-hint">Provider limit: up to 262,144 tokens.</p>
+        </div>
+
+        <h3 class="side-card-subheading">Model B (arena partner)</h3>
+        <label class="toggle">
+          <input id="agentBEnabled" type="checkbox" checked>
+          <span>Enable Model B for dual debates</span>
+        </label>
+        <div class="field">
+          <label for="agentAName">Model A display name</label>
+          <input id="agentAName" type="text" placeholder="SAM-A">
+        </div>
+        <div class="field">
+          <label for="agentAPrompt">Model A arena persona</label>
+          <textarea id="agentAPrompt" rows="3" placeholder="You are SAM-A, an analytical thinker."></textarea>
+        </div>
+        <div class="field">
+          <label for="agentAProviderSelect">Model A preset override</label>
+          <select id="agentAProviderSelect">
+            <option value="inherit">Share Model A settings</option>
+          </select>
+          <p id="agentAProviderNotes" class="field-hint" role="note"></p>
+        </div>
+        <div class="field">
+          <label for="agentAEndpoint">Model A override endpoint</label>
+          <input id="agentAEndpoint" type="url" placeholder="http://localhost:1234/v1/chat/completions">
+        </div>
+        <div class="field">
+          <label for="agentAModel">Model A override name</label>
+          <input id="agentAModel" type="text" placeholder="lmstudio-community/TinyLlama-1.1B-Chat-v1.0">
+        </div>
+        <div class="field">
+          <label for="agentAApiKey">Model A override key</label>
+          <input id="agentAApiKey" type="password" autocomplete="off" placeholder="Optional unless required by the service">
+        </div>
+        <div id="agentBConfig" class="agent-b-config">
+          <div class="field">
+            <label for="agentBName">Model B display name</label>
+            <input id="agentBName" type="text" placeholder="SAM-B">
+          </div>
+          <div class="field">
+            <label for="agentBPrompt">Model B arena persona</label>
+            <textarea id="agentBPrompt" rows="3" placeholder="You are SAM-B, a creative explorer."></textarea>
+          </div>
+          <div class="field">
+            <label for="agentBProviderSelect">Model B preset</label>
+            <select id="agentBProviderSelect">
+              <option value="inherit">Share Model A settings</option>
+            </select>
+            <p id="agentBProviderNotes" class="field-hint" role="note"></p>
+          </div>
+          <div class="field">
+            <label for="agentBEndpoint">Model B endpoint</label>
+            <input id="agentBEndpoint" type="url" placeholder="https://openrouter.ai/api/v1/chat/completions">
+          </div>
+          <div class="field">
+            <label for="agentBModel">Model B name</label>
+            <input id="agentBModel" type="text" placeholder="openrouter/google/gemma-2-9b-it">
+          </div>
+          <div class="field">
+            <label for="agentBApiKey">Model B API key</label>
+            <input id="agentBApiKey" type="password" autocomplete="off" placeholder="Optional unless required by the service">
+          </div>
+        </div>
+
+        <div class="field field--inline">
+          <label for="dualTurnLimit">Max turns (0 = unlimited)</label>
+          <input id="dualTurnLimit" type="number" min="0" max="50" value="0" placeholder="0">
+        </div>
+        <label class="toggle">
+          <input id="dualAutoContinue" type="checkbox" checked>
+          <span>Auto-continue conversation</span>
+        </label>
+        <button id="saveConfigButton" class="primary">Save model settings</button>
+      </section>
+
+      <section class="side-card" aria-labelledby="reflex-heading">
+        <h2 id="reflex-heading">Reflex &amp; telemetry</h2>
+        <p class="hint-text">Stabilize long debates with periodic summaries and entropy sensing.</p>
+        <label class="toggle">
+          <input id="reflexToggle" type="checkbox">
+          <span>Enable Reflex mode</span>
+        </label>
+        <div class="field field--inline">
+          <label for="reflexInterval">Turns between summaries</label>
+          <input id="reflexInterval" type="number" min="2" max="50" value="8">
+        </div>
+        <div class="field field--inline">
+          <label for="entropyWindow">Entropy lookback (turns)</label>
+          <input id="entropyWindow" type="number" min="2" max="50" value="6">
+        </div>
+        <div class="field field--stack">
+          <button id="triggerReflexButton" class="ghost" type="button">Trigger Reflex now</button>
+        </div>
+        <p id="reflexStatusText" class="hint-text reflex-status-text" role="status">Reflex idle.</p>
+      </section>
+
+      <section class="side-card" aria-labelledby="appearance-heading">
+        <h2 id="appearance-heading">Appearance</h2>
+        <p class="hint-text">Personalize the backdrop that frames both chat modes.</p>
+        <div class="field">
+          <label for="backgroundUrlInput">Background image URL</label>
+          <input id="backgroundUrlInput" type="url" placeholder="https://example.com/wallpaper.jpg">
+        </div>
+        <div class="field">
+          <label for="backgroundFileInput">Upload background image</label>
+          <input id="backgroundFileInput" type="file" accept="image/*">
+        </div>
+        <div class="appearance-actions">
+          <button id="clearBackgroundButton" class="ghost" type="button">Use default backdrop</button>
+        </div>
+        <p id="backgroundStatus" class="hint-text" role="note">Default gradient background active.</p>
+      </section>
+
+      <section class="side-card" aria-labelledby="debug-heading">
+        <h2 id="debug-heading">Debug &amp; Logs</h2>
+        <p class="hint-text">Inspect live processes, capture notes, and export run logs.</p>
+        <label class="toggle">
+          <input id="debugToggle" type="checkbox">
+          <span>Enable debug console</span>
+        </label>
+        <div class="field field--stack">
+          <button id="openDebugButton" class="ghost" type="button">Open debug console</button>
+        </div>
+        <div class="field field--stack">
+          <button id="logShutdownButton" class="ghost" type="button">Log shutdown</button>
+          <button id="logErrorButton" class="ghost danger" type="button">Log error</button>
+          <button id="exportLogsButton" class="ghost" type="button">Export logs</button>
+        </div>
+        <p id="logStatus" class="hint-text" role="status"></p>
+      </section>
+  </aside>
+
+  <template id="messageTemplate">
+    <article class="message">
+      <header class="message-meta">
+        <span class="message-role"></span>
+        <span class="message-turn"></span>
+        <time class="message-time"></time>
+        <span class="message-badge"></span>
+      </header>
+      <p class="message-content"></p>
+    </article>
+  </template>
+
+  <template id="dualMessageTemplate">
+    <article class="dual-message">
+      <header>
+        <span class="dual-turn" hidden></span>
+        <span class="dual-speaker"></span>
+        <span class="dual-badge" hidden></span>
+        <time class="dual-time"></time>
+      </header>
+      <p class="dual-content"></p>
+    </article>
+  </template>
+
+  <div id="debugPanel" class="debug-panel" role="dialog" aria-modal="true" aria-labelledby="debugPanelHeading" hidden>
+    <div class="debug-panel__card">
+      <header class="debug-panel__header">
+        <div>
+          <h2 id="debugPanelHeading">Debug console</h2>
+          <p class="debug-panel__subtitle">Monitor live processes and recent log events.</p>
+        </div>
+        <button id="debugCloseButton" class="ghost" type="button" aria-label="Close debug console">✕</button>
+      </header>
+      <section class="debug-panel__section" aria-labelledby="processHeading">
+        <h3 id="processHeading">Live processes</h3>
+        <ul id="processList" class="debug-process-list"></ul>
+      </section>
+      <section class="debug-panel__section" aria-labelledby="logHeading">
+        <h3 id="logHeading">Recent log entries</h3>
+        <ol id="logList" class="debug-log-list"></ol>
+      </section>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
