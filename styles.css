@@ -74,8 +74,8 @@ body[data-has-custom-bg='true']::before {
 .options-handle {
   position: fixed;
   top: 50%;
-  right: 0;
-  transform: translate(45%, -50%);
+  left: 0;
+  transform: translate(-45%, -50%);
   z-index: 1100;
   width: 4.1rem;
   height: 4.2rem;
@@ -100,7 +100,7 @@ body[data-has-custom-bg='true']::before {
 }
 
 .options-handle:hover {
-  transform: translate(45%, -50%) scale(1.03);
+  transform: translate(-45%, -50%) scale(1.03);
   box-shadow: 0 20px 40px -20px rgba(15, 23, 42, 0.5);
 }
 
@@ -110,7 +110,7 @@ body[data-has-custom-bg='true']::before {
 }
 
 body.options-open .options-handle {
-  right: var(--drawer-width);
+  left: var(--drawer-width);
   background: var(--accent);
   color: #fff;
   box-shadow: 0 18px 40px -18px rgba(77, 124, 255, 0.6);
@@ -118,7 +118,7 @@ body.options-open .options-handle {
 
 @media (max-width: 480px) {
   body.options-open .options-handle {
-    right: 0;
+    left: 0;
   }
 }
 
@@ -318,18 +318,18 @@ body[data-mode='arena'] #arenaPanel {
 .side-panel {
   position: fixed;
   top: 0;
-  right: 0;
+  left: 0;
   bottom: 0;
   width: var(--drawer-width);
   max-width: 100%;
   overflow-y: auto;
-  transform: translateX(100%);
+  transform: translateX(-100%);
   transition: transform 0.3s ease;
   border-radius: 0;
-  border-left: 1px solid var(--surface-border);
-  border-right: none;
+  border-right: 1px solid var(--surface-border);
+  border-left: none;
   z-index: 1105;
-  box-shadow: -35px 0 55px -35px rgba(15, 23, 42, 0.45);
+  box-shadow: 35px 0 55px -35px rgba(15, 23, 42, 0.45);
   background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(236, 238, 245, 0.94));
 }
 

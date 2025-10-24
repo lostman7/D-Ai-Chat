@@ -125,6 +125,11 @@
           <input id="retrievalCount" type="number" min="0" max="200" value="0">
         </div>
 
+        <label class="toggle">
+          <input id="autoInjectMemories" type="checkbox">
+          <span>Auto-inject retrieved memories into prompts</span>
+        </label>
+
         <div class="field">
           <label for="contextTurns">Recent turns in context</label>
           <input id="contextTurns" type="number" min="2" max="40" value="12">
@@ -171,7 +176,9 @@
         <p id="ragImportStatus" class="hint-text" role="status">RAG archives not loaded yet.</p>
         <div id="floatingMemoryList" class="memory-list" role="list"></div>
         <div class="memory-actions">
+          <button id="saveChatArchiveButton" class="ghost" type="button">Save chat to archive</button>
           <button id="loadRagButton" class="ghost" type="button">Load RAG archives</button>
+          <button id="loadChunkDataButton" class="ghost" type="button">Load chunk data</button>
           <button id="refreshFloatingButton" class="ghost" type="button">Refresh view</button>
           <button id="archiveUnpinnedButton" class="ghost danger" type="button">Archive unpinned</button>
         </div>
@@ -315,6 +322,16 @@
         <div class="field">
           <label for="agentAApiKey">Model A override key</label>
           <input id="agentAApiKey" type="password" autocomplete="off" placeholder="Optional unless required by the service">
+        </div>
+
+        <div class="field field--inline">
+          <label for="requestTimeout">Request timeout (seconds)</label>
+          <input id="requestTimeout" type="number" min="10" max="600" value="30">
+        </div>
+        <div class="field field--inline">
+          <label for="reasoningTimeout">Reasoning timeout (seconds)</label>
+          <input id="reasoningTimeout" type="number" min="30" max="900" value="120">
+          <p class="field-hint">Used whenever a model or preset signals extended thinking time.</p>
         </div>
         <div id="agentBConfig" class="agent-b-config">
           <div class="field">
