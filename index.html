@@ -277,6 +277,10 @@
           <input id="apiKeyInput" type="password" autocomplete="off">
         </div>
         <div class="field">
+          <label for="agentAName">Model A display name</label>
+          <input id="agentAName" type="text" placeholder="SAM-A">
+        </div>
+        <div class="field">
           <label for="systemPromptInput">Persona / system prompt</label>
           <textarea id="systemPromptInput" rows="4" placeholder="You are SAM, a helpful memory-augmented assistant."></textarea>
         </div>
@@ -298,31 +302,8 @@
         </label>
         <div id="arenaPrimaryConfig" class="arena-primary-config" hidden aria-hidden="true">
           <div class="field">
-            <label for="agentAName">Model A display name</label>
-            <input id="agentAName" type="text" placeholder="SAM-A">
-          </div>
-          <div class="field">
             <label for="agentAPrompt">Model A arena persona</label>
             <textarea id="agentAPrompt" rows="3" placeholder="You are SAM-A, an analytical thinker."></textarea>
-          </div>
-          <div class="field">
-            <label for="agentAProviderSelect">Model A preset override</label>
-            <select id="agentAProviderSelect">
-              <option value="inherit">Share Model A settings</option>
-            </select>
-            <p id="agentAProviderNotes" class="field-hint" role="note"></p>
-          </div>
-          <div class="field">
-            <label for="agentAEndpoint">Model A override endpoint</label>
-            <input id="agentAEndpoint" type="url" placeholder="http://localhost:1234/v1/chat/completions">
-          </div>
-          <div class="field">
-            <label for="agentAModel">Model A override name</label>
-            <input id="agentAModel" type="text" placeholder="lmstudio-community/TinyLlama-1.1B-Chat-v1.0">
-          </div>
-          <div class="field">
-            <label for="agentAApiKey">Model A override key</label>
-            <input id="agentAApiKey" type="password" autocomplete="off" placeholder="Optional unless required by the service">
           </div>
         </div>
 

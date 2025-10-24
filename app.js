@@ -260,10 +260,6 @@ const defaultConfig = {
   agentBEnabled: false,
   agentBName: 'SAM-B',
   agentBPrompt: 'You are SAM-B, a creative explorer who loves bold ideas and storytelling.',
-  agentAProviderPreset: 'inherit',
-  agentAEndpoint: '',
-  agentAModel: '',
-  agentAApiKey: '',
   agentBProviderPreset: 'inherit',
   agentBEndpoint: '',
   agentBModel: '',
@@ -757,11 +753,6 @@ const elements = {
   agentAPrompt: document.getElementById('agentAPrompt'),
   agentBName: document.getElementById('agentBName'),
   agentBPrompt: document.getElementById('agentBPrompt'),
-  agentAProviderSelect: document.getElementById('agentAProviderSelect'),
-  agentAProviderNotes: document.getElementById('agentAProviderNotes'),
-  agentAEndpoint: document.getElementById('agentAEndpoint'),
-  agentAModel: document.getElementById('agentAModel'),
-  agentAApiKey: document.getElementById('agentAApiKey'),
   arenaPrimaryConfig: document.getElementById('arenaPrimaryConfig'),
   requestTimeout: document.getElementById('requestTimeout'),
   reasoningTimeout: document.getElementById('reasoningTimeout'),
@@ -908,18 +899,16 @@ function loadConfig() {
       MAX_MEMORY_LIMIT_MB,
       defaultConfig.memoryLimitMB
     );
-    if (!config.agentAProviderPreset || (config.agentAProviderPreset !== 'inherit' && !providerPresetMap.has(config.agentAProviderPreset))) {
-      config.agentAProviderPreset = defaultConfig.agentAProviderPreset;
-    }
     if (!config.agentBProviderPreset || (config.agentBProviderPreset !== 'inherit' && !providerPresetMap.has(config.agentBProviderPreset))) {
       config.agentBProviderPreset = defaultConfig.agentBProviderPreset;
     }
     if (typeof config.agentBEnabled !== 'boolean') {
       config.agentBEnabled = defaultConfig.agentBEnabled;
     }
-    config.agentAEndpoint = config.agentAEndpoint ?? '';
-    config.agentAModel = config.agentAModel ?? '';
-    config.agentAApiKey = config.agentAApiKey ?? '';
+    delete config.agentAProviderPreset;
+    delete config.agentAEndpoint;
+    delete config.agentAModel;
+    delete config.agentAApiKey;
     config.agentBEndpoint = config.agentBEndpoint ?? '';
     config.agentBModel = config.agentBModel ?? '';
     config.agentBApiKey = config.agentBApiKey ?? '';
@@ -1155,7 +1144,6 @@ function populateProviderSelect() {
 }
 
 function populateArenaProviderSelects() {
-  populateProviderOptions(elements.agentAProviderSelect, { includeInherit: true });
   populateProviderOptions(elements.agentBProviderSelect, { includeInherit: true });
 }
 
@@ -1187,7 +1175,11 @@ function updateProviderNotes() {
 }
 
 function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
-  const prefix = agent === 'A' ? 'agentA' : 'agentB';
+  if (agent === 'A') {
+    return;
+  }
+
+  const prefix = 'agentB';
   if (!presetId || presetId === 'inherit') {
     config[`${prefix}ProviderPreset`] = 'inherit';
     updateAgentConnectionInputs(agent);
@@ -1260,7 +1252,6 @@ function updateConfigInputs() {
   if (elements.maxTokensInput) {
     updateMaxTokensCeiling();
   }
-  updateAgentConnectionInputs('A');
   updateAgentConnectionInputs('B');
   if (elements.dualSeedInput) {
     elements.dualSeedInput.value = config.dualSeed ?? DEFAULT_DUAL_SEED;
@@ -1314,11 +1305,16 @@ function updateConfigInputs() {
 }
 
 function updateAgentConnectionInputs(agent) {
-  const prefix = agent === 'A' ? 'agentA' : 'agentB';
-  const providerSelect = elements[`${prefix}ProviderSelect`];
-  const endpointInput = elements[`${prefix}Endpoint`];
-  const modelInput = elements[`${prefix}Model`];
-  const apiKeyInput = elements[`${prefix}ApiKey`];
+  if (agent === 'A') {
+    updateArenaProviderNotes('A', getAgentConnection('A'));
+    return;
+  }
+
+  const prefix = 'agentB';
+  const providerSelect = elements.agentBProviderSelect;
+  const endpointInput = elements.agentBEndpoint;
+  const modelInput = elements.agentBModel;
+  const apiKeyInput = elements.agentBApiKey;
   const providerKey = config[`${prefix}ProviderPreset`] ?? 'inherit';
   const connection = getAgentConnection(agent);
 
@@ -1326,7 +1322,7 @@ function updateAgentConnectionInputs(agent) {
     providerSelect.value = providerKey;
   }
 
-  if (agent === 'B' && !config.agentBEnabled) {
+  if (!config.agentBEnabled) {
     if (providerSelect) providerSelect.disabled = true;
     if (endpointInput) endpointInput.disabled = true;
     if (modelInput) modelInput.disabled = true;
@@ -1386,12 +1382,7 @@ function applyAgentBEnabledState() {
     elements.agentBConfig.setAttribute('aria-hidden', String(!enabled));
   }
   const toggledFields = [
-    'agentAName',
     'agentAPrompt',
-    'agentAProviderSelect',
-    'agentAEndpoint',
-    'agentAModel',
-    'agentAApiKey',
     'agentBProviderSelect',
     'agentBEndpoint',
     'agentBModel',
@@ -1413,7 +1404,6 @@ function applyAgentBEnabledState() {
     elements.agentBProviderNotes.textContent = 'Enable Model B to configure a separate connection.';
   }
   if (enabled) {
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
   }
   updateProcessState(
@@ -1425,14 +1415,12 @@ function applyAgentBEnabledState() {
 }
 
 function updateArenaProviderNotes(agent, connection = getAgentConnection(agent)) {
-  const notesElement = agent === 'A' ? elements.agentAProviderNotes : elements.agentBProviderNotes;
+  if (agent === 'A') return;
+  const notesElement = elements.agentBProviderNotes;
   if (!notesElement) return;
   if (connection.inherits) {
     const baseLabel = connection.providerLabel || 'Custom';
-    notesElement.textContent =
-      agent === 'A'
-        ? `Using the primary Model A connection (${baseLabel}).`
-        : `Sharing Model A settings (${baseLabel}).`;
+    notesElement.textContent = `Sharing Model A settings (${baseLabel}).`;
     return;
   }
   const parts = [connection.providerLabel];
@@ -1446,23 +1434,33 @@ function updateArenaProviderNotes(agent, connection = getAgentConnection(agent))
 }
 
 function getAgentConnection(agent) {
-  const prefix = agent === 'A' ? 'agentA' : 'agentB';
-  const agentPresetId = config[`${prefix}ProviderPreset`] ?? 'inherit';
-  const inherits = agentPresetId === 'inherit';
   const basePreset = providerPresetMap.get(config.providerPreset) ?? providerPresetMap.get('custom');
+
+  if (agent === 'A') {
+    return {
+      endpoint: config.endpoint,
+      model: config.model,
+      apiKey: config.apiKey,
+      temperature: config.temperature,
+      maxTokens: config.maxResponseTokens,
+      providerPreset: basePreset?.id ?? 'custom',
+      providerLabel: basePreset ? `${basePreset.label} (main)` : 'Custom',
+      presetDescription: basePreset?.description ?? '',
+      requiresKey: Boolean(basePreset?.requiresKey),
+      inherits: false,
+      agentPresetId: basePreset?.id ?? 'custom'
+    };
+  }
+
+  const agentPresetId = config.agentBProviderPreset ?? 'inherit';
+  const inherits = agentPresetId === 'inherit';
   const preset = inherits
     ? basePreset
     : providerPresetMap.get(agentPresetId) ?? providerPresetMap.get('custom');
 
-  const endpoint = inherits
-    ? config.endpoint
-    : config[`${prefix}Endpoint`] || preset?.endpoint || '';
-  const model = inherits
-    ? config.model
-    : config[`${prefix}Model`] || preset?.model || '';
-  const apiKey = inherits
-    ? config.apiKey
-    : config[`${prefix}ApiKey`] || '';
+  const endpoint = inherits ? config.endpoint : config.agentBEndpoint || preset?.endpoint || '';
+  const model = inherits ? config.model : config.agentBModel || preset?.model || '';
+  const apiKey = inherits ? config.apiKey : config.agentBApiKey || '';
 
   return {
     endpoint,
@@ -1712,10 +1710,6 @@ function bindEvents() {
     applyProviderPreset(event.target.value, { silent: false });
   });
 
-  addListener(elements.agentAProviderSelect, 'change', (event) => {
-    applyArenaProviderPreset('A', event.target.value);
-  });
-
   addListener(elements.agentBProviderSelect, 'change', (event) => {
     applyArenaProviderPreset('B', event.target.value);
   });
@@ -1730,19 +1724,16 @@ function bindEvents() {
 
   addListener(elements.endpointInput, 'input', (event) => {
     config.endpoint = event.target.value.trim();
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
   });
 
   addListener(elements.modelInput, 'input', (event) => {
     config.model = event.target.value.trim();
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
   });
 
   addListener(elements.apiKeyInput, 'input', (event) => {
     config.apiKey = event.target.value;
-    updateAgentConnectionInputs('A');
     updateAgentConnectionInputs('B');
   });
 
@@ -1785,21 +1776,6 @@ function bindEvents() {
       config.reasoningTimeoutSeconds = config.requestTimeoutSeconds;
     }
     elements.reasoningTimeout.value = config.reasoningTimeoutSeconds;
-    saveConfig();
-  });
-
-  addListener(elements.agentAEndpoint, 'input', (event) => {
-    config.agentAEndpoint = event.target.value.trim();
-    saveConfig();
-  });
-
-  addListener(elements.agentAModel, 'input', (event) => {
-    config.agentAModel = event.target.value.trim();
-    saveConfig();
-  });
-
-  addListener(elements.agentAApiKey, 'input', (event) => {
-    config.agentAApiKey = event.target.value;
     saveConfig();
   });
 
@@ -6598,6 +6574,7 @@ async function generateDualTurn(speaker, seed, options = {}) {
   const partner = speaker === 'A' ? 'B' : 'A';
   const speakerName = getAgentDisplayName(speaker);
   const partnerName = getAgentDisplayName(partner);
+  const normalizedSeed = typeof seed === 'string' && seed.trim() ? seed : activeDualSeed || config.dualSeed || DEFAULT_DUAL_SEED;
   const persona = getAgentPersona(speaker);
   const connection = activeDualConnections[speaker] ?? getAgentConnection(speaker);
   clearDualCountdownTimer();
@@ -6635,13 +6612,16 @@ async function generateDualTurn(speaker, seed, options = {}) {
   if (options.isInitial) {
     historyMessages.push({
       role: 'user',
-      content: `${partnerName}: ${seed}`
+      content: `${partnerName}: ${normalizedSeed}`
     });
-  } else if (latestPartnerTurn) {
-    historyMessages.push({
-      role: 'user',
-      content: `${partnerName}: ${latestPartnerTurn.content}`
-    });
+  } else {
+    const lastMessage = historyMessages[historyMessages.length - 1];
+    if (!lastMessage || lastMessage.role !== 'user') {
+      const fallbackContent = latestPartnerTurn
+        ? `${partnerName}: ${latestPartnerTurn.content}`
+        : `${partnerName}: ${normalizedSeed}`;
+      historyMessages.push({ role: 'user', content: fallbackContent });
+    }
   }
 
   const retrievalQuery = options.isInitial ? seed : latestPartnerTurn?.content ?? seed;

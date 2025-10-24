@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 
 const STORAGE_DIR_NAME = 'sam-storage';
+const ramStore = new Map();
 
 function ensureStorageDir() {
   const dir = path.join(app.getPath('userData'), STORAGE_DIR_NAME);
@@ -32,12 +33,17 @@ function storagePathForKey(key) {
 }
 
 function readStorageValue(key) {
+  if (ramStore.has(key)) {
+    return ramStore.get(key);
+  }
   try {
     const filePath = storagePathForKey(key);
     if (!fs.existsSync(filePath)) {
       return null;
     }
-    return fs.readFileSync(filePath, 'utf8');
+    const value = fs.readFileSync(filePath, 'utf8');
+    ramStore.set(key, value);
+    return value;
   } catch (error) {
     console.warn('Failed to read storage value for key', key, error);
     return null;
@@ -48,16 +54,19 @@ function writeStorageValue(key, value) {
   try {
     const filePath = storagePathForKey(key);
     const normalized = String(value);
+    ramStore.set(key, normalized);
     fs.writeFileSync(filePath, normalized, 'utf8');
     return true;
   } catch (error) {
     console.warn('Failed to persist storage value for key', key, error);
+    ramStore.set(key, String(value));
     return false;
   }
 }
 
 function removeStorageValue(key) {
   try {
+    ramStore.delete(key);
     const filePath = storagePathForKey(key);
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
@@ -70,6 +79,9 @@ function removeStorageValue(key) {
 }
 
 function listStorageKeys() {
+  if (ramStore.size > 0) {
+    return Array.from(ramStore.keys());
+  }
   try {
     const dir = ensureStorageDir();
     const entries = fs.readdirSync(dir);
@@ -77,18 +89,25 @@ function listStorageKeys() {
     for (const entry of entries) {
       const key = decodeKey(entry);
       if (key) {
-        keys.push(key);
+        try {
+          const value = fs.readFileSync(path.join(dir, entry), 'utf8');
+          ramStore.set(key, value);
+          keys.push(key);
+        } catch (error) {
+          console.warn('Failed to hydrate RAM store for key', key, error);
+        }
       }
     }
     return keys;
   } catch (error) {
     console.warn('Failed to list storage keys', error);
-    return [];
+    return Array.from(ramStore.keys());
   }
 }
 
 function clearStorage() {
   try {
+    ramStore.clear();
     const dir = ensureStorageDir();
     if (!fs.existsSync(dir)) {
       return true;
@@ -108,6 +127,29 @@ function clearStorage() {
   } catch (error) {
     console.warn('Failed to clear storage', error);
     return false;
+  }
+}
+
+function primeRamStore() {
+  try {
+    const dir = ensureStorageDir();
+    if (!fs.existsSync(dir)) {
+      return;
+    }
+    const entries = fs.readdirSync(dir);
+    for (const entry of entries) {
+      const key = decodeKey(entry);
+      if (!key) continue;
+      const filePath = path.join(dir, entry);
+      try {
+        const value = fs.readFileSync(filePath, 'utf8');
+        ramStore.set(key, value);
+      } catch (error) {
+        console.warn('Failed to preload RAM store value for key', key, error);
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to prime RAM store', error);
   }
 }
 
@@ -154,6 +196,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   ensureStorageDir();
+  primeRamStore();
   registerStorageHandlers();
   createWindow();
 
