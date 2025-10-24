@@ -5444,8 +5444,10 @@ async function callModel(messages, overrides = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
 
+  let response;
+
   try {
-    const response = await fetch(requestEndpoint, {
+    response = await fetch(requestEndpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
@@ -5459,7 +5461,6 @@ async function callModel(messages, overrides = {}) {
     }
     throw error;
   }
-
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`HTTP ${response.status}: ${text}`);
