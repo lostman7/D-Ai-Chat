@@ -1,4 +1,7 @@
-const MB = 1024 * 1024;
+import { embedAndStore, vectorSearch } from './chunker.js'; // CODEx: Integrate shared embedding utilities for chunk storage and retrieval.
+// CODEx: Maintain explicit separation between module imports and runtime constants.
+const MB = 1024 * 1024; // CODEx: Base multiplier for megabyte calculations across memory limits.
+const MAX_RAG_EMBEDDING_BYTES = 100 * MB; // CODEx: Cap chunk embedding footprint to 100 MB within the RAM disk budget.
 const MIN_MEMORY_LIMIT_MB = 50;
 const MAX_MEMORY_LIMIT_MB = 200;
 const MEMORY_LIMIT_STEP_MB = 10;
@@ -340,6 +343,7 @@ const defaultConfig = {
   retrievalCount: 0,
   reasoningModeEnabled: false,
   autoInjectMemories: false,
+  useEmbeddingRetrieval: true, // CODEx: Enable embedding-first retrieval unless explicitly disabled.
   requestTimeoutSeconds: 30,
   reasoningTimeoutSeconds: 300,
   contextTurns: 12,
@@ -731,7 +735,8 @@ let ragTelemetry = {
   staticBytes: 0,
   staticErrors: [],
   loaded: false,
-  lastRetrievalMs: 0
+  lastRetrievalMs: 0,
+  lastRetrievalMode: 'lexical' // CODEx: Track whether embeddings or keyword fallback handled the last retrieval.
 };
 const ramDiskCache = {
   chunked: new Map(),
@@ -743,6 +748,10 @@ const ramDiskCache = {
 const embeddingCache = new Map();
 const messageEmbeddingCache = new Map();
 const chunkEmbeddingIndex = new Map();
+let chunkEmbeddingFootprintBytes = 0; // CODEx: Measure bytes consumed by cached chunk embeddings.
+const chunkEmbeddingOrder = []; // CODEx: Preserve insertion order for trimming cached embeddings.
+let embeddingServiceHealthy = true; // CODEx: Represent whether the embedding endpoint is responsive.
+let embeddingServiceReason = ''; // CODEx: Store the most recent embedding failure reason for UI diagnostics.
 
 // CODEx: High-resolution clock helper for latency tracking.
 function getTimestampMs() {
@@ -764,6 +773,8 @@ function clearCachedEmbeddings() {
   embeddingCache.clear();
   messageEmbeddingCache.clear();
   chunkEmbeddingIndex.clear();
+  chunkEmbeddingFootprintBytes = 0; // CODEx: Reset embedding footprint accounting when caches clear.
+  chunkEmbeddingOrder.length = 0; // CODEx: Drop insertion order tracking alongside cache reset.
 }
 
 // CODEx: Detect reasoning-focused checkpoints to adjust timeouts and context.
@@ -796,6 +807,77 @@ function isReasoningModeActive(overrides = {}) {
   const model = overrides.model ?? overrides.modelId ?? config.model;
   return isReasoningModelId(model, preset);
 }
+
+// CODEx: Embedding retrieval helpers manage vector health and budgeting.
+function isEmbeddingRetrievalEnabled() { // CODEx: Determine if embedding search should run for the current configuration.
+  return config.useEmbeddingRetrieval !== false; // CODEx: Default to enabling embeddings unless explicitly disabled.
+} // CODEx
+// CODEx: Maintain accurate embedding health tracking for UI diagnostics.
+function setEmbeddingServiceHealth(healthy, reason = '') { // CODEx: Persist the embedding provider health status.
+  embeddingServiceHealthy = Boolean(healthy); // CODEx: Normalize provider health to a strict boolean.
+  embeddingServiceReason = healthy ? '' : String(reason || '').slice(0, 60); // CODEx: Retain a trimmed explanation for UI messaging.
+  refreshEmbeddingStatusIndicator(); // CODEx: Keep the embedding status indicator synchronized with the latest health state.
+} // CODEx
+// CODEx: Refresh DOM status text to reflect embedding availability.
+function refreshEmbeddingStatusIndicator() { // CODEx: Update the memory drawer indicator for embedding availability.
+  const indicator = elements.embeddingStatus; // CODEx: Reference the DOM node used for embedding status text.
+  if (!indicator) { // CODEx: Exit early when the indicator has not been rendered.
+    return; // CODEx: Avoid errors when the status element is absent.
+  } // CODEx
+  if (!isEmbeddingRetrievalEnabled()) { // CODEx: Display disabled messaging when embeddings are turned off.
+    indicator.textContent = 'Embedding Active ✗ (disabled)'; // CODEx: Communicate the disabled embedding state to the user.
+    return; // CODEx: Skip additional status updates when disabled.
+  } // CODEx
+  if (embeddingServiceHealthy) { // CODEx: Show success when the embedding provider is responding.
+    indicator.textContent = 'Embedding Active ✓'; // CODEx: Render affirmative status for healthy embedding service.
+    return; // CODEx: Finish once success state is displayed.
+  } // CODEx
+  const reason = embeddingServiceReason ? ` (${embeddingServiceReason})` : ' (offline)'; // CODEx: Prepare contextual failure messaging.
+  indicator.textContent = `Embedding Active ✗${reason}`; // CODEx: Render failure status along with the recorded reason.
+} // CODEx
+// CODEx: Footprint estimation drives cache budgeting accuracy.
+function estimateEmbeddingBytes(vector) { // CODEx: Estimate bytes consumed by an embedding array.
+  if (!Array.isArray(vector)) { // CODEx: Ignore malformed embedding payloads.
+    return 0; // CODEx: Count no memory usage when vectors are invalid.
+  } // CODEx
+  return vector.length * 8; // CODEx: Assume double-precision floats for footprint approximation.
+} // CODEx
+// CODEx: Cache management ensures embeddings respect RAM disk constraints.
+function storeChunkEmbedding(key, vector) { // CODEx: Cache chunk embeddings while tracking memory usage.
+  const previous = chunkEmbeddingIndex.get(key); // CODEx: Retrieve prior embedding to adjust totals.
+  if (!chunkEmbeddingIndex.has(key)) { // CODEx: Track insertion order for new cache entries.
+    chunkEmbeddingOrder.push(key); // CODEx: Record key order for future evictions.
+  } // CODEx
+  if (Array.isArray(previous)) { // CODEx: Remove prior embedding weight from the footprint tally.
+    chunkEmbeddingFootprintBytes -= estimateEmbeddingBytes(previous); // CODEx: Subtract previous vector contribution.
+  } // CODEx
+  chunkEmbeddingIndex.set(key, vector); // CODEx: Persist the latest embedding vector in cache.
+  chunkEmbeddingFootprintBytes += estimateEmbeddingBytes(vector); // CODEx: Add new vector contribution to the footprint.
+  enforceChunkEmbeddingBudget(); // CODEx: Ensure the cache remains within the RAM budget.
+} // CODEx
+// CODEx: Periodically trim embeddings to keep memory usage predictable.
+function enforceChunkEmbeddingBudget() { // CODEx: Trim cached embeddings when exceeding RAM disk capacity.
+  if (chunkEmbeddingFootprintBytes <= MAX_RAG_EMBEDDING_BYTES) { // CODEx: Leave cache untouched when within limits.
+    return; // CODEx: No trimming required under the limit.
+  } // CODEx
+  let removed = 0; // CODEx: Track how many embeddings are evicted.
+  while (chunkEmbeddingFootprintBytes > MAX_RAG_EMBEDDING_BYTES && chunkEmbeddingOrder.length) { // CODEx: Continue until usage is within the cap.
+    const oldestKey = chunkEmbeddingOrder.shift(); // CODEx: Pull the oldest embedding key for eviction.
+    const vector = chunkEmbeddingIndex.get(oldestKey); // CODEx: Look up the corresponding embedding payload.
+    if (!Array.isArray(vector)) { // CODEx: Skip keys already cleared or invalid.
+      continue; // CODEx: Proceed to the next queued key when data missing.
+    } // CODEx
+    chunkEmbeddingIndex.delete(oldestKey); // CODEx: Remove the stale embedding from cache.
+    chunkEmbeddingFootprintBytes -= estimateEmbeddingBytes(vector); // CODEx: Reduce tracked footprint after eviction.
+    removed += 1; // CODEx: Count the eviction for diagnostics.
+  } // CODEx
+  if (chunkEmbeddingFootprintBytes < 0) { // CODEx: Prevent negative totals after trimming.
+    chunkEmbeddingFootprintBytes = 0; // CODEx: Reset footprint to zero when underflow occurs.
+  } // CODEx
+  if (removed > 0) { // CODEx: Emit diagnostics when trimming happens.
+    console.debug('Embedding cache trimmed', { removed, remainingBytes: chunkEmbeddingFootprintBytes }); // CODEx: Log trimming metrics for debugging.
+  } // CODEx
+} // CODEx
 const phasePromptCache = new Map();
 let activePhaseIndex = 0;
 let activePhaseId = null;
@@ -896,6 +978,8 @@ const elements = {
   memorySliderValue: document.getElementById('memorySliderValue'),
   retrievalCount: document.getElementById('retrievalCount'),
   reasoningModeToggle: document.getElementById('reasoningModeToggle'),
+  embeddingRetrievalToggle: document.getElementById('embeddingRetrievalToggle'), // CODEx: Toggle element for embedding-based retrieval.
+  embeddingStatus: document.getElementById('embeddingStatus'), // CODEx: Status label showing embedding availability.
   autoInjectMemories: document.getElementById('autoInjectMemories'),
   contextTurns: document.getElementById('contextTurns'),
   exportButton: document.getElementById('exportMemoryButton'),
@@ -1121,6 +1205,7 @@ function loadConfig() {
     );
     config.maxResponseTokens = Math.round(clampedMaxTokens);
     config.reasoningModeEnabled = Boolean(config.reasoningModeEnabled);
+    config.useEmbeddingRetrieval = typeof config.useEmbeddingRetrieval === 'boolean' ? config.useEmbeddingRetrieval : defaultConfig.useEmbeddingRetrieval; // CODEx: Normalize embedding toggle with sane default.
     if (!config.embeddingModel || typeof config.embeddingModel !== 'string') {
       config.embeddingModel = defaultConfig.embeddingModel;
     } else {
@@ -1482,6 +1567,10 @@ function updateConfigInputs() {
   if (elements.reasoningModeToggle) {
     elements.reasoningModeToggle.checked = Boolean(config.reasoningModeEnabled);
   }
+  if (elements.embeddingRetrievalToggle) {
+    elements.embeddingRetrievalToggle.checked = isEmbeddingRetrievalEnabled(); // CODEx: Reflect embedding toggle state in UI.
+  }
+  refreshEmbeddingStatusIndicator(); // CODEx: Update embedding status banner after syncing configuration.
   elements.contextTurns.value = config.contextTurns;
   if (elements.providerSelect) {
     elements.providerSelect.value = config.providerPreset ?? defaultConfig.providerPreset;
@@ -1961,6 +2050,12 @@ function bindEvents() {
     config.autoInjectMemories = event.target.checked;
     saveConfig();
     updateRagStatusDisplay();
+  });
+  // CODEx: Separate memory injection handling from embedding toggle logic for clarity.
+  addListener(elements.embeddingRetrievalToggle, 'change', (event) => {
+    config.useEmbeddingRetrieval = event.target.checked; // CODEx: Persist embedding toggle state on interaction.
+    saveConfig(); // CODEx: Store updated configuration immediately.
+    refreshEmbeddingStatusIndicator(); // CODEx: Reflect new embedding availability in the UI.
   });
 
   addListener(elements.contextTurns, 'change', (event) => {
@@ -3681,7 +3776,7 @@ async function loadChunkedRagRecords() {
           ? chunk.embedding
           : chunkEmbeddingIndex.get(key) || null;
         if (Array.isArray(vector)) {
-          chunkEmbeddingIndex.set(key, vector);
+          storeChunkEmbedding(key, vector); // CODEx: Refresh cache footprint when hydrating from RAM disk.
         }
         return {
           id: `${originalPath}-chunk-${index}`,
@@ -4779,32 +4874,15 @@ async function enrichChunksWithEmbeddings(originalPath, chunks) {
     return chunks;
   }
   const canonical = canonicalizeOriginalPath(originalPath || '');
-  await Promise.all(
-    chunks.map(async (chunk, index) => {
-      if (!chunk || typeof chunk.content !== 'string') {
-        return;
-      }
-      const key = `${canonical}#${index}`;
-      if (Array.isArray(chunk.embedding) && chunk.embedding.length) {
-        chunkEmbeddingIndex.set(key, chunk.embedding);
-        return;
-      }
-      try {
-        const vector = await generateTextEmbedding(chunk.content);
-        if (vector) {
-          chunk.embedding = vector;
-          chunkEmbeddingIndex.set(key, vector);
-          return;
-        }
-      } catch (error) {
-        console.debug('Chunk embedding fallback:', error);
-      }
-      const fallback = lexicalEmbedding(chunk.content);
-      chunk.embedding = fallback;
-      chunkEmbeddingIndex.set(key, fallback);
-    })
-  );
-  return chunks;
+  const enriched = await embedAndStore(chunks, {
+    sourceId: canonical,
+    embedder: (content) => generateTextEmbedding(content), // CODEx: Request provider embeddings for each chunk body.
+    lexicalEmbedder: (content) => lexicalEmbedding(content), // CODEx: Produce deterministic fallback vectors when provider fails.
+    registerEmbedding: (sourceId, index, vector) => {
+      storeChunkEmbedding(`${sourceId}#${index}`, vector); // CODEx: Cache embeddings with footprint tracking per chunk.
+    }
+  });
+  return enriched; // CODEx: Return enriched chunk array containing embeddings for persistence.
 }
 
 // CODEx: Cache embeddings when chunk files are reloaded from disk or RAM.
@@ -4816,7 +4894,7 @@ function hydrateChunkEmbeddingIndex(record) {
   record.chunks.forEach((chunk, index) => {
     if (chunk && Array.isArray(chunk.embedding) && chunk.embedding.length) {
       const key = `${canonical}#${index}`;
-      chunkEmbeddingIndex.set(key, chunk.embedding);
+      storeChunkEmbedding(key, chunk.embedding); // CODEx: Rehydrate embedding cache while preserving footprint accounting.
     }
   });
 }
@@ -6257,23 +6335,47 @@ async function retrieveRelevantMemories(query, limit) {
       }
     }
   }
-  const scores = [];
-  const queryVector = await generateQueryEmbedding(normalizedQuery, tokens);
+  const candidateList = Array.from(candidates.values()); // CODEx: Normalize candidate map into an iterable list.
+  let useEmbeddings = isEmbeddingRetrievalEnabled() && embeddingServiceHealthy; // CODEx: Determine if vector search should run.
+  let queryVector = null; // CODEx: Placeholder for query embedding when available.
+  if (useEmbeddings) { // CODEx: Only compute embeddings when enabled and healthy.
+    queryVector = await generateQueryEmbedding(normalizedQuery, tokens); // CODEx: Derive query embedding via provider.
+    if (!Array.isArray(queryVector) || !queryVector.length || !embeddingServiceHealthy) { // CODEx: Disable embeddings when unavailable.
+      useEmbeddings = false; // CODEx: Fall back to lexical scoring if embeddings failed.
+    } // CODEx
+  } // CODEx
 
-  for (const value of candidates.values()) {
-    const lexicalScore = cosineSimilarity(tokens, tokenize(value.content));
-    const vectorScore = await scoreEmbeddingMatch(queryVector, value);
-    const combinedScore = vectorScore !== null ? (vectorScore * 0.8 + lexicalScore * 0.2) : lexicalScore;
-    if (combinedScore > 0) {
-      scores.push({ entry: value, score: combinedScore });
-    }
+  const scored = await vectorSearch({ // CODEx: Blend vector and lexical scoring through shared helper.
+    candidates: candidateList, // CODEx: Supply full candidate set for scoring.
+    limit, // CODEx: Honor retrieval limit requested by caller.
+    useEmbeddings, // CODEx: Toggle embedding math based on availability.
+    queryVector, // CODEx: Provide precomputed query embedding when available.
+    ensureEmbedding: (entry) => ensureEntryEmbedding(entry), // CODEx: Resolve candidate embeddings lazily.
+    lexicalScorer: (entry) => cosineSimilarity(tokens, tokenize(entry.content)), // CODEx: Compute lexical overlap per entry.
+    similarity: cosineSimilarityVectors, // CODEx: Apply cosine similarity for vector comparison.
+    debugHook: (error, entry) => console.debug('Embedding match fallback', { error, id: entry.id }) // CODEx: Surface embedding failures for debugging.
+  });
+
+  const selected = limit > 0 ? scored.slice(0, limit) : scored; // CODEx: Respect caller-imposed top-k limit.
+  const result = selected.map((item) => item.entry); // CODEx: Extract memory payloads for downstream use.
+  ragTelemetry.lastRetrievalMs = Math.round(Math.max(0, getTimestampMs() - retrievalStarted)); // CODEx: Record retrieval latency for diagnostics.
+  ragTelemetry.lastRetrievalMode = useEmbeddings ? 'embedding' : 'lexical'; // CODEx: Persist retrieval mode for telemetry overlays.
+
+  if (typeof console !== 'undefined' && typeof console.debug === 'function') { // CODEx: Avoid logging when console missing.
+    const topResults = selected.slice(0, Math.min(5, selected.length)).map((item) => ({ // CODEx: Summarize top matches for debugging output.
+      id: item.entry.id ?? item.entry.timestamp, // CODEx: Provide stable identifier for the retrieved memory.
+      score: Number.isFinite(item.score) ? Number(item.score).toFixed(3) : '0.000', // CODEx: Present combined score with consistent precision.
+      origin: item.entry.origin ?? 'unknown' // CODEx: Include memory origin to aid troubleshooting.
+    }));
+    console.debug('RAG retrieval', { // CODEx: Emit retrieval diagnostics to the debug console.
+      query: normalizedQuery.slice(0, 160), // CODEx: Log truncated query context for reference.
+      latencyMs: ragTelemetry.lastRetrievalMs, // CODEx: Share measured retrieval latency.
+      mode: ragTelemetry.lastRetrievalMode, // CODEx: Indicate whether embeddings or lexical fallback was used.
+      topResults // CODEx: Provide the scored top-k results for debugging.
+    });
   }
 
-  scores.sort((a, b) => b.score - a.score);
-  const selected = limit > 0 ? scores.slice(0, limit) : scores;
-  const result = selected.map((item) => item.entry);
-  ragTelemetry.lastRetrievalMs = Math.round(Math.max(0, getTimestampMs() - retrievalStarted));
-  return result;
+  return result; // CODEx: Return ordered memory results to callers.
 }
 
 function tokenize(text) {
@@ -6312,30 +6414,18 @@ function cosineSimilarity(queryTokens, docTokens) {
 
 // CODEx: Generate or reuse embeddings for the active query text.
 async function generateQueryEmbedding(query, tokens) {
+  if (!isEmbeddingRetrievalEnabled()) {
+    return null; // CODEx: Skip embedding generation when disabled by configuration.
+  }
   if (!query || query.length < EMBEDDING_MIN_QUERY_LENGTH) {
-    return null;
+    return null; // CODEx: Avoid embedding tiny prompts to conserve provider usage.
   }
   try {
-    return await generateTextEmbedding(query);
+    return await generateTextEmbedding(query); // CODEx: Delegate to shared embedding resolver.
   } catch (error) {
-    console.debug('Embedding query fallback engaged:', error);
-    if (tokens.length < 2) {
-      return null;
-    }
-    return lexicalEmbedding(tokens);
+    console.debug('Embedding query fallback engaged:', error); // CODEx: Surface provider failures for diagnostics.
+    return null; // CODEx: Allow lexical scoring path to handle retrieval when embeddings fail.
   }
-}
-
-// CODEx: Score a candidate memory against the current query embedding.
-async function scoreEmbeddingMatch(queryVector, entry) {
-  if (!queryVector) {
-    return null;
-  }
-  const vector = await ensureEntryEmbedding(entry);
-  if (!vector) {
-    return null;
-  }
-  return cosineSimilarityVectors(queryVector, vector);
 }
 
 // CODEx: Ensure a message has an embedding cached for future retrieval.
@@ -6374,13 +6464,23 @@ async function generateTextEmbedding(text, options = {}) {
     return embeddingCache.get(cacheKey);
   }
   let vector = null;
-  try {
-    vector = await requestEmbeddingFromProvider(trimmed, model, options);
-  } catch (error) {
-    console.debug('Embedding provider unavailable, falling back to lexical vector:', error);
-  }
-  if (!Array.isArray(vector) || !vector.length) {
-    vector = lexicalEmbedding(trimmed);
+  if (!isEmbeddingRetrievalEnabled()) {
+    vector = lexicalEmbedding(trimmed); // CODEx: Produce lexical vector immediately when embeddings disabled.
+  } else {
+    try {
+      vector = await requestEmbeddingFromProvider(trimmed, model, options); // CODEx: Request embedding from configured provider.
+      if (Array.isArray(vector) && vector.length) {
+        setEmbeddingServiceHealth(true); // CODEx: Mark embedding service healthy on success.
+      } else {
+        setEmbeddingServiceHealth(false, 'empty embedding'); // CODEx: Flag provider failure when response lacks vector data.
+      }
+    } catch (error) {
+      console.debug('Embedding provider unavailable, falling back to lexical vector:', error); // CODEx: Log provider outage for debugging.
+      setEmbeddingServiceHealth(false, error?.message || 'offline'); // CODEx: Persist failure reason for UI indicator.
+    }
+    if (!Array.isArray(vector) || !vector.length) {
+      vector = lexicalEmbedding(trimmed); // CODEx: Fallback to lexical vector when provider fails.
+    }
   }
   embeddingCache.set(cacheKey, vector);
   return vector;

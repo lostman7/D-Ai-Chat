@@ -135,6 +135,12 @@
           <span>Reasoning mode (limit context to fresh turns and lightweight RAG)</span>
         </label>
 
+        <label class="toggle"> <!-- // CODEx: Embedding retrieval toggle container -->
+          <input id="embeddingRetrievalToggle" type="checkbox"> <!-- // CODEx: Checkbox enabling embedding-based retrieval -->
+          <span>Use embeddings for retrieval</span> <!-- // CODEx: Toggle description for vector search -->
+        </label>
+        <p id="embeddingStatus" class="hint-text" role="status">Embedding Active ✗ (disabled)</p> <!-- // CODEx: Status indicator for embedding availability -->
+
         <div class="field">
           <label for="contextTurns">Recent turns in context</label>
           <input id="contextTurns" type="number" min="2" max="40" value="12">
