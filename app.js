@@ -81,6 +81,8 @@ const defaultConfig = {
 const TEST_TTS_PHRASE = 'This is SAM performing a voice check with persistent memory engaged.';
 const TTS_ERROR_COOLDOWN = 15000;
 const PINNED_STORAGE_KEY = 'sam-pinned-messages';
+const RAM_DISK_CHUNK_PREFIX = 'sam-chunked-';
+const RAM_DISK_UNCHUNKED_PREFIX = 'sam-unchunked-';
 
 const providerPresets = [
   {
@@ -392,6 +394,10 @@ let ragTelemetry = {
   staticErrors: [],
   loaded: false
 };
+const ramDiskCache = {
+  chunked: new Map(),
+  unchunked: new Map()
+};
 let chunkerState = {
   chunkSize: 500,
   chunkOverlap: 50,
@@ -551,6 +557,7 @@ async function init() {
   populateArenaProviderSelects();
   populateTtsControls();
   bindEvents();
+  primeRamDiskCache();
   applyDebugSetting();
   updateConfigInputs();
   updateSpeakToggle();
@@ -2850,40 +2857,43 @@ async function hydrateFloatingMemoryFromRag() {
 async function loadChunkedRagRecords() {
   const records = [];
   try {
-    // First, try to load from actual file system in rag/chunked/
+    const seen = new Set();
+
     try {
       const manifestResponse = await fetch('rag/manifest.json');
       if (manifestResponse.ok) {
         const manifest = await manifestResponse.json();
-        const files = manifest.files || [];
+        const files = Array.isArray(manifest.files) ? manifest.files : [];
 
         for (const fileEntry of files) {
-          const chunkedPath = `rag/chunked/${fileEntry.path}`;
+          const originalPath = `rag/${fileEntry.path}`;
+          const chunkedPath = toChunkedPath(originalPath);
           try {
-            const chunkedResponse = await fetch(chunkedPath);
-            if (chunkedResponse.ok) {
-              const data = await chunkedResponse.json();
-              if (data && Array.isArray(data.chunks) && data.chunks.length > 0) {
-                const messages = data.chunks.map((chunk, index) => ({
-                  id: `${data.originalPath}-chunk-${index}`,
-                  role: 'archive',
-                  content: chunk.content,
-                  timestamp: Date.now() + index, // Ensure unique timestamps
-                  origin: 'rag-chunked',
-                  mode: MODE_CHAT,
-                  pinned: false
-                }));
+            const result = await loadChunkedFileData(chunkedPath, originalPath);
+            const chunkList = result?.data?.chunks;
+            if (Array.isArray(chunkList) && chunkList.length > 0) {
+              const messages = chunkList.map((chunk, index) => ({
+                id: `${originalPath}-chunk-${index}`,
+                role: 'archive',
+                content: chunk.content,
+                timestamp: Date.now() + index,
+                origin: 'rag-chunked',
+                mode: MODE_CHAT,
+                pinned: false
+              }));
 
-                records.push({
-                  id: data.originalPath,
-                  label: `Chunked: ${data.originalPath}`,
-                  mode: MODE_CHAT,
-                  origin: 'rag-chunked',
-                  messages: messages,
-                  bytes: estimateMessagesSize(messages)
-                });
-                addSystemMessage(`✓ Loaded chunked file: ${fileEntry.path} (${data.chunks.length} chunks)`);
-              }
+              const labelSuffix = result.source === 'ram' ? ' (RAM disk)' : '';
+              records.push({
+                id: originalPath,
+                label: `Chunked: ${originalPath}${labelSuffix}`,
+                mode: MODE_CHAT,
+                origin: 'rag-chunked',
+                messages,
+                bytes: estimateMessagesSize(messages)
+              });
+              seen.add(originalPath);
+              const locationLabel = result.source === 'ram' ? 'RAM disk' : 'workspace';
+              addSystemMessage(`✓ Loaded chunked file: ${fileEntry.path} (${chunkList.length} chunks, ${locationLabel})`);
             }
           } catch (fileError) {
             console.warn(`Could not load chunked file ${chunkedPath}:`, fileError);
@@ -2896,40 +2906,34 @@ async function loadChunkedRagRecords() {
       void recordLog('error', `Could not load RAG manifest for chunked files: ${manifestError.message}`, { level: 'error' });
     }
 
-    // Fallback: load from localStorage
-    const keys = Object.keys(window.localStorage).filter(key => key.startsWith('sam-chunked-'));
-
-    for (const key of keys) {
-      try {
-        const data = JSON.parse(window.localStorage.getItem(key));
-        if (data && Array.isArray(data.chunks) && data.chunks.length > 0) {
-          // Skip if we already loaded this from file system
-          const alreadyLoaded = records.some(record => record.id === data.originalPath);
-          if (alreadyLoaded) continue;
-
-          const messages = data.chunks.map((chunk, index) => ({
-            id: `${data.originalPath}-chunk-${index}`,
-            role: 'archive',
-            content: chunk.content,
-            timestamp: Date.now() + index, // Ensure unique timestamps
-            origin: 'rag-chunked',
-            mode: MODE_CHAT,
-            pinned: false
-          }));
-
-          records.push({
-            id: data.originalPath,
-            label: `Chunked: ${data.originalPath} (localStorage)`,
-            mode: MODE_CHAT,
-            origin: 'rag-chunked',
-            messages: messages,
-            bytes: estimateMessagesSize(messages)
-          });
-        }
-      } catch (error) {
-        console.warn(`Failed to load chunked record ${key}:`, error);
-        void recordLog('error', `Failed to load chunked record ${key}: ${error.message}`, { level: 'error' });
+    for (const { path, data } of listRamDiskChunkedEntries()) {
+      const originalPath = typeof data?.originalPath === 'string' ? data.originalPath : fromChunkedPath(path);
+      if (!originalPath || seen.has(originalPath)) {
+        continue;
       }
+      const chunkList = Array.isArray(data?.chunks) ? data.chunks : [];
+      if (!chunkList.length) {
+        continue;
+      }
+      const messages = chunkList.map((chunk, index) => ({
+        id: `${originalPath}-chunk-${index}`,
+        role: 'archive',
+        content: chunk.content,
+        timestamp: Date.now() + index,
+        origin: 'rag-chunked',
+        mode: MODE_CHAT,
+        pinned: false
+      }));
+
+      records.push({
+        id: originalPath,
+        label: `Chunked: ${originalPath} (RAM disk)`,
+        mode: MODE_CHAT,
+        origin: 'rag-chunked',
+        messages,
+        bytes: estimateMessagesSize(messages)
+      });
+      seen.add(originalPath);
     }
   } catch (error) {
     console.error('Error loading chunked RAG records:', error);
@@ -2954,6 +2958,306 @@ async function manualRagReload() {
   }
 }
 
+function toChunkedPath(originalPath) {
+  if (typeof originalPath !== 'string' || !originalPath) {
+    return '';
+  }
+  if (originalPath.startsWith('rag/chunked/')) {
+    return originalPath;
+  }
+  return originalPath.replace(/^rag\//, 'rag/chunked/');
+}
+
+function fromChunkedPath(chunkedPath) {
+  if (typeof chunkedPath !== 'string' || !chunkedPath) {
+    return '';
+  }
+  if (chunkedPath.startsWith('rag/chunked/')) {
+    return chunkedPath.replace(/^rag\/chunked\//, 'rag/');
+  }
+  return chunkedPath;
+}
+
+function toUnchunkedPath(originalPath) {
+  if (typeof originalPath !== 'string' || !originalPath) {
+    return '';
+  }
+  if (originalPath.startsWith('rag/unchunked/')) {
+    return originalPath;
+  }
+  return originalPath.replace(/^rag\//, 'rag/unchunked/');
+}
+
+function dedupePaths(paths) {
+  return Array.from(new Set((Array.isArray(paths) ? paths : [paths]).filter(Boolean)));
+}
+
+function cacheChunkedInRam(paths, data) {
+  if (!data) return;
+  const targets = new Set(dedupePaths(paths));
+  if (data && typeof data.originalPath === 'string') {
+    targets.add(data.originalPath);
+    targets.add(toChunkedPath(data.originalPath));
+  }
+  if (data && typeof data.chunkedPath === 'string') {
+    targets.add(data.chunkedPath);
+  }
+  for (const path of targets) {
+    if (path) {
+      ramDiskCache.chunked.set(path, data);
+    }
+  }
+}
+
+function cacheUnchunkedInRam(paths, content) {
+  if (typeof content !== 'string') return;
+  const targets = dedupePaths(paths);
+  for (const path of targets) {
+    if (path) {
+      ramDiskCache.unchunked.set(path, content);
+    }
+  }
+}
+
+function readRamDiskChunk(paths) {
+  const candidates = dedupePaths(paths);
+  for (const path of candidates) {
+    if (ramDiskCache.chunked.has(path)) {
+      return ramDiskCache.chunked.get(path);
+    }
+  }
+  for (const path of candidates) {
+    const stored = window.localStorage.getItem(`${RAM_DISK_CHUNK_PREFIX}${path}`);
+    if (!stored) continue;
+    try {
+      const data = JSON.parse(stored);
+      if (typeof data.chunkedPath !== 'string') {
+        data.chunkedPath = path;
+      }
+      cacheChunkedInRam(candidates, data);
+      return data;
+    } catch (error) {
+      console.warn(`Failed to parse RAM disk chunk for ${path}:`, error);
+    }
+  }
+  return null;
+}
+
+function readRamDiskUnchunked(paths) {
+  const candidates = dedupePaths(paths);
+  for (const path of candidates) {
+    if (ramDiskCache.unchunked.has(path)) {
+      return ramDiskCache.unchunked.get(path);
+    }
+  }
+  for (const path of candidates) {
+    const stored = window.localStorage.getItem(`${RAM_DISK_UNCHUNKED_PREFIX}${path}`);
+    if (stored !== null && stored !== undefined) {
+      cacheUnchunkedInRam(candidates, stored);
+      return stored;
+    }
+  }
+  return null;
+}
+
+function listRamDiskChunkedEntries() {
+  const entries = [];
+  const keys = Object.keys(window.localStorage).filter((key) => key.startsWith(RAM_DISK_CHUNK_PREFIX));
+  for (const key of keys) {
+    const path = key.slice(RAM_DISK_CHUNK_PREFIX.length);
+    const data = readRamDiskChunk(path);
+    if (data) {
+      entries.push({ path, data });
+    }
+  }
+  return entries;
+}
+
+function listRamDiskUnchunkedEntries() {
+  const entries = [];
+  const keys = Object.keys(window.localStorage).filter((key) => key.startsWith(RAM_DISK_UNCHUNKED_PREFIX));
+  for (const key of keys) {
+    const path = key.slice(RAM_DISK_UNCHUNKED_PREFIX.length);
+    const content = readRamDiskUnchunked(path);
+    if (content !== null) {
+      entries.push({ path, content });
+    }
+  }
+  return entries;
+}
+
+function primeRamDiskCache() {
+  try {
+    const keys = Object.keys(window.localStorage);
+    for (const key of keys) {
+      if (key.startsWith(RAM_DISK_CHUNK_PREFIX)) {
+        const path = key.slice(RAM_DISK_CHUNK_PREFIX.length);
+        const stored = window.localStorage.getItem(key);
+        if (!stored) continue;
+        try {
+          const data = JSON.parse(stored);
+          cacheChunkedInRam([path], data);
+        } catch (error) {
+          console.warn(`Failed to parse cached chunked entry ${path}:`, error);
+        }
+      } else if (key.startsWith(RAM_DISK_UNCHUNKED_PREFIX)) {
+        const path = key.slice(RAM_DISK_UNCHUNKED_PREFIX.length);
+        const stored = window.localStorage.getItem(key);
+        if (stored !== null && stored !== undefined) {
+          cacheUnchunkedInRam([path], stored);
+        }
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to prime RAM disk cache:', error);
+  }
+}
+
+function normalizeRagData(data) {
+  if (data == null) {
+    return '';
+  }
+  if (typeof data === 'string') {
+    return data;
+  }
+  if (Array.isArray(data)) {
+    return data.map((item) => normalizeRagData(item)).join('\n');
+  }
+  if (typeof data === 'object') {
+    if (typeof data.content === 'string') {
+      return data.content;
+    }
+    return JSON.stringify(data);
+  }
+  return String(data);
+}
+
+function normalizeRagString(raw) {
+  if (typeof raw !== 'string') {
+    return normalizeRagData(raw);
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return '';
+  }
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return normalizeRagData(parsed);
+    } catch (error) {
+      const lines = trimmed.split(/\r?\n/);
+      const parsedLines = [];
+      let parsedCount = 0;
+      for (const line of lines) {
+        const candidate = line.trim();
+        if (!candidate) continue;
+        if (candidate.startsWith('{') || candidate.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(candidate);
+            parsedLines.push(normalizeRagData(parsed));
+            parsedCount += 1;
+            continue;
+          } catch (lineError) {
+            // fall through to keep the original line
+          }
+        }
+        parsedLines.push(line);
+      }
+      if (parsedCount > 0) {
+        return parsedLines.join('\n');
+      }
+    }
+  }
+  return raw;
+}
+
+async function loadChunkedFileData(chunkedPath, originalPath) {
+  const candidates = dedupePaths([chunkedPath, originalPath]);
+  const cached = readRamDiskChunk(candidates);
+  if (cached) {
+    return { data: cached, source: 'ram' };
+  }
+  for (const path of candidates) {
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        const payload = await response.json();
+        const normalized = { ...payload, chunkedPath: path };
+        cacheChunkedInRam(candidates, normalized);
+        return { data: normalized, source: 'filesystem' };
+      }
+    } catch (error) {
+      console.debug(`Failed to load chunked file ${path}:`, error);
+    }
+  }
+  return null;
+}
+
+async function loadRagFileContent(paths) {
+  const candidates = dedupePaths(paths);
+  for (const path of candidates) {
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await response.json();
+          const raw = typeof data === 'string' ? data : JSON.stringify(data);
+          cacheUnchunkedInRam(candidates, raw);
+          return { content: normalizeRagData(data), source: 'filesystem', contentType };
+        }
+        const text = await response.text();
+        cacheUnchunkedInRam(candidates, text);
+        return { content: text, source: 'filesystem', contentType: contentType || 'text/plain' };
+      }
+    } catch (error) {
+      console.debug(`Failed to fetch ${path} for chunking`, error);
+    }
+  }
+  const ramContent = readRamDiskUnchunked(candidates);
+  if (ramContent !== null) {
+    return { content: normalizeRagString(ramContent), source: 'ram', contentType: 'text/plain' };
+  }
+  return null;
+}
+
+async function detectUnchunkedFile(originalPath, manifestSize = 0) {
+  const candidatePaths = dedupePaths([toUnchunkedPath(originalPath), originalPath]);
+  for (const path of candidatePaths) {
+    try {
+      const response = await fetch(path);
+      if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        const text = await response.text();
+        cacheUnchunkedInRam(candidatePaths, text);
+        const sizeHeader = Number.parseInt(response.headers.get('content-length') || '', 10);
+        const computedSize = Number.isFinite(sizeHeader) ? sizeHeader : manifestSize || text.length;
+        return {
+          path,
+          originalPath,
+          size: computedSize,
+          source: 'workspace',
+          ramContent: text,
+          contentType
+        };
+      }
+    } catch (error) {
+      console.debug(`Failed to inspect ${path}:`, error);
+    }
+  }
+  const ramContent = readRamDiskUnchunked(candidatePaths);
+  if (ramContent !== null) {
+    return {
+      path: toUnchunkedPath(originalPath),
+      originalPath,
+      size: manifestSize || ramContent.length,
+      source: 'ram',
+      ramContent
+    };
+  }
+  return null;
+}
+
 async function scanForChunkableFiles() {
   if (chunkerState.isProcessing) {
     addSystemMessage('Chunker is already processing. Please wait.');
@@ -2976,51 +3280,82 @@ async function scanForChunkableFiles() {
     chunkerState.chunkedFiles = [];
     chunkerState.totalChunks = 0;
 
-    // Check for files in rag/ directory
-    for (const entry of manifest.files || []) {
+    const seenChunked = new Set();
+    const seenUnchunked = new Set();
+    const manifestFiles = Array.isArray(manifest.files) ? manifest.files : [];
+
+    for (const entry of manifestFiles) {
       const filePath = `rag/${entry.path}`;
-      const chunkedPath = filePath.replace(/^rag\//, 'rag/chunked/');
-      const unchunkedPath = filePath.replace(/^rag\//, 'rag/unchunked/');
+      const chunkedPath = toChunkedPath(filePath);
 
       try {
-        // Check if chunked version exists
-        const chunkedResponse = await fetch(chunkedPath);
-        if (chunkedResponse.ok) {
-          const chunkedData = await chunkedResponse.json();
+        const chunkedRecord = await loadChunkedFileData(chunkedPath, filePath);
+        const chunkList = chunkedRecord?.data?.chunks;
+        if (Array.isArray(chunkList) && chunkList.length > 0) {
           chunkerState.chunkedFiles.push({
             originalPath: filePath,
             chunkedPath,
-            chunks: chunkedData.chunks || []
+            chunks: chunkList,
+            source: chunkedRecord.source
           });
-          chunkerState.totalChunks += chunkedData.chunks?.length || 0;
-          addSystemMessage(`✓ Found chunked: ${entry.path} (${chunkedData.chunks?.length || 0} chunks)`);
-        } else {
-          // Check if file exists in unchunked
-          const unchunkedResponse = await fetch(unchunkedPath);
-          if (unchunkedResponse.ok) {
-            chunkerState.unchunkedFiles.push({
-              path: unchunkedPath,
-              originalPath: filePath,
-              size: entry.size || 0
-            });
-            addSystemMessage(`📁 Found unchunked: ${entry.path}`);
-          } else {
-            // Check if file exists in original location
-            const originalResponse = await fetch(filePath);
-            if (originalResponse.ok) {
-              chunkerState.unchunkedFiles.push({
-                path: filePath,
-                originalPath: filePath,
-                size: entry.size || 0
-              });
-              addSystemMessage(`📄 Found original: ${entry.path}`);
-            }
-          }
+          chunkerState.totalChunks += chunkList.length;
+          seenChunked.add(filePath);
+          const locationLabel = chunkedRecord.source === 'ram' ? 'RAM disk' : 'workspace';
+          addSystemMessage(`✓ Found chunked: ${entry.path} (${chunkList.length} chunks, ${locationLabel})`);
+          continue;
+        }
+
+        const descriptor = await detectUnchunkedFile(filePath, entry.size || 0);
+        if (descriptor) {
+          chunkerState.unchunkedFiles.push(descriptor);
+          seenUnchunked.add(filePath);
+          const locationLabel = descriptor.source === 'ram' ? 'RAM disk' : 'workspace';
+          const icon = descriptor.source === 'ram' ? '📦' : '📁';
+          addSystemMessage(`${icon} Found unchunked: ${entry.path} (${locationLabel})`);
         }
       } catch (error) {
         console.warn(`Error checking ${filePath}:`, error);
         addSystemMessage(`⚠️ Could not check ${entry.path}`);
       }
+    }
+
+    for (const { path, data } of listRamDiskChunkedEntries()) {
+      const originalPath = typeof data?.originalPath === 'string' ? data.originalPath : fromChunkedPath(path);
+      if (!originalPath || seenChunked.has(originalPath)) {
+        continue;
+      }
+      const chunks = Array.isArray(data?.chunks) ? data.chunks : [];
+      if (!chunks.length) {
+        continue;
+      }
+      chunkerState.chunkedFiles.push({
+        originalPath,
+        chunkedPath: toChunkedPath(originalPath),
+        chunks,
+        source: 'ram'
+      });
+      chunkerState.totalChunks += chunks.length;
+      seenChunked.add(originalPath);
+      const label = originalPath.startsWith('rag/') ? originalPath.slice(4) : originalPath;
+      addSystemMessage(`✓ Found chunked: ${label} (${chunks.length} chunks, RAM disk)`);
+    }
+
+    for (const { path, content } of listRamDiskUnchunkedEntries()) {
+      const originalPath = path;
+      if (!originalPath || seenChunked.has(originalPath) || seenUnchunked.has(originalPath)) {
+        continue;
+      }
+      const descriptor = {
+        path: toUnchunkedPath(originalPath),
+        originalPath,
+        size: content.length,
+        source: 'ram',
+        ramContent: content
+      };
+      chunkerState.unchunkedFiles.push(descriptor);
+      seenUnchunked.add(originalPath);
+      const label = originalPath.startsWith('rag/') ? originalPath.slice(4) : originalPath;
+      addSystemMessage(`📦 Found unchunked: ${label} (RAM disk)`);
     }
 
     updateChunkerStatus();
@@ -3056,37 +3391,42 @@ async function chunkAllFiles() {
 
     for (const file of chunkerState.unchunkedFiles) {
       try {
-        addSystemMessage(`Chunking ${file.path}...`);
-        const chunks = await chunkFile(file.path, chunkerState.chunkSize, chunkerState.chunkOverlap);
-        if (chunks && chunks.length > 0) {
+        const originalPath = file.originalPath || file.path;
+        const displayPath = originalPath || file.path;
+        addSystemMessage(`Chunking ${displayPath}...`);
+        const chunks = await chunkFile(file, chunkerState.chunkSize, chunkerState.chunkOverlap);
+        if (Array.isArray(chunks) && chunks.length > 0) {
           const chunkedData = {
-            originalPath: file.originalPath,
+            originalPath,
             chunkSize: chunkerState.chunkSize,
             chunkOverlap: chunkerState.chunkOverlap,
-            chunks: chunks,
+            chunks,
             createdAt: new Date().toISOString()
           };
 
           // Save chunked file to rag/chunked/
-          const chunkedPath = file.originalPath.replace(/^rag\//, 'rag/chunked/');
-          await saveChunkedFileToFS(chunkedPath, chunkedData);
+          const chunkedPath = toChunkedPath(originalPath);
+          const saveLocation = await saveChunkedFileToFS(chunkedPath, chunkedData);
 
           // Move original to rag/unchunked/
-          await moveToUnchunkedFS(file.path, file.originalPath);
+          await moveToUnchunkedFS(file.path, originalPath);
 
           chunkerState.chunkedFiles.push({
-            originalPath: file.originalPath,
+            originalPath,
             chunkedPath,
-            chunks: chunks
+            chunks,
+            source: saveLocation
           });
 
           totalChunksCreated += chunks.length;
           processedCount++;
-          addSystemMessage(`✓ Chunked ${file.path} into ${chunks.length} chunks`);
+          const locationLabel = saveLocation === 'ram' ? 'RAM disk' : 'workspace';
+          addSystemMessage(`✓ Chunked ${displayPath} into ${chunks.length} chunks (${locationLabel})`);
         }
       } catch (error) {
-        console.error(`Error chunking ${file.path}:`, error);
-        addSystemMessage(`✗ Failed to chunk ${file.path}: ${error.message || 'Unknown error'}`);
+        const originalPath = file.originalPath || file.path;
+        console.error(`Error chunking ${originalPath}:`, error);
+        addSystemMessage(`✗ Failed to chunk ${originalPath}: ${error.message || 'Unknown error'}`);
       }
     }
 
@@ -3106,37 +3446,39 @@ async function chunkAllFiles() {
   }
 }
 
-async function chunkFile(filePath, chunkSize, overlap) {
+async function chunkFile(fileDescriptor, chunkSize, overlap) {
+  const descriptor =
+    typeof fileDescriptor === 'string'
+      ? { path: fileDescriptor, originalPath: fileDescriptor }
+      : { ...fileDescriptor };
+  const label = descriptor.originalPath || descriptor.path || 'unknown file';
+  const candidatePaths = dedupePaths([descriptor.path, descriptor.originalPath]);
+
   try {
-    const response = await fetch(filePath);
-    if (!response.ok) {
-      throw new Error(`Failed to load file: ${response.status}`);
-    }
+    let sourceContent = '';
 
-    let content = '';
-    const contentType = response.headers.get('content-type') || '';
-
-    if (contentType.includes('application/json')) {
-      const data = await response.json();
-      if (Array.isArray(data)) {
-        // Handle JSONL or array format
-        content = data.map(item => typeof item === 'string' ? item : JSON.stringify(item)).join('\n');
-      } else if (data.content) {
-        content = data.content;
-      } else {
-        content = JSON.stringify(data);
-      }
+    if (typeof descriptor.ramContent === 'string') {
+      cacheUnchunkedInRam(candidatePaths, descriptor.ramContent);
+      sourceContent = normalizeRagString(descriptor.ramContent);
     } else {
-      content = await response.text();
+      const loaded = await loadRagFileContent(candidatePaths);
+      if (loaded && typeof loaded.content === 'string') {
+        sourceContent = normalizeRagString(loaded.content);
+      } else {
+        const fallback = readRamDiskUnchunked(candidatePaths);
+        if (fallback !== null) {
+          sourceContent = normalizeRagString(fallback);
+        } else {
+          throw new Error('File not found in workspace or RAM disk');
+        }
+      }
     }
 
-    if (!content.trim()) {
+    if (!sourceContent.trim()) {
       return [];
     }
 
-    // Split into sentences/paragraphs for better chunking
-    const segments = content.split(/\n\s*\n/).filter(s => s.trim());
-
+    const segments = sourceContent.split(/\n\s*\n/).filter((segment) => segment.trim());
     const chunks = [];
     let currentChunk = '';
     let currentTokens = 0;
@@ -3145,16 +3487,14 @@ async function chunkFile(filePath, chunkSize, overlap) {
       const segmentTokens = estimateTokenCount(segment);
 
       if (currentTokens + segmentTokens > chunkSize && currentChunk.trim()) {
-        // Save current chunk
         chunks.push({
           content: currentChunk.trim(),
           tokens: currentTokens,
           startIndex: chunks.length * (chunkSize - overlap)
         });
 
-        // Start new chunk with overlap
         const overlapText = extractOverlapText(currentChunk, overlap);
-        currentChunk = overlapText + segment;
+        currentChunk = overlapText ? overlapText + segment : segment;
         currentTokens = estimateTokenCount(currentChunk);
       } else {
         currentChunk += (currentChunk ? '\n\n' : '') + segment;
@@ -3162,7 +3502,6 @@ async function chunkFile(filePath, chunkSize, overlap) {
       }
     }
 
-    // Add final chunk
     if (currentChunk.trim()) {
       chunks.push({
         content: currentChunk.trim(),
@@ -3172,10 +3511,9 @@ async function chunkFile(filePath, chunkSize, overlap) {
     }
 
     return chunks;
-
   } catch (error) {
-    console.error(`Error chunking file ${filePath}:`, error);
-    void recordLog('error', `Error chunking file ${filePath}: ${error.message}`, { level: 'error' });
+    console.error(`Error chunking file ${label}:`, error);
+    void recordLog('error', `Error chunking file ${label}: ${error.message}`, { level: 'error' });
     throw error;
   }
 }
@@ -3202,8 +3540,9 @@ function extractOverlapText(text, overlapTokens) {
 }
 
 async function saveChunkedFileToFS(path, data) {
+  const payloadForCache = { ...data, chunkedPath: path };
+  cacheChunkedInRam([path, data?.originalPath], payloadForCache);
   try {
-    // Save to actual file system in rag/chunked/
     const response = await fetch(path, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -3213,19 +3552,24 @@ async function saveChunkedFileToFS(path, data) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
     console.log(`Saved chunked file to ${path}`);
+    return 'workspace';
   } catch (error) {
     console.error('Error saving chunked file to FS:', error);
-    // Fallback to localStorage
-    const key = `sam-chunked-${path}`;
-    window.localStorage.setItem(key, JSON.stringify(data));
-    console.log(`Fallback: Saved chunked file to localStorage: ${key}`);
+    try {
+      window.localStorage.setItem(`${RAM_DISK_CHUNK_PREFIX}${path}`, JSON.stringify(payloadForCache));
+      cacheChunkedInRam([path, data?.originalPath], payloadForCache);
+      console.log(`Fallback: Saved chunked file to localStorage: ${RAM_DISK_CHUNK_PREFIX}${path}`);
+    } catch (storageError) {
+      console.warn('Failed to persist chunked file to localStorage:', storageError);
+    }
+    return 'ram';
   }
 }
 
 async function moveToUnchunkedFS(fromPath, originalPath) {
+  const sourcePath = originalPath || fromPath;
+  const unchunkedPath = toUnchunkedPath(sourcePath);
   try {
-    // Move original file to rag/unchunked/
-    const unchunkedPath = originalPath.replace(/^rag\//, 'rag/unchunked/');
     const response = await fetch(fromPath);
     if (response.ok) {
       const content = await response.text();
@@ -3235,26 +3579,42 @@ async function moveToUnchunkedFS(fromPath, originalPath) {
         body: content
       });
       if (moveResponse.ok) {
-        // Delete original file
         await fetch(fromPath, { method: 'DELETE' });
+        cacheUnchunkedInRam([sourcePath, unchunkedPath], content);
         console.log(`Moved ${fromPath} to ${unchunkedPath}`);
+        return 'workspace';
       }
     }
   } catch (error) {
     console.warn('Could not move file to unchunked folder, using localStorage fallback:', error);
-    // Fallback to localStorage
-    const key = `sam-unchunked-${originalPath}`;
-    try {
+  }
+
+  try {
+    let content = readRamDiskUnchunked([fromPath, sourcePath, unchunkedPath]);
+    if (content === null) {
       const response = await fetch(fromPath);
       if (response.ok) {
-        const content = await response.text();
-        window.localStorage.setItem(key, content);
-        console.log(`Fallback: Moved file to localStorage: ${key}`);
+        content = await response.text();
       }
-    } catch (fallbackError) {
-      console.warn('Fallback also failed:', fallbackError);
     }
+    if (typeof content === 'string') {
+      cacheUnchunkedInRam([sourcePath, unchunkedPath], content);
+      const targets = [sourcePath, unchunkedPath];
+      for (const target of targets) {
+        try {
+          window.localStorage.setItem(`${RAM_DISK_UNCHUNKED_PREFIX}${target}`, content);
+        } catch (storageError) {
+          console.warn(`Failed to persist unchunked file to localStorage (${target}):`, storageError);
+        }
+      }
+      console.log(`Fallback: Moved file to RAM disk storage for ${sourcePath}`);
+      return 'ram';
+    }
+  } catch (fallbackError) {
+    console.warn('Fallback also failed:', fallbackError);
   }
+
+  return 'unknown';
 }
 
 function clearAllChunks() {
@@ -3262,7 +3622,9 @@ function clearAllChunks() {
     addSystemMessage('🗑️ Clearing all chunked and unchunked files...');
 
     // Clear localStorage entries
-    const keys = Object.keys(window.localStorage).filter(key => key.startsWith('sam-chunked-') || key.startsWith('sam-unchunked-'));
+    const keys = Object.keys(window.localStorage).filter(
+      (key) => key.startsWith(RAM_DISK_CHUNK_PREFIX) || key.startsWith(RAM_DISK_UNCHUNKED_PREFIX)
+    );
     keys.forEach(key => window.localStorage.removeItem(key));
 
     // Try to delete files from file system
@@ -3291,6 +3653,8 @@ function clearAllChunks() {
       chunkerState.unchunkedFiles = [];
       chunkerState.chunkedFiles = [];
       chunkerState.totalChunks = 0;
+      ramDiskCache.chunked.clear();
+      ramDiskCache.unchunked.clear();
       updateChunkerStatus();
       addSystemMessage(`✅ Cleared all chunked and unchunked files.`);
     });
@@ -3915,10 +4279,23 @@ function updateChunkerStatus() {
       elements.chunkerStatus.textContent = '🔄 Processing files…';
       elements.chunkerStatus.style.color = '#ff6b35'; // Orange/red for processing
     } else if (chunkerState.unchunkedFiles.length > 0) {
-      elements.chunkerStatus.textContent = `🟡 ${chunkerState.unchunkedFiles.length} file${chunkerState.unchunkedFiles.length === 1 ? '' : 's'} ready to chunk.`;
+      const pending = chunkerState.unchunkedFiles.length;
+      const ramBacked = chunkerState.unchunkedFiles.filter((file) => file.source === 'ram').length;
+      let status = `🟡 ${pending} file${pending === 1 ? '' : 's'} ready to chunk.`;
+      if (ramBacked > 0) {
+        status += ` ${ramBacked} cached in RAM disk.`;
+      }
+      elements.chunkerStatus.textContent = status;
       elements.chunkerStatus.style.color = '#ffd23f'; // Yellow for ready
     } else {
-      elements.chunkerStatus.textContent = '🟢 No files to chunk. Scan the rag/ folder first.';
+      const chunkedCount = chunkerState.chunkedFiles.length;
+      const ramChunked = chunkerState.chunkedFiles.filter((file) => file.source === 'ram').length;
+      if (chunkedCount > 0) {
+        const ramNote = ramChunked > 0 ? ` (${ramChunked} cached in RAM disk)` : '';
+        elements.chunkerStatus.textContent = `🟢 ${chunkedCount} chunked file${chunkedCount === 1 ? '' : 's'} ready${ramNote}.`;
+      } else {
+        elements.chunkerStatus.textContent = '🟢 No files to chunk. Scan the rag/ folder first.';
+      }
       elements.chunkerStatus.style.color = '#06ffa5'; // Green for idle
     }
   }
@@ -4361,19 +4738,6 @@ function cosineSimilarity(queryTokens, docTokens) {
   });
   if (!queryMagnitude || !docMagnitude) return 0;
   return dotProduct / Math.sqrt(queryMagnitude * docMagnitude);
-}
-
-function estimateTokenCount(text) {
-  if (!text) return 0;
-  const parts = text
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
-  let total = 0;
-  for (const part of parts) {
-    total += Math.max(1, Math.ceil(part.length / 4));
-  }
-  return total;
 }
 
 function trimResponseToTokenLimit(text, limit) {
