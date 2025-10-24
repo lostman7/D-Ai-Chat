@@ -472,7 +472,7 @@ const providerPresets = [
     label: 'Ollama (local)',
     description:
       'Point SAM at an Ollama instance. Run `ollama serve`, pull a model such as `tinyllama`, and enable the OpenAI-compatible endpoint.',
-    endpoint: 'http://localhost:11434/v1/chat/completions',
+    endpoint: 'http://localhost:11434/api/generate', // CODEx hot-fix: align Ollama local default with native generate route.
     model: 'tinyllama',
     requiresKey: false,
     contextLimit: 65536
@@ -6979,7 +6979,16 @@ function detectConnectionType(endpoint, preset) {
 function resolveLocalChatEndpoint(endpoint, type) {
   const base = deriveBaseUrl(endpoint);
   if (type === 'ollama') {
-    return `${stripTrailingSlashes(base)}/api/chat`;
+    if (/\/api\/generate$/i.test(endpoint)) {
+      return endpoint; // CODEx hot-fix: retain explicit generate endpoint without changes.
+    } // CODEx hot-fix
+    if (/\/v1\/chat\/completions$/i.test(endpoint)) {
+      return endpoint.replace(/\/v1\/chat\/completions$/i, '/api/generate'); // CODEx hot-fix: translate legacy path.
+    } // CODEx hot-fix
+    if (/\/api\/chat$/i.test(endpoint)) {
+      return endpoint.replace(/\/api\/chat$/i, '/api/generate'); // CODEx hot-fix: swap deprecated chat route.
+    } // CODEx hot-fix
+    return `${stripTrailingSlashes(base)}/api/generate`; // CODEx hot-fix: default to generate endpoint.
   }
   if (type === 'lmstudio') {
     if (/\/api\/chat$/.test(endpoint)) {
@@ -7022,14 +7031,25 @@ async function callLocalModel({
   try {
     while (attempt < 2) {
       attempt += 1;
-      const payload = {
-        model,
-        messages: normalizeLocalMessages(messages),
-        temperature,
-        stream: false,
-        num_ctx: numCtx,
-        num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx))
-      };
+      const isOllamaLocal = type === 'ollama'; // CODEx hot-fix: flag Ollama routing.
+      const payload = isOllamaLocal
+        ? {
+            model, // CODEx hot-fix: request Ollama model identifier.
+            prompt: collapseMessagesToPrompt(messages), // CODEx hot-fix: flatten transcript for /api/generate.
+            stream: false, // CODEx hot-fix: keep non-streamed response for existing parser.
+            options: {
+              temperature, // CODEx hot-fix: forward temperature control.
+              num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx)) // CODEx hot-fix: respect prediction bounds.
+            }
+          }
+        : {
+            model,
+            messages: normalizeLocalMessages(messages),
+            temperature,
+            stream: false,
+            num_ctx: numCtx,
+            num_predict: Math.max(256, Math.min(maxTokens || 1024, numCtx))
+          };
       let response;
       try {
         response = await fetch(chatEndpoint, {
@@ -7047,8 +7067,13 @@ async function callLocalModel({
         throw error;
       }
       if (response.ok) {
-        const data = await response.json();
-        const text = data?.message?.content || data?.output || data?.response || '';
+        const data = await response.json(); // CODEx hot-fix: parse completion payload.
+        const text = isOllamaLocal
+          ? data?.response || data?.output || data?.message?.content || '' // CODEx hot-fix: normalize Ollama generate outputs.
+          : data?.message?.content || data?.output || data?.response || ''; // CODEx hot-fix: preserve LM Studio parsing.
+        if (isOllamaLocal && attempt === 1) {
+          console.log('[RAG] Provider = Ollama Local → /api/generate OK'); // CODEx hot-fix: surface successful routing telemetry.
+        } // CODEx hot-fix
         if (typeof onStream === 'function') {
           onStream({ type: 'content', text }); // CODEx: Emit final payload for local completions.
         }
