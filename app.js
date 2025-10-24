@@ -3661,7 +3661,7 @@ function normalizeDirectoryListingFromJson(payload, basePath) {
       }
     }
   }
-  return Array.from(results);
+  return filterSuspiciousDirectoryEntries(Array.from(results));
 }
 
 function normalizeDirectoryListingFromText(text, basePath) {
@@ -3682,6 +3682,7 @@ function normalizeDirectoryListingFromText(text, basePath) {
       if (!pathname || pathname === expectedPrefix) continue;
       if (!pathname.startsWith(expectedPrefix)) continue;
       if (pathname.endsWith('/')) continue;
+      if (/["']/.test(pathname)) continue;
       results.add(pathname);
     }
   } catch (error) {
@@ -3694,12 +3695,25 @@ function normalizeDirectoryListingFromText(text, basePath) {
       const trimmed = line.trim();
       if (!trimmed || trimmed === '.' || trimmed === '..') continue;
       if (/[<>]/.test(trimmed)) continue;
+      if (/["']/.test(trimmed) && /=/.test(trimmed)) continue;
       if (trimmed.endsWith('/')) continue;
       results.add(resolveRagPath(normalizedBase, trimmed));
     }
   }
 
-  return Array.from(results);
+  return filterSuspiciousDirectoryEntries(Array.from(results));
+}
+
+function filterSuspiciousDirectoryEntries(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries.filter((entry) => {
+    if (!entry) return false;
+    if (/["'<>]/.test(entry)) return false;
+    const lastSegment = entry.split('/').pop();
+    if (!lastSegment || lastSegment === '.' || lastSegment === '..') return false;
+    if (/["'<>]/.test(lastSegment)) return false;
+    return true;
+  });
 }
 
 async function scanForChunkableFiles() {
