@@ -1,4 +1,11 @@
 import { boardEntriesToChunks, applyBoardEmbeddings, vectorSearch } from './chunker.js';
+import {
+  initVectorCache,
+  getCachedVectors,
+  storeCachedVectors,
+  subscribeVectorCache,
+  VECTOR_CACHE_LIMIT_BYTES
+} from './rag/vectorCache.js';
 
 const STORAGE_KEY = 'sam_settings_v2';
 const BOARD_STORAGE_KEY = 'sam_board_store_v1';
@@ -110,11 +117,20 @@ let humanInputResolver = null;
 const humanInputQueue = [];
 
 const elements = {};
+let unsubscribeVectorCache = null;
 
 function createAgent(id) {
   const agent = deepClone(DEFAULT_AGENT_TEMPLATE);
   agent.id = id;
   return agent;
+}
+
+function resolveAgentId(agent) {
+  if (agent?.id) return agent.id;
+  for (const [id, value] of Object.entries(settings.agents)) {
+    if (value === agent) return id;
+  }
+  return 'unknown';
 }
 
 function createArenaState() {
@@ -751,6 +767,7 @@ function populateReferences() {
   elements.autoInjectMemories = document.getElementById('autoInjectMemories');
   elements.embeddingToggle = document.getElementById('embeddingRetrievalToggle');
   elements.embeddingStatus = document.getElementById('embeddingStatus');
+  elements.vectorCacheStatus = document.getElementById('vectorCacheStatus');
   elements.floatingMemoryList = document.getElementById('floatingMemoryList');
   elements.floatingMemoryCount = document.getElementById('floatingMemoryCount');
   elements.pinnedMemoryCount = document.getElementById('pinnedMemoryCount');
@@ -814,6 +831,7 @@ function renderMemorySettings() {
     elements.embeddingToggle.checked = Boolean(settings.memory.useEmbeddings);
   }
   updateEmbeddingStatus();
+  updateVectorCacheStatus();
   updateMemoryStatus();
   updateMemoryStats();
 }
@@ -912,6 +930,26 @@ function updateEmbeddingStatus() {
   if (!elements.embeddingStatus) return;
   const state = settings.memory.useEmbeddings;
   elements.embeddingStatus.textContent = `Embedding Active ${state ? '✓ (enabled)' : '✗ (disabled)'}`;
+}
+
+function updateVectorCacheStatus(stats) {
+  if (!elements.vectorCacheStatus) return;
+  const fallbackSupported = typeof indexedDB !== 'undefined';
+  const snapshot = stats ?? {
+    bytes: 0,
+    entries: 0,
+    status: fallbackSupported ? 'Initialising…' : 'Unavailable',
+    supported: fallbackSupported
+  };
+  if (!snapshot.supported) {
+    elements.vectorCacheStatus.textContent = 'Vector cache unavailable in this environment.';
+    return;
+  }
+  const sizeMb = (snapshot.bytes / MB).toFixed(1);
+  const limitMb = (VECTOR_CACHE_LIMIT_BYTES / MB).toFixed(0);
+  const entries = snapshot.entries ?? 0;
+  const status = snapshot.status ?? 'Idle';
+  elements.vectorCacheStatus.textContent = `Vector cache: ${sizeMb} MB of ${limitMb} MB • ${entries} entries • Sync: ${status}`;
 }
 
 function renderAgents() {
@@ -1287,6 +1325,21 @@ function submitHumanMessage() {
   }
 }
 
+async function setupVectorCache() {
+  if (unsubscribeVectorCache) {
+    unsubscribeVectorCache();
+    unsubscribeVectorCache = null;
+  }
+  unsubscribeVectorCache = subscribeVectorCache((stats) => {
+    updateVectorCacheStatus(stats);
+  });
+  try {
+    await initVectorCache();
+  } catch (error) {
+    console.warn('Vector cache initialisation failed', error);
+  }
+}
+
 async function initialise() {
   populateReferences();
   bindOptionsHandle();
@@ -1299,6 +1352,7 @@ async function initialise() {
   renderAgents();
   setupBoardControls();
   setupHumanInput();
+  await setupVectorCache();
   await loadFloatingMemory();
   renderFloatingMemory();
   await loadBoard();
@@ -1638,8 +1692,39 @@ async function maybeEmbed(agent, texts, options = {}) {
   if (!force && !settings.memory.useEmbeddings) {
     return null;
   }
+  if (!agent) {
+    return null;
+  }
+  const context = {
+    agentId: resolveAgentId(agent),
+    model: agent?.embed?.model || agent?.model?.name || agent?.model?.preset || 'default',
+    provider: agent?.embed?.provider || 'generic'
+  };
   try {
-    return await callEmbedding(agent, texts);
+    await initVectorCache();
+    const cached = await getCachedVectors({ ...context, texts });
+    const results = cached.vectors.slice();
+    const misses = cached.misses ?? [];
+    if (!misses.length) {
+      return results;
+    }
+    const inputs = misses.map((item) => item.text);
+    const fresh = await callEmbedding(agent, inputs);
+    if (!Array.isArray(fresh) || !fresh.length) {
+      return results;
+    }
+    const storeEntries = [];
+    for (let index = 0; index < misses.length; index += 1) {
+      const miss = misses[index];
+      const vector = fresh[index];
+      if (!vector) continue;
+      results[miss.index] = Array.isArray(vector) ? vector : Array.from(vector);
+      storeEntries.push({ key: miss.key, hash: miss.hash, vector });
+    }
+    if (storeEntries.length) {
+      await storeCachedVectors({ ...context, entries: storeEntries });
+    }
+    return results;
   } catch (error) {
     console.warn('Embedding request failed', error);
     return null;
@@ -2060,12 +2145,14 @@ async function callEmbedding(agent, inputs) {
   console.info(`[Agent=${agent.id ?? 'unknown'}] [Provider=${provider}] [EMBED] URL=${endpoint} t=${Math.round(duration)}ms`);
   if (provider === 'ollama_local') {
     const data = await response.json();
-    const vectors = Array.isArray(data.embeddings) ? data.embeddings : data.embedding ? [data.embedding] : [];
-    return vectors;
+    if (Array.isArray(data.embeddings)) {
+      return data.embeddings;
+    }
+    return data.embedding ? [data.embedding] : [];
   }
   const data = await response.json();
-  const vector = data.data?.[0]?.embedding ?? [];
-  return [vector];
+  const vectors = Array.isArray(data.data) ? data.data.map((item) => item.embedding ?? []) : [];
+  return vectors;
 }
 
 function buildEmbedPayload(provider, agent, inputs) {
