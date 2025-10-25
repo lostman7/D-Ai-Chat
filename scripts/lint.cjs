@@ -30,24 +30,24 @@ try {
   runNodeCheck('app.js');
 
   verifyMarkers('index.html', [
-    { pattern: 'id="optionsHandle"', description: 'options drawer handle' },
-    { pattern: 'id="optionsDrawer"', description: 'options drawer panel' },
-    { pattern: 'id="a_model_preset"', description: 'Agent A provider selector' },
-    { pattern: 'id="memorySlider"', description: 'memory slider control' },
-    { pattern: 'id="dualChatWindow"', description: 'dual agent transcript container' }
+    { pattern: 'id=\"optionsHandle\"', description: 'options drawer handle' },
+    { pattern: 'id=\"optionsDrawer\"', description: 'options drawer panel' },
+    { pattern: 'id=\"arena_mode\"', description: 'arena selector' },
+    { pattern: 'id=\"agent_list\"', description: 'agent roster' },
+    { pattern: 'id=\"boardViewport\"', description: 'board viewport container' }
   ]);
 
   verifyMarkers('app.js', [
-    { pattern: 'function runDiagnostics', description: 'diagnostics routine' },
-    { pattern: 'function renderFloatingMemoryWorkbench', description: 'floating memory refresher' },
-    { pattern: 'function applyProviderPreset', description: 'provider preset handler' },
-    { pattern: 'async function synthesizeRemoteTts', description: 'speech synthesis handler' }
+    { pattern: 'async function startArena()', description: 'arena bootstrapper' },
+    { pattern: 'async function gatherBoardContext', description: 'board-aware retrieval' },
+    { pattern: 'function buildPromptFromBoard', description: 'prompt synthesizer' },
+    { pattern: 'async function callEmbedding', description: 'embedding request handler' }
   ]);
 
   verifyMarkers('styles.css', [
     { pattern: '.options-handle', description: 'options handle styles' },
     { pattern: '.side-panel', description: 'drawer styling' },
-    { pattern: '.memory-list', description: 'floating memory list styling' }
+    { pattern: '.board-panel', description: 'board layout styles' }
   ]);
 
   console.log('All static checks passed.');

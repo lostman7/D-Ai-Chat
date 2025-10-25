@@ -68,3 +68,28 @@ export async function vectorSearch(options = {}) { // CODEx: Rank candidate memo
   scored.sort((a, b) => b.score - a.score); // CODEx: Rank candidates from highest to lowest score.
   return limit > 0 ? scored.slice(0, limit) : scored; // CODEx: Apply optional top-k truncation before returning.
 } // CODEx
+
+export function boardEntriesToChunks(entries = []) {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+  return entries.map((entry, index) => ({
+    id: entry.id ?? `board-${index}`,
+    content: entry.content ?? '',
+    round: entry.round ?? 0,
+    turn: entry.turn ?? index + 1,
+    agentId: entry.agentId ?? 'unknown',
+    ts: entry.ts ?? null,
+    summary: entry.summary ?? null
+  }));
+}
+
+export function applyBoardEmbeddings(chunks = [], embeddings = []) {
+  if (!Array.isArray(chunks) || !Array.isArray(embeddings)) {
+    return chunks;
+  }
+  return chunks.map((chunk, index) => ({
+    ...chunk,
+    embedding: Array.isArray(embeddings[index]) ? embeddings[index] : chunk.embedding ?? null
+  }));
+}
