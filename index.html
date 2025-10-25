@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SAM • Memory-Augmented Chat</title>
+  <title>SAM • Multi-Arena Orchestrator</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -19,142 +19,103 @@
     <span class="sr-only">Toggle SAM options</span>
   </button>
   <div id="optionsBackdrop" class="options-backdrop" hidden></div>
-  <div id="modeOverlay" class="mode-overlay" role="dialog" aria-modal="true" aria-labelledby="mode-heading">
-    <div class="mode-card">
-      <h2 id="mode-heading">Choose how to run SAM</h2>
-      <p>Start in human chat mode or let SAM debate itself to grow long-term memories.</p>
-      <div class="mode-actions">
-        <button id="enterChatButton" class="primary" type="button">Chat with SAM</button>
-        <button id="enterArenaButton" class="ghost" type="button">Launch dual agents</button>
-      </div>
-    </div>
-  </div>
+
   <main class="layout">
-    <div id="statusDock" class="status-dock" role="region" aria-live="polite">
-      <div class="status-row">
-        <span id="modelStatus" class="status-pill status-pill--alert" role="status">Model A: Not connected</span>
-        <span id="modelBStatus" class="status-pill status-pill--alert" role="status">Model B: Disabled</span>
-        <span id="ragStatusFlag" class="status-pill status-pill--alert" role="status">RAG: Not loaded</span>
-        <span id="memoryStatus" class="status-pill">Floating memory: 0 / 100&nbsp;MB</span>
-      </div>
-      <div class="status-row status-row--actions">
-        <span id="systemResourceStatus" class="status-note">Detecting system memory and GPU…</span>
-        <div class="status-actions">
-          <button id="diagnosticsButton" class="ghost ghost--small" type="button">Run diagnostics</button>
-          <button id="switchToArenaButton" class="ghost ghost--small" type="button">Open SAM arena</button>
-          <button id="switchToChatButton" class="ghost ghost--small" type="button">Return to single agent chat</button>
+    <aside id="optionsDrawer" class="side-panel" aria-labelledby="settings-heading" tabindex="-1" aria-hidden="true" inert>
+      <section class="side-card" aria-labelledby="arena-heading">
+        <header class="side-card__header">
+          <h2 id="arena-heading">Arena configuration</h2>
+        </header>
+        <div class="field">
+          <label for="arena_mode">Arena mode</label>
+          <select id="arena_mode">
+            <option value="human">Human Arena</option>
+            <option value="pair">Pair Arena</option>
+            <option value="roundtable">Roundtable</option>
+            <option value="allout">All-Out</option>
+          </select>
         </div>
-      </div>
-    </div>
+        <div class="field field--inline">
+          <label for="turn_cooldown_ms">Turn cooldown (ms)</label>
+          <input id="turn_cooldown_ms" type="number" min="0" value="15000">
+        </div>
+        <div class="field">
+          <label for="board_policy">Board memory policy</label>
+          <select id="board_policy">
+            <option value="last_k_messages">Last K messages</option>
+            <option value="rolling_window_tokens">Rolling token window</option>
+            <option value="summary_every_n_turns">Summary every N turns</option>
+          </select>
+        </div>
+        <div class="field field--inline">
+          <label for="board_window">Window size / tokens</label>
+          <input id="board_window" type="number" min="1" value="20">
+        </div>
+        <div class="field field--inline" id="summaryEveryField">
+          <label for="summary_every">Summaries every N turns</label>
+          <input id="summary_every" type="number" min="1" value="5">
+        </div>
+        <label class="toggle">
+          <input id="parallel_mode_toggle" type="checkbox">
+          <span>Enable parallel workers (All-Out only)</span>
+        </label>
+        <div class="participants-header">
+          <h3 id="participants-heading">Participants</h3>
+          <button id="add_agent_btn" class="ghost" type="button">Add agent</button>
+        </div>
+        <ol id="agent_list" class="agent-list" aria-labelledby="participants-heading"></ol>
+      </section>
 
-    <section id="chatPanel" class="chat-panel" aria-labelledby="chat-heading" hidden>
-      <header class="panel-header">
-        <div>
-          <h1 id="chat-heading">SAM</h1>
-          <p class="subtitle">Memory-augmented assistant with local RAG</p>
-        </div>
-      </header>
-
-      <div id="chatWindow" class="chat-window" aria-live="polite" data-scroll-container="true"></div>
-
-      <footer class="chat-footer">
-        <div class="input-row">
-          <label class="sr-only" for="messageInput">Message</label>
-          <textarea id="messageInput" rows="2" placeholder="Ask SAM anything…"></textarea>
-          <div class="input-actions">
-            <button id="sendButton" class="primary">Send</button>
-            <button id="voiceButton" class="ghost" aria-pressed="false" title="Toggle speech recognition">🎙 Voice</button>
-            <label class="toggle">
-              <input id="speakToggle" type="checkbox">
-              <span>Auto speak replies</span>
-            </label>
-          </div>
-        </div>
-        <div class="memory-tools">
-          <button id="retrieveButton" class="ghost">Promote relevant memories</button>
-          <button id="clearChatButton" class="ghost danger">Clear chat window</button>
-        </div>
-      </footer>
-    </section>
-
-    <section id="arenaPanel" class="arena-panel" aria-labelledby="arena-heading" hidden>
-      <header class="panel-header">
-        <div>
-          <h1 id="arena-heading">SAM Arena</h1>
-          <p class="subtitle">Let SAM debate itself and archive the dialogue automatically.</p>
-        </div>
-      </header>
-
-      <div class="arena-body">
-        <div id="dualChatWindow" class="chat-window chat-window--arena" aria-live="polite" data-scroll-container="true"></div>
-        <div class="arena-telemetry" role="status">
-          <div class="entropy-meter" aria-live="polite">
-            <span class="entropy-label">ENTROPY</span>
-            <div class="entropy-bar" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-              <div id="entropyBarFill" class="entropy-bar__fill"></div>
-            </div>
-            <span id="entropyStatus" class="entropy-status">Calibrating…</span>
-          </div>
-          <div id="reflexStatus" class="reflex-status">Reflex idle</div>
-        </div>
-        <div class="arena-footer">
-          <label class="field" for="dualSeedInput">
-            <span>Conversation starter</span>
-            <textarea id="dualSeedInput" rows="2" placeholder="Debate whether persistent memories make AI more helpful."></textarea>
-          </label>
-          <div class="arena-actions">
-            <button id="startDualButton" class="primary" type="button">Start conversation</button>
-            <button id="nextDualButton" class="ghost" type="button">Step turn</button>
-            <button id="stopDualButton" class="ghost danger" type="button">Stop</button>
-            <button id="exportDualButton" class="ghost" type="button">Export transcript</button>
-          </div>
-          <div id="dualStatus" class="status-text" role="status">Awaiting start…</div>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <aside id="optionsDrawer" class="side-panel" aria-labelledby="memory-heading" tabindex="-1" aria-hidden="true" inert>
-      <section class="side-card">
-        <h2 id="memory-heading">Memory &amp; Retrieval</h2>
+      <section class="side-card" aria-labelledby="memory-heading">
+        <header class="side-card__header">
+          <h2 id="memory-heading">Memory settings</h2>
+        </header>
+        <p id="memoryStatus" class="status-pill">Floating memory: 0 / 100&nbsp;MB</p>
         <label class="slider-label" for="memorySlider">Floating memory budget <span id="memorySliderValue">100&nbsp;MB</span></label>
         <input id="memorySlider" type="range" min="50" max="200" step="10" value="100">
-
         <div class="field">
           <label for="retrievalCount">Memories per retrieval (0 = unlimited)</label>
           <input id="retrievalCount" type="number" min="0" max="200" value="0">
         </div>
-
         <label class="toggle">
           <input id="autoInjectMemories" type="checkbox">
-          <span>Auto-inject retrieved memories into prompts</span>
+          <span>Auto-inject retrieved memories</span>
         </label>
-
         <label class="toggle">
-          <input id="reasoningModeToggle" type="checkbox">
-          <span>Reasoning mode (limit context to fresh turns and lightweight RAG)</span>
+          <input id="embeddingRetrievalToggle" type="checkbox">
+          <span>Use embeddings for retrieval</span>
         </label>
-
-        <label class="toggle"> <!-- // CODEx: Embedding retrieval toggle container -->
-          <input id="embeddingRetrievalToggle" type="checkbox"> <!-- // CODEx: Checkbox enabling embedding-based retrieval -->
-          <span>Use embeddings for retrieval</span> <!-- // CODEx: Toggle description for vector search -->
-        </label>
-        <p id="embeddingStatus" class="hint-text" role="status">Embedding Active ✗ (disabled)</p> <!-- // CODEx: Status indicator for embedding availability -->
-
-        <div class="field">
-          <label for="contextTurns">Recent turns in context</label>
-          <input id="contextTurns" type="number" min="2" max="40" value="12">
-        </div>
-
-        <button id="exportMemoryButton" class="ghost">Export conversation log</button>
+        <p id="embeddingStatus" class="hint-text" role="status">Embedding Active ✗ (disabled)</p>
+        <button id="exportMemoryButton" class="ghost" type="button">Export floating memory</button>
       </section>
 
       <section class="side-card" aria-labelledby="workbench-heading">
-        <h2 id="workbench-heading">Floating memory workbench</h2>
-        <p class="hint-text">See what&apos;s on SAM&apos;s mental desk and pin critical memories.</p>
-        <dl class="memory-stats">
+        <header class="side-card__header">
+          <h2 id="workbench-heading">Floating memory workbench</h2>
+        </header>
+        <p class="hint-text">Review the RAM-disk memories that feed retrieval and pin critical notes.</p>
+        <p id="vectorCacheStatus" class="hint-text" role="status">Local Embedding Cache: Inactive</p>
+        <div class="memory-stats">
+          <div>
+            <dt>Cache entries</dt>
+            <dd id="vectorCacheEntries">0</dd>
+          </div>
+          <div>
+            <dt>Cache size</dt>
+            <dd id="vectorCacheSize">0 MB</dd>
+          </div>
+          <div>
+            <dt>Cache hits</dt>
+            <dd id="vectorCacheHits">0</dd>
+          </div>
+          <div>
+            <dt>Cache misses</dt>
+            <dd id="vectorCacheMisses">0</dd>
+          </div>
+        </div>
+        <dl class="memory-stats" aria-live="polite">
           <div class="memory-stat">
-            <dt>Messages afloat</dt>
+            <dt>Floating</dt>
             <dd id="floatingMemoryCount">0</dd>
           </div>
           <div class="memory-stat">
@@ -162,398 +123,163 @@
             <dd id="pinnedMemoryCount">0</dd>
           </div>
           <div class="memory-stat">
-            <dt>Recovered from RAG</dt>
+            <dt>RAG entries</dt>
             <dd id="ragMemoryCount">0</dd>
-          </div>
-          <div class="memory-stat">
-            <dt>RAG snapshots loaded</dt>
-            <dd id="ragSnapshotCount">0</dd>
           </div>
           <div class="memory-stat">
             <dt>RAG footprint</dt>
             <dd id="ragFootprint">0 MB</dd>
           </div>
-          <div class="memory-stat">
-            <dt>Compression ratio</dt>
-            <dd id="ragCompressionRatio">0%</dd>
-          </div>
-        </dl>
-        <dl class="memory-stats memory-stats--retrieval" aria-live="polite">
-          <div class="memory-stat">
-            <dt>Model&nbsp;A retrievals</dt>
-            <dd id="modelARetrievals">0</dd>
-          </div>
-          <div class="memory-stat">
-            <dt>Model&nbsp;B retrievals</dt>
-            <dd id="modelBRetrievals">0</dd>
-          </div>
         </dl>
         <p id="ragImportStatus" class="hint-text" role="status">RAG archives not loaded yet.</p>
         <div id="floatingMemoryList" class="memory-list" role="list"></div>
         <div class="memory-actions">
-          <button id="saveChatArchiveButton" class="ghost" type="button">Save chat to archive</button>
-          <button id="loadRagButton" class="ghost" type="button">Load RAG archives</button>
-          <button id="loadChunkDataButton" class="ghost" type="button">Load chunk data</button>
           <button id="refreshFloatingButton" class="ghost" type="button">Refresh view</button>
           <button id="archiveUnpinnedButton" class="ghost danger" type="button">Archive unpinned</button>
         </div>
       </section>
+    </aside>
 
-      <section class="side-card" aria-labelledby="chunker-heading">
-        <h2 id="chunker-heading">File Chunker</h2>
-        <p class="hint-text">Optimize RAG performance by chunking large files into smaller, more retrievable pieces.</p>
-        <div class="field field--inline">
-          <label for="chunkSizeInput">Chunk size (tokens)</label>
-          <input id="chunkSizeInput" type="number" min="100" max="2000" value="500" step="50">
+    <section id="boardPanel" class="board-panel" aria-labelledby="board-heading">
+      <header class="panel-header">
+        <div class="panel-header__stack">
+          <h1 id="board-heading">SAM Bulletin Board</h1>
+          <p class="subtitle">Durable arena transcript with floating memory</p>
         </div>
-        <div class="field field--inline">
-          <label for="chunkOverlapInput">Overlap (tokens)</label>
-          <input id="chunkOverlapInput" type="number" min="0" max="200" value="50" step="10">
+        <div class="board-controls">
+          <span id="boardTurnStatus" class="status-pill">Round 0 • Idle</span>
+          <button id="snapshotBoardBtn" class="ghost" type="button">Snapshot now</button>
+          <button id="pauseArenaBtn" class="ghost" type="button">Pause</button>
+          <button id="resumeArenaBtn" class="ghost" type="button">Resume</button>
         </div>
-        <dl class="memory-stats memory-stats--chunker" aria-live="polite">
-          <div class="memory-stat">
-            <dt>Unchunked files</dt>
-            <dd id="unchunkedFileCount">0</dd>
+      </header>
+      <div id="boardViewport" class="board-viewport" aria-live="polite"></div>
+      <footer class="board-footer">
+        <div class="board-footer__left">
+          <button id="startArenaBtn" class="primary" type="button">Start arena</button>
+          <button id="stopArenaBtn" class="ghost danger" type="button">Stop</button>
+          <button id="exportBoardBtn" class="ghost" type="button">Export board</button>
+        </div>
+        <div class="board-footer__right">
+          <label class="toggle">
+            <input id="humanInputToggle" type="checkbox">
+            <span>Enable human participant input</span>
+          </label>
+        </div>
+      </footer>
+    </section>
+
+    <section id="chatPanel" class="chat-panel" aria-labelledby="chat-heading" hidden>
+      <header class="panel-header">
+        <div class="panel-header__stack">
+          <h2 id="chat-heading">Human Arena Input</h2>
+          <p class="subtitle">Send a message when it is the human turn</p>
+        </div>
+      </header>
+      <div id="chatWindow" class="chat-window" aria-live="polite"></div>
+      <footer class="chat-footer">
+        <label class="sr-only" for="messageInput">Message</label>
+        <textarea id="messageInput" rows="2" placeholder="Share your thoughts with the arena…"></textarea>
+        <div class="input-actions">
+          <button id="sendButton" class="primary" type="button">Send</button>
+          <button id="clearChatButton" class="ghost danger" type="button">Clear</button>
+        </div>
+      </footer>
+    </section>
+  </main>
+
+  <template id="agentCardTemplate">
+    <li class="agent-card side-card" data-agent-id="">
+      <header class="agent-card__header">
+        <button class="accordion-toggle" type="button" aria-expanded="false">
+          <span class="agent-card__title"></span>
+          <span class="chevron" aria-hidden="true">▸</span>
+        </button>
+        <button class="ghost ghost--icon agent-remove" type="button" title="Remove agent">🗑</button>
+      </header>
+      <div class="agent-card__body" hidden>
+        <section class="agent-section">
+          <h3>Chat model</h3>
+          <div class="field">
+            <label>Provider</label>
+            <select class="agent-model-provider">
+              <option value="ollama_local">Ollama (local)</option>
+              <option value="ollama_cloud">Ollama Cloud</option>
+              <option value="lmstudio">LM Studio</option>
+            </select>
           </div>
-          <div class="memory-stat">
-            <dt>Chunked files</dt>
-            <dd id="chunkedFileCount">0</dd>
+          <div class="field">
+            <label>Preset</label>
+            <input class="agent-model-preset" type="text" placeholder="default">
           </div>
-          <div class="memory-stat">
-            <dt>Total chunks</dt>
-            <dd id="totalChunkCount">0</dd>
+          <div class="field">
+            <label>Endpoint</label>
+            <input class="agent-model-endpoint" type="text" placeholder="http://localhost:11434/api/generate">
           </div>
-        </dl>
-        <p id="chunkerStatus" class="hint-text" role="status">No files to chunk. Scan the rag/ folder first.</p>
-        <div class="chunker-actions">
-          <button id="scanChunkerButton" class="ghost" type="button">Scan for files</button>
-          <button id="chunkFilesButton" class="ghost" type="button">Chunk all files</button>
-          <button id="clearChunksButton" class="ghost danger" type="button">Clear chunks</button>
-        </div>
-      </section>
-
-      <section class="side-card" aria-labelledby="tts-heading">
-        <h2 id="tts-heading">Speech synthesis</h2>
-        <div class="field">
-          <label for="ttsPresetSelect">Voice preset</label>
-          <select id="ttsPresetSelect"></select>
-        </div>
-        <div class="field field--inline field--range">
-          <label for="ttsVolume">Playback volume</label>
-          <input id="ttsVolume" type="range" min="0" max="200" value="100">
-          <span id="ttsVolumeValue" class="range-value">100%</span>
-        </div>
-        <div class="field" data-tts-field="server">
-          <label for="ttsServerUrl">Server URL</label>
-          <input id="ttsServerUrl" type="url" placeholder="http://localhost:5002">
-          <p class="field-hint">Point to your Piper, Coqui, Bark, or custom TTS HTTP server.</p>
-        </div>
-        <div class="field" data-tts-field="voice">
-          <label for="ttsVoiceId">Voice or speaker ID</label>
-          <input id="ttsVoiceId" type="text" list="ttsVoiceCatalog" placeholder="en_US-amy-low">
-          <datalist id="ttsVoiceCatalog"></datalist>
-        </div>
-        <div class="field" data-tts-field="apiKey">
-          <label for="ttsApiKeyInput">API key</label>
-          <input id="ttsApiKeyInput" type="password" autocomplete="off" placeholder="Optional unless required by the service">
-        </div>
-        <div class="tts-actions">
-          <button id="testTtsButton" class="ghost" type="button">Test voice</button>
-        </div>
-        <p id="ttsPresetDetails" class="hint-text" role="note"></p>
-        <details class="tts-notes">
-          <summary>AMD-friendly community favorites</summary>
-          <ul id="ttsPresetList" class="preset-list"></ul>
-        </details>
-      </section>
-
-      <section class="side-card" aria-labelledby="dual-heading">
-        <h2 id="dual-heading">Agent routing &amp; models</h2>
-        <p class="hint-text">Tune each agent&apos;s model and embedding pipeline with collapse-friendly cards.</p>
-
-        <!-- Agent A -->
-        <section class="side-card" id="agentACard" data-collapsed="false">
-          <header class="embed-card__header">
-            <h2>Agent A (primary SAM)</h2>
-            <button class="ghost ghost--icon" id="toggleAgentA" aria-expanded="true">▾</button>
-          </header>
-          <div class="embed-card__body" id="agentABody">
-            <!-- Model block -->
-            <div class="embed-card">
-              <div class="embed-card__header">
-                <h4>Model</h4>
-              </div>
-              <div class="embed-card__body">
-                <label class="field">Provider preset
-                  <select id="a_model_preset"></select>
-                </label>
-                <p id="providerNotes" class="field-hint" role="note"></p>
-                <label class="field">Endpoint URL
-                  <input id="a_model_endpoint" placeholder="http://localhost:11434/api/generate" />
-                </label>
-                <label class="field">Model name
-                  <input id="a_model_name" placeholder="llama3.2:3b" list="a_model_catalog" />
-                </label>
-                <datalist id="a_model_catalog"></datalist>
-                <label class="field">API key (optional)
-                  <input id="a_model_key" />
-                </label>
-                <div class="field field--range">
-                  <span class="slider-label"><span>Temperature</span><span class="range-value" id="a_temp_value">0.7</span></span>
-                  <input type="range" id="a_temp" min="0" max="2" step="0.05" value="0.7" />
-                </div>
-                <label class="field">Max tokens
-                  <input id="a_max_tokens" type="number" min="64" max="8192" value="1024" />
-                </label>
-                <p id="maxTokensHint" class="field-hint">Provider limit: up to 262,144 tokens.</p>
-                <label class="field">Model A display name
-                  <input id="agentAName" type="text" placeholder="SAM-A">
-                </label>
-                <label class="field">Persona / system prompt
-                  <textarea id="systemPromptInput" rows="4" placeholder="You are SAM, a helpful memory-augmented assistant."></textarea>
-                </label>
-              </div>
-            </div>
-            <!-- Embedding block -->
-            <div class="embed-card">
-              <div class="embed-card__header">
-                <h4>Embeddings</h4>
-              </div>
-              <div class="embed-card__body">
-                <label class="field">Embedding provider
-                  <select id="a_embed_provider"></select>
-                </label>
-                <label class="field">Embedding model
-                  <input id="a_embed_model" placeholder="mxbai-embed-large:latest" />
-                </label>
-                <label class="field">Embedding endpoint
-                  <input id="a_embed_endpoint" placeholder="POST http://localhost:11434/api/embed" />
-                </label>
-                <label class="field">Embedding API key
-                  <input id="a_embed_key" />
-                </label>
-                <label class="field">Context length
-                  <input id="a_embed_ctx" type="number" min="512" max="4096" value="1024" />
-                </label>
-                <div class="embed-card__actions">
-                  <button class="ghost" id="a_test_embed">Test embedding</button>
-                  <span id="a_embed_status" class="status-text"></span>
-                </div>
-              </div>
-            </div>
-            <div class="field" id="openRouterPolicyField">
-              <label for="openRouterPolicyInput">OpenRouter data policy</label>
-              <input id="openRouterPolicyInput" type="text" placeholder="e.g. default, opt-out, free">
-              <p class="field-hint">Match your OpenRouter privacy mode to avoid 404 data-policy errors.</p>
-            </div>
+          <div class="field">
+            <label>Model</label>
+            <select class="agent-model-name"></select>
+          </div>
+          <div class="field">
+            <label>API key</label>
+            <input class="agent-model-key" type="password" autocomplete="off">
+          </div>
+          <div class="field field--split">
+            <label>Temperature</label>
+            <input class="agent-model-temp" type="number" min="0" max="2" step="0.1" value="0.7">
+          </div>
+          <div class="field field--split">
+            <label>Max tokens</label>
+            <input class="agent-model-max" type="number" min="64" max="32768" value="2048">
+          </div>
+          <label class="toggle agent-cooldown-toggle">
+            <input class="agent-cooldown-check" type="checkbox">
+            <span>Custom cooldown (ms)</span>
+          </label>
+          <div class="field" data-per-agent-cooldown hidden>
+            <input class="agent-cooldown-input" type="number" min="0" value="0">
+          </div>
+          <div class="agent-actions">
+            <button class="ghost agent-test-chat" type="button">Test chat</button>
           </div>
         </section>
-
-        <!-- Agent B (skeptic) -->
-        <section class="side-card" id="agentBCard" data-collapsed="true">
-          <header class="embed-card__header">
-            <h2>Agent B (skeptic)</h2>
-            <button class="ghost ghost--icon" id="toggleAgentB" aria-expanded="false">▸</button>
-          </header>
-          <div class="embed-card__body" id="agentBBody" hidden>
-            <label class="toggle">
-              <input id="agentBEnabled" type="checkbox">
-              <span>Enable Model B for dual debates</span>
-            </label>
-            <label class="field">Model B display name
-              <input id="agentBName" type="text" placeholder="SAM-B">
-            </label>
-            <label class="field">Model B arena persona
-              <textarea id="agentBPrompt" rows="3" placeholder="You are SAM-B, a creative explorer."></textarea>
-            </label>
-            <!-- Model block -->
-            <div class="embed-card">
-              <div class="embed-card__header">
-                <h4>Model</h4>
-              </div>
-              <div class="embed-card__body">
-                <label class="field">Provider preset
-                  <select id="b_model_preset"></select>
-                </label>
-                <label class="field">Endpoint URL
-                  <input id="b_model_endpoint" placeholder="http://127.0.0.1:1234/v1/chat/completions" />
-                </label>
-                <label class="field">Model name
-                  <input id="b_model_name" placeholder="qwen2.5-7b-instruct" list="b_model_catalog" />
-                </label>
-                <datalist id="b_model_catalog"></datalist>
-                <label class="field">API key (optional)
-                  <input id="b_model_key" />
-                </label>
-                <div class="field field--range">
-                  <span class="slider-label"><span>Temperature</span><span class="range-value" id="b_temp_value">0.7</span></span>
-                  <input type="range" id="b_temp" min="0" max="2" step="0.05" value="0.7" />
-                </div>
-                <label class="field">Max tokens
-                  <input id="b_max_tokens" type="number" min="64" max="8192" value="1024" />
-                </label>
-              </div>
-            </div>
-            <!-- Embedding block -->
-            <div class="embed-card">
-              <div class="embed-card__header">
-                <h4>Embeddings</h4>
-              </div>
-              <div class="embed-card__body">
-                <label class="field">Embedding provider
-                  <select id="b_embed_provider"></select>
-                </label>
-                <label class="field">Embedding model
-                  <input id="b_embed_model" placeholder="text-embedding-3-large" />
-                </label>
-                <label class="field">Embedding endpoint
-                  <input id="b_embed_endpoint" placeholder="http://127.0.0.1:1234/v1/embeddings" />
-                </label>
-                <label class="field">Embedding API key
-                  <input id="b_embed_key" />
-                </label>
-                <label class="field">Context length
-                  <input id="b_embed_ctx" type="number" min="512" max="4096" value="1536" />
-                </label>
-                <div class="embed-card__actions">
-                  <button class="ghost" id="b_test_embed">Test embedding</button>
-                  <span id="b_embed_status" class="status-text"></span>
-                </div>
-              </div>
-            </div>
+        <section class="agent-section">
+          <h3>Embeddings</h3>
+          <div class="field">
+            <label>Provider</label>
+            <select class="agent-embed-provider">
+              <option value="ollama_local">Ollama (local)</option>
+              <option value="ollama_cloud">Ollama Cloud</option>
+              <option value="lmstudio">LM Studio</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Endpoint</label>
+            <input class="agent-embed-endpoint" type="text" placeholder="http://localhost:11434/api/embed">
+          </div>
+          <div class="field">
+            <label>Model</label>
+            <select class="agent-embed-model"></select>
+          </div>
+          <div class="field">
+            <label>API key</label>
+            <input class="agent-embed-key" type="password" autocomplete="off">
+          </div>
+          <div class="field field--split">
+            <label>Context length</label>
+            <input class="agent-embed-ctx" type="number" min="128" max="32768" value="2048">
+          </div>
+          <div class="agent-actions">
+            <button class="ghost agent-test-embed" type="button">Test embed</button>
           </div>
         </section>
-
-        <!-- Save controls -->
-        <div class="memory-actions">
-          <button id="saveOptions" class="primary">Save</button>
-          <span id="saveStatus" class="status-text"></span>
-        </div>
-
-        <div class="field field--inline">
-          <label for="requestTimeout">Request timeout (seconds)</label>
-          <input id="requestTimeout" type="number" min="10" max="600" value="30">
-        </div>
-        <div class="field field--inline">
-          <label for="reasoningTimeout">Reasoning timeout (seconds)</label>
-          <input id="reasoningTimeout" type="number" min="30" max="900" value="120">
-          <p class="field-hint">Used whenever a model or preset signals extended thinking time.</p>
-        </div>
-        <div class="field field--inline">
-          <label for="dualTurnLimit">Max turns (0 = unlimited)</label>
-          <input id="dualTurnLimit" type="number" min="0" max="50" value="0" placeholder="0">
-        </div>
-        <div class="field field--inline">
-          <label for="dualTurnDelay">Dual turn delay (seconds)</label>
-          <input id="dualTurnDelay" type="number" min="0" max="600" value="15" placeholder="15">
-          <p class="field-hint">Wait this long before auto-starting the partner&apos;s next turn.</p>
-        </div>
-        <label class="toggle">
-          <input id="dualAutoContinue" type="checkbox" checked>
-          <span>Auto-continue conversation</span>
-        </label>
-      </section>
-
-      <section class="side-card" aria-labelledby="reflex-heading">
-        <h2 id="reflex-heading">Reflex &amp; telemetry</h2>
-        <p class="hint-text">Stabilize long debates with periodic summaries and entropy sensing.</p>
-        <label class="toggle">
-          <input id="reflexToggle" type="checkbox">
-          <span>Enable Reflex mode</span>
-        </label>
-        <div class="field field--inline">
-          <label for="reflexInterval">Turns between summaries</label>
-          <input id="reflexInterval" type="number" min="2" max="50" value="8">
-        </div>
-        <div class="field field--inline">
-          <label for="entropyWindow">Entropy lookback (volleys)</label>
-          <input id="entropyWindow" type="number" min="1" max="25" value="5">
-        </div>
-        <div class="field field--stack">
-          <button id="triggerReflexButton" class="ghost" type="button">Trigger Reflex now</button>
-        </div>
-        <p id="reflexStatusText" class="hint-text reflex-status-text" role="status">Reflex idle.</p>
-      </section>
-
-      <section class="side-card" aria-labelledby="appearance-heading">
-        <h2 id="appearance-heading">Appearance</h2>
-        <p class="hint-text">Personalize the backdrop that frames both chat modes.</p>
-        <div class="field">
-          <label for="backgroundUrlInput">Background image URL</label>
-          <input id="backgroundUrlInput" type="url" placeholder="https://example.com/wallpaper.jpg">
-        </div>
-        <div class="field">
-          <label for="backgroundFileInput">Upload background image</label>
-          <input id="backgroundFileInput" type="file" accept="image/*">
-        </div>
-        <div class="appearance-actions">
-          <button id="clearBackgroundButton" class="ghost" type="button">Use default backdrop</button>
-        </div>
-        <p id="backgroundStatus" class="hint-text" role="note">Default gradient background active.</p>
-      </section>
-
-      <section class="side-card" aria-labelledby="debug-heading">
-        <h2 id="debug-heading">Debug &amp; Logs</h2>
-        <p class="hint-text">Inspect live processes, capture notes, and export run logs.</p>
-        <label class="toggle">
-          <input id="debugToggle" type="checkbox">
-          <span>Enable debug console</span>
-        </label>
-        <div class="field field--stack">
-          <button id="openDebugButton" class="ghost" type="button">Open debug console</button>
-        </div>
-        <div class="field field--stack">
-          <button id="logShutdownButton" class="ghost" type="button">Log shutdown</button>
-          <button id="logErrorButton" class="ghost danger" type="button">Log error</button>
-          <button id="exportLogsButton" class="ghost" type="button">Export logs</button>
-        </div>
-        <p id="logStatus" class="hint-text" role="status"></p>
-      </section>
-  </aside>
-
-  <template id="messageTemplate">
-    <article class="message">
-      <header class="message-meta">
-        <span class="message-role"></span>
-        <span class="message-turn"></span>
-        <time class="message-time"></time>
-        <span class="message-badge"></span>
-      </header>
-      <p class="message-content"></p>
-    </article>
+        <section class="agent-section">
+          <h3>Persona</h3>
+          <textarea class="agent-persona" rows="3" placeholder="Describe this agent's role and expertise."></textarea>
+        </section>
+      </div>
+    </li>
   </template>
-
-  <template id="dualMessageTemplate">
-    <article class="dual-message">
-      <header>
-        <span class="dual-turn" hidden></span>
-        <span class="dual-speaker"></span>
-        <span class="dual-badge" hidden></span>
-        <time class="dual-time"></time>
-      </header>
-      <p class="dual-content"></p>
-    </article>
-  </template>
-
-  <div id="debugPanel" class="debug-panel" role="dialog" aria-modal="true" aria-labelledby="debugPanelHeading" hidden>
-    <div class="debug-panel__card">
-      <header class="debug-panel__header">
-        <div>
-          <h2 id="debugPanelHeading">Debug console</h2>
-          <p class="debug-panel__subtitle">Monitor live processes and recent log events.</p>
-        </div>
-        <button id="debugCloseButton" class="ghost" type="button" aria-label="Close debug console">✕</button>
-      </header>
-      <section class="debug-panel__section" aria-labelledby="processHeading">
-        <h3 id="processHeading">Live processes</h3>
-        <ul id="processList" class="debug-process-list"></ul>
-      </section>
-      <section class="debug-panel__section" aria-labelledby="logHeading">
-        <h3 id="logHeading">Recent log entries</h3>
-        <ol id="logList" class="debug-log-list"></ol>
-      </section>
-    </div>
-  </div>
 
   <script type="module" src="app.js"></script>
 </body>
