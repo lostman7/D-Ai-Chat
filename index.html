@@ -292,8 +292,9 @@
                   <input id="a_model_endpoint" placeholder="http://localhost:11434/api/generate" />
                 </label>
                 <label class="field">Model name
-                  <input id="a_model_name" placeholder="llama3.2:3b" />
+                  <input id="a_model_name" placeholder="llama3.2:3b" list="a_model_catalog" />
                 </label>
+                <datalist id="a_model_catalog"></datalist>
                 <label class="field">API key (optional)
                   <input id="a_model_key" />
                 </label>
@@ -378,8 +379,9 @@
                   <input id="b_model_endpoint" placeholder="http://127.0.0.1:1234/v1/chat/completions" />
                 </label>
                 <label class="field">Model name
-                  <input id="b_model_name" placeholder="qwen2.5-7b-instruct" />
+                  <input id="b_model_name" placeholder="qwen2.5-7b-instruct" list="b_model_catalog" />
                 </label>
+                <datalist id="b_model_catalog"></datalist>
                 <label class="field">API key (optional)
                   <input id="b_model_key" />
                 </label>

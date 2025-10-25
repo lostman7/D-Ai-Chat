@@ -892,6 +892,11 @@ let embeddingServiceReason = ''; // CODEx: Store the most recent embedding failu
 const embeddingProviderState = { preference: EMBEDDING_PROVIDERS.AUTO, active: EMBEDDING_PROVIDERS.OPENAI, baseUrl: '', lastProbe: 0 }; // CODEx: Track provider selection and probe metadata.
 const embeddingBucketManifests = new Map(); // CODEx: Persisted manifest metadata keyed by cache bucket.
 const embeddingBucketManifestLoaded = new Set(); // CODEx: Track which manifests have been hydrated from disk.
+const OLLAMA_MODEL_REFRESH_INTERVAL_MS = 60 * 1000; // CODEx: Minimum interval between Ollama catalog refreshes.
+const agentModelCatalogState = { // CODEx: Track fetched model catalogs per agent.
+  A: { target: '', models: [], lastFetched: 0 }, // CODEx: SAM-A catalog metadata.
+  B: { target: '', models: [], lastFetched: 0 } // CODEx: SAM-B catalog metadata.
+};
 
 // CODEx: High-resolution clock helper for latency tracking.
 function getTimestampMs() {
@@ -1114,6 +1119,126 @@ function toggleCardSection(cardElement, toggleButton, bodyElement) { // CODEx: F
   }
   const collapsed = cardElement.getAttribute('data-collapsed') === 'true'; // CODEx: Read current collapse flag.
   updateCardSectionState(cardElement, toggleButton, bodyElement, !collapsed); // CODEx: Apply inverted state.
+} // CODEx
+
+function wireCardToggle(cardId, buttonId, bodyId, registerListener = (element, eventName, handler) => { // CODEx: Bind collapse
+  if (!element) { // CODEx: Guard missing event targets.
+    return; // CODEx: Skip when toggle button absent.
+  }
+  element.addEventListener(eventName, handler); // CODEx: Fallback binding strategy when custom registrar not provided.
+}) {
+  const cardElement = document.getElementById(cardId); // CODEx: Resolve accordion container.
+  const toggleButton = document.getElementById(buttonId); // CODEx: Resolve toggle control.
+  const bodyElement = document.getElementById(bodyId); // CODEx: Resolve collapsible body content.
+  if (!cardElement || !toggleButton || !bodyElement) { // CODEx: Abort when markup incomplete.
+    return; // CODEx: Prevent runtime errors for missing DOM nodes.
+  }
+  const applyState = (collapsed) => { // CODEx: Helper to reuse state sync across interactions.
+    updateCardSectionState(cardElement, toggleButton, bodyElement, collapsed); // CODEx: Delegate to shared state handler.
+  };
+  const initialCollapsed = cardElement.getAttribute('data-collapsed') === 'true'; // CODEx: Inspect initial collapse flag.
+  applyState(initialCollapsed); // CODEx: Ensure visual state matches markup on load.
+  registerListener(toggleButton, 'click', () => { // CODEx: Register toggle handler with provided registrar.
+    const collapsed = cardElement.getAttribute('data-collapsed') === 'true'; // CODEx: Read latest collapse state.
+    applyState(!collapsed); // CODEx: Flip state on interaction.
+  });
+} // CODEx
+
+function initializeAgentCardToggles(registerListener) { // CODEx: Wire accordion toggles for both agent cards.
+  wireCardToggle('agentACard', 'toggleAgentA', 'agentABody', registerListener); // CODEx: Bind SAM-A toggle.
+  wireCardToggle('agentBCard', 'toggleAgentB', 'agentBBody', registerListener); // CODEx: Bind SAM-B toggle.
+} // CODEx
+
+function renderAgentModelCatalog(agent, models = [], { propagate = true } = {}) { // CODEx: Update datalist suggestions per agent.
+  const normalizedAgent = agent === 'B' ? 'B' : 'A'; // CODEx: Normalize agent identifier.
+  const listElement = normalizedAgent === 'A' ? elements.agentAModelCatalog : elements.agentBModelCatalog; // CODEx: Resolve datalist node.
+  if (!listElement) { // CODEx: Skip when datalist missing from DOM.
+    return; // CODEx: Avoid runtime errors on absent markup.
+  }
+  const uniqueModels = Array.from(new Set((models || []).map((name) => (typeof name === 'string' ? name.trim() : '')).filter(Boolean))); // CODEx: Deduplicate and sanitize model names.
+  listElement.innerHTML = uniqueModels.map((name) => `<option value="${name}"></option>`).join(''); // CODEx: Render datalist options.
+  const state = agentModelCatalogState[normalizedAgent]; // CODEx: Snapshot per-agent catalog state.
+  if (state) { // CODEx: Update cached models when state available.
+    state.models = uniqueModels; // CODEx: Persist sanitized suggestions for reuse.
+  }
+  if (normalizedAgent === 'A' && propagate) { // CODEx: Mirror catalog when SAM-B inherits SAM-A settings.
+    const connectionB = getAgentConnection('B'); // CODEx: Inspect SAM-B connection state.
+    if (connectionB?.inherits) { // CODEx: Only propagate when Model B shares Model A connection.
+      renderAgentModelCatalog('B', uniqueModels, { propagate: false }); // CODEx: Copy suggestions into SAM-B datalist without recursion.
+      if (agentModelCatalogState.B) { // CODEx: Align SAM-B cache metadata with shared list.
+        agentModelCatalogState.B.target = agentModelCatalogState.A?.target || agentModelCatalogState.B.target; // CODEx: Mirror fetch target for SAM-B when inheriting.
+        agentModelCatalogState.B.lastFetched = agentModelCatalogState.A?.lastFetched || agentModelCatalogState.B.lastFetched; // CODEx: Mirror fetch timestamp for SAM-B when inheriting.
+      }
+    }
+  }
+} // CODEx
+
+async function refreshOllamaModelCatalog(agent) { // CODEx: Discover local Ollama models and update selectors.
+  const normalizedAgent = agent === 'B' ? 'B' : 'A'; // CODEx: Normalize agent identifier.
+  const connection = getAgentConnection(normalizedAgent); // CODEx: Inspect agent connection config.
+  const inherits = normalizedAgent === 'B' && connection?.inherits; // CODEx: Determine if SAM-B shares SAM-A settings.
+  const effectiveConnection = inherits ? getAgentConnection('A') : connection; // CODEx: Resolve effective provider details.
+  const providerId = (effectiveConnection?.providerPreset || '').toLowerCase(); // CODEx: Normalize provider preset identifier.
+  const isOllamaLocal = providerId === 'ollama' || providerId === 'ollama-local'; // CODEx: Detect Ollama local routing.
+  const state = agentModelCatalogState[normalizedAgent]; // CODEx: Access per-agent refresh metadata.
+  if (!isOllamaLocal || !effectiveConnection) { // CODEx: Clear catalogs when provider not Ollama.
+    if (state) { // CODEx: Reset cached metadata for non-Ollama providers.
+      state.target = '';
+      state.lastFetched = 0;
+      state.models = [];
+    }
+    renderAgentModelCatalog(normalizedAgent, [], { propagate: normalizedAgent === 'A' }); // CODEx: Clear datalist suggestions.
+    return; // CODEx: No discovery required for non-Ollama providers.
+  }
+  if (inherits) { // CODEx: Reuse SAM-A catalog when SAM-B inherits connection.
+    const sharedState = agentModelCatalogState.A; // CODEx: Reference SAM-A metadata.
+    if (sharedState) { // CODEx: Mirror metadata for SAM-B.
+      agentModelCatalogState.B.target = sharedState.target;
+      agentModelCatalogState.B.lastFetched = sharedState.lastFetched;
+      renderAgentModelCatalog('B', sharedState.models, { propagate: false }); // CODEx: Copy existing suggestions without recursion.
+    }
+    return; // CODEx: Avoid duplicate fetch when sharing connection.
+  }
+  const presetFallback = providerPresetMap.get('ollama'); // CODEx: Reference default Ollama preset for fallback endpoint.
+  const endpoint = effectiveConnection.endpoint || presetFallback?.endpoint || 'http://localhost:11434/api/generate'; // CODEx: Choose base endpoint for discovery.
+  const baseOrigin = deriveBaseOrigin(endpoint) || 'http://localhost:11434'; // CODEx: Resolve host origin for /api/tags request.
+  const target = `${stripTrailingSlashes(baseOrigin)}/api/tags`; // CODEx: Construct Ollama model listing endpoint.
+  const now = Date.now(); // CODEx: Timestamp for rate limiting.
+  if (state && state.target === target && now - state.lastFetched < OLLAMA_MODEL_REFRESH_INTERVAL_MS) { // CODEx: Skip redundant fetches within cooldown window.
+    renderAgentModelCatalog(normalizedAgent, state.models, { propagate: normalizedAgent === 'A' }); // CODEx: Ensure UI remains in sync with cached data.
+    return; // CODEx: Avoid unnecessary network requests.
+  }
+  if (state) { // CODEx: Update target prior to fetch.
+    state.target = target;
+  }
+  try {
+    const response = await fetch(target, { method: 'GET' }); // CODEx: Query Ollama for available models.
+    if (!response.ok) { // CODEx: Treat non-200 as failure.
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const payload = await response.json(); // CODEx: Parse JSON body containing model tags.
+    const modelEntries = Array.isArray(payload?.models) ? payload.models : []; // CODEx: Extract model array defensively.
+    const models = modelEntries
+      .map((entry) => {
+        if (typeof entry === 'string') return entry; // CODEx: Support simple string entries.
+        if (entry && typeof entry === 'object') { // CODEx: Handle structured tag entries.
+          return entry.name || entry.model || entry.id || '';
+        }
+        return '';
+      })
+      .filter((name) => typeof name === 'string' && name.trim()); // CODEx: Sanitize results.
+    if (state) { // CODEx: Stamp refresh metadata after successful fetch.
+      state.lastFetched = Date.now();
+      state.models = models;
+    }
+    console.info('[Ollama] Model catalog refreshed', { agent: normalizedAgent, target, count: models.length }); // CODEx: Telemetry for successful discovery.
+    renderAgentModelCatalog(normalizedAgent, models, { propagate: normalizedAgent === 'A' }); // CODEx: Update UI suggestions.
+  } catch (error) {
+    if (state) { // CODEx: Record failure timestamp to avoid tight retry loops.
+      state.lastFetched = Date.now();
+    }
+    console.warn('[Ollama] Model catalog refresh failed', { agent: normalizedAgent, target, error }); // CODEx: Surface discovery issues.
+  }
 } // CODEx
 
 async function runEmbeddingTest(agent) { // CODEx: Probe embedding health for a specific arena agent.
@@ -1570,6 +1695,7 @@ const elements = {
   agentAEmbeddingContextInput: document.getElementById('a_embed_ctx'), // CODEx: Agent A embedding context input.
   agentAEmbeddingTestButton: document.getElementById('a_test_embed'), // CODEx: Agent A embedding test button.
   agentAEmbeddingStatus: document.getElementById('a_embed_status'), // CODEx: Agent A embedding status label.
+  agentAModelCatalog: document.getElementById('a_model_catalog'), // CODEx: Agent A model suggestion list.
   agentBEmbeddingProviderSelect: document.getElementById('b_embed_provider'), // CODEx: Agent B embedding provider select.
   agentBEmbeddingModelInput: document.getElementById('b_embed_model'), // CODEx: Agent B embedding model input.
   agentBEmbeddingEndpointInput: document.getElementById('b_embed_endpoint'), // CODEx: Agent B embedding endpoint input.
@@ -1577,6 +1703,7 @@ const elements = {
   agentBEmbeddingContextInput: document.getElementById('b_embed_ctx'), // CODEx: Agent B embedding context input.
   agentBEmbeddingTestButton: document.getElementById('b_test_embed'), // CODEx: Agent B embedding test button.
   agentBEmbeddingStatus: document.getElementById('b_embed_status'), // CODEx: Agent B embedding status label.
+  agentBModelCatalog: document.getElementById('b_model_catalog'), // CODEx: Agent B model suggestion list.
   saveConfigButton: document.getElementById('saveOptions'), // CODEx: Manual save control.
   saveStatus: document.getElementById('saveStatus'), // CODEx: Save feedback label.
   openRouterPolicyField: document.getElementById('openRouterPolicyField'),
@@ -1662,6 +1789,7 @@ async function init() {
   initProcessRegistry();
   populateProviderSelect();
   populateArenaProviderSelects();
+  populateEmbeddingProviderSelects(); // CODEx: Ensure embedding provider dropdowns are pre-populated.
   populateTtsControls();
   bindEvents();
   ensureEmbeddingCacheManifest(); // CODEx: Hydrate embedding cache manifest before retrieval operations.
@@ -1673,6 +1801,8 @@ async function init() {
   updateConfigInputs();
   updateSpeakToggle();
   updateModelConnectionStatus();
+  void refreshOllamaModelCatalog('A'); // CODEx: Hydrate SAM-A model suggestions on startup.
+  void refreshOllamaModelCatalog('B'); // CODEx: Hydrate SAM-B model suggestions on startup.
   ensureRagSessionId(MODE_CHAT);
   ensureRagSessionId(MODE_ARENA);
   const responsiveQuery = window.matchMedia('(max-width: 1100px)');
@@ -2110,6 +2240,36 @@ function populateArenaProviderSelects() {
   populateProviderOptions(elements.agentBProviderSelect, { includeInherit: true });
 }
 
+function populateEmbeddingProviderSelect(selectElement, agentKey) { // CODEx: Seed per-agent embedding provider dropdown.
+  if (!selectElement) { // CODEx: Skip when control absent in DOM.
+    return; // CODEx: Prevent runtime errors for missing nodes.
+  }
+  const options = [ // CODEx: Supported embedding provider choices.
+    { value: EMBEDDING_PROVIDERS.AUTO, label: 'Auto (detect)' },
+    { value: EMBEDDING_PROVIDERS.OLLAMA_LOCAL, label: 'Ollama (Local)' },
+    { value: EMBEDDING_PROVIDERS.OLLAMA_CLOUD, label: 'Ollama (Cloud)' },
+    { value: EMBEDDING_PROVIDERS.LM_STUDIO, label: 'LM Studio' },
+    { value: EMBEDDING_PROVIDERS.OPENAI, label: 'OpenAI-Compatible' }
+  ];
+  selectElement.innerHTML = options
+    .map((entry) => `<option value="${entry.value}">${entry.label}</option>`)
+    .join(''); // CODEx: Render consistent option markup.
+  const key = agentKey === 'B' ? 'agentBEmbeddingProvider' : 'agentAEmbeddingProvider'; // CODEx: Determine config binding.
+  const fallback = agentKey === 'B' ? defaultConfig.agentBEmbeddingProvider : defaultConfig.agentAEmbeddingProvider; // CODEx: Resolve default provider.
+  const stored = config[key] || fallback; // CODEx: Pull persisted provider or fallback.
+  const hasStoredOption = options.some((entry) => entry.value === stored); // CODEx: Confirm stored value remains available.
+  const value = hasStoredOption ? stored : fallback; // CODEx: Choose safe option when stored missing.
+  if (!hasStoredOption) { // CODEx: Repair config when stored option invalid.
+    config[key] = value; // CODEx: Sync sanitized value back into config.
+  }
+  selectElement.value = value; // CODEx: Reflect selection in UI control.
+}
+
+function populateEmbeddingProviderSelects() { // CODEx: Initialize both agent embedding provider selects.
+  populateEmbeddingProviderSelect(elements.agentAEmbeddingProviderSelect, 'A'); // CODEx: Populate SAM-A provider dropdown.
+  populateEmbeddingProviderSelect(elements.agentBEmbeddingProviderSelect, 'B'); // CODEx: Populate SAM-B provider dropdown.
+}
+
 function applyProviderPreset(presetId, { silent = false } = {}) {
   const preset = providerPresetMap.get(presetId) ?? providerPresetMap.get('custom');
   config.providerPreset = preset.id;
@@ -2122,6 +2282,7 @@ function applyProviderPreset(presetId, { silent = false } = {}) {
   updateConfigInputs();
   saveConfig();
   updateModelConnectionStatus();
+  void refreshOllamaModelCatalog('A'); // CODEx: Sync SAM-A model catalog after preset changes.
   if (!silent && preset.id !== 'custom') {
     addSystemMessage(`Loaded ${preset.label} defaults. Double-check your API key and click "Save model settings" to confirm.`);
   }
@@ -2185,6 +2346,7 @@ function applyArenaProviderPreset(agent, presetId, { silent = false } = {}) {
   applyOpenRouterPolicyVisibility();
   saveConfig();
   updateModelConnectionStatus();
+  void refreshOllamaModelCatalog('B'); // CODEx: Refresh SAM-B model catalog after preset updates.
   if (!silent && preset.id !== 'custom') {
     addSystemMessage(
       `${getAgentDisplayName(agent)} loaded ${preset.label} defaults. Provide credentials if required and click "Save model settings".`
@@ -2388,6 +2550,7 @@ function updateConfigInputs() {
 function updateAgentConnectionInputs(agent) {
   if (agent === 'A') {
     updateArenaProviderNotes('A', getAgentConnection('A'));
+    void refreshOllamaModelCatalog('A'); // CODEx: Update SAM-A catalog during connection sync.
     return;
   }
 
@@ -2460,6 +2623,7 @@ function updateAgentConnectionInputs(agent) {
   }
 
   updateArenaProviderNotes(agent, connection);
+  void refreshOllamaModelCatalog(agent); // CODEx: Sync model catalog after connection updates.
 }
 
 function applyAgentBEnabledState() {
@@ -2737,21 +2901,7 @@ function bindEvents() {
     }
   };
 
-  if (elements.agentACard && elements.toggleAgentA && elements.agentABody) { // CODEx: Initialize Agent A accordion state.
-    const collapsed = elements.agentACard.getAttribute('data-collapsed') === 'true'; // CODEx: Determine default collapse value.
-    updateCardSectionState(elements.agentACard, elements.toggleAgentA, elements.agentABody, collapsed); // CODEx: Sync visuals.
-    addListener(elements.toggleAgentA, 'click', () => { // CODEx: Toggle Agent A card on demand.
-      toggleCardSection(elements.agentACard, elements.toggleAgentA, elements.agentABody); // CODEx: Apply flip state.
-    });
-  }
-
-  if (elements.agentBCard && elements.toggleAgentB && elements.agentBBody) { // CODEx: Initialize Agent B accordion state.
-    const collapsed = elements.agentBCard.getAttribute('data-collapsed') === 'true'; // CODEx: Determine default collapse value.
-    updateCardSectionState(elements.agentBCard, elements.toggleAgentB, elements.agentBBody, collapsed); // CODEx: Sync visuals.
-    addListener(elements.toggleAgentB, 'click', () => { // CODEx: Toggle Agent B card on demand.
-      toggleCardSection(elements.agentBCard, elements.toggleAgentB, elements.agentBBody); // CODEx: Apply flip state.
-    });
-  }
+  initializeAgentCardToggles(addListener); // CODEx: Restore accordion toggles via shared helper.
 
   addListener(elements.enterChatButton, 'click', () => {
     setActiveMode(MODE_CHAT);
@@ -2835,10 +2985,12 @@ function bindEvents() {
 
   addListener(elements.providerSelect, 'change', (event) => {
     applyProviderPreset(event.target.value, { silent: false });
+    void refreshOllamaModelCatalog('A'); // CODEx: Re-query Ollama catalog when SAM-A provider changes.
   });
 
   addListener(elements.agentBProviderSelect, 'change', (event) => {
     applyArenaProviderPreset('B', event.target.value);
+    void refreshOllamaModelCatalog('B'); // CODEx: Update SAM-B catalog after provider selection.
   });
 
   const autosaveTargets = document.querySelectorAll(
@@ -2869,6 +3021,7 @@ function bindEvents() {
     config.endpoint = event.target.value.trim();
     updateAgentConnectionInputs('B');
     void resolveActiveEmbeddingProvider(true); // CODEx: Re-probe embedding provider when base endpoint changes.
+    void refreshOllamaModelCatalog('A'); // CODEx: Rebuild SAM-A suggestions when endpoint changes.
   });
 
   addListener(elements.modelInput, 'input', (event) => {
@@ -3090,6 +3243,7 @@ function bindEvents() {
   addListener(elements.agentBEndpoint, 'input', (event) => {
     config.agentBEndpoint = event.target.value.trim();
     saveConfig();
+    void refreshOllamaModelCatalog('B'); // CODEx: Update SAM-B suggestions when endpoint overrides change.
   });
 
   addListener(elements.agentBModel, 'input', (event) => {
